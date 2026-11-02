@@ -175,6 +175,9 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
             Some((vec![f(*a)?, i(*expert_of)?, f(*w)?], vec![f(*c)?]))
         }
         Op::CombineIdx { a, b, out, .. } => Some((vec![i(*a)?, i(*b)?], vec![i(*out)?])),
+        Op::Gather { weighted, token_id, gate, out, .. } => {
+            Some((vec![f(*weighted)?, i(*token_id)?, f(*gate)?], vec![f(*out)?]))
+        }
         Op::IdxBroadcast { base, out, .. } => Some((vec![i(*base)?], vec![i(*out)?])),
         Op::PadIdx { base, out, .. } => Some((vec![i(*base)?], vec![i(*out)?])),
         Op::Argmax { x, out, sel, thr, gate, d1, d2, .. } => Some((
@@ -185,7 +188,214 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
     }
 }
 
-/// Reverse reduction proof. Its returned leaf claims still need independent
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseGatherProof {
+    /// Routing relation (claim 0): selector booleanity, exactly one token per
+    /// valid position (mask), and token_id(pos) = sum_t t*M[t,pos]. The
+    /// verifier only opens the committed one-hot columns at the derived point.
+    routing: VirtualProof,
+    /// Eq-weighted product sumcheck over the position domain:
+    /// sum_pos R'(pos) * W'(pos) * gate(pos) == out~(r_j, r_t).
+    sum: VirtualProof,
+    /// Selector evaluations M[t](z_r), one per token (aux batch opening).
+    aux_values: Vec<Goldilocks>,
+    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+}
+
+fn gather_dims(op: &Op) -> Option<(T, T, T, T, usize, usize)> {
+    match op {
+        Op::Gather { weighted, token_id, gate, out, m, h } => {
+            if !m.is_power_of_two() || !h.is_power_of_two() { return None; }
+            Some((*weighted, *token_id, *gate, *out, *m, *h))
+        }
+        _ => None,
+    }
+}
+
+/// S7b: eq-weighted token-routing relation terms. MLE indices: 0 = eq,
+/// 1..=m the one-hot token selectors, 1+m the token_id column, 2+m the mask.
+fn gather_routing_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec<usize>)> {
+    let mut terms = Vec::with_capacity(4 * count + 2);
+    let mut gp = Goldilocks::ONE;
+    for t in 0..count {
+        terms.push((gp, vec![0usize, 1 + t, 1 + t]));
+        terms.push((-gp, vec![0usize, 1 + t]));
+        gp = gp * gamma;
+    }
+    let tie_w = gp;
+    for t in 0..count {
+        terms.push((tie_w * Goldilocks::from_u64(t as u64), vec![0usize, 1 + t]));
+    }
+    terms.push((-tie_w, vec![0usize, 1 + count]));
+    let onehot_w = tie_w * gamma;
+    for t in 0..count {
+        terms.push((onehot_w, vec![0usize, 1 + t]));
+    }
+    terms.push((-onehot_w, vec![0usize, 2 + count]));
+    terms
+}
+
+fn prove_reverse_gather(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+    aux: PreparedAux, transcript: &mut Transcript)
+    -> Option<(ReverseGatherProof, Vec<EvalClaim>)>
+{
+    let (weighted, token_id, gate, out, m, h) = gather_dims(op)?;
+    let lg_h = h.trailing_zeros() as usize;
+    let out_key = TensorKey::Field(out).encoded()?;
+    let (qp, v) = argmax_claim(outs, out_key)?;
+    if qp.len() != lg_h + m.trailing_zeros() as usize { return None; }
+    let (r_j, r_t) = qp.split_at(lg_h);
+    let s = aux.descriptor.len;
+    if aux.descriptor.role != AuxRole::GatherRouting || aux.descriptor.columns != m { return None; }
+    let arity = aux.descriptor.arity;
+    let padded = 1usize.checked_shl(arity as u32)?;
+    if store.get(weighted).len() != s.checked_mul(h)? || store.get(gate).len() != s
+        || store.get(out).len() != m.checked_mul(h)? { return None; }
+    let tok = store.idx.get(token_id)?;
+    if tok.len() != s { return None; }
+
+    // Routing relation (claim 0).
+    let q_r: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gamma = transcript.field();
+    let terms = gather_routing_terms(gamma, m);
+    let eq_r = mle::eq_evals(&q_r);
+    let mut tok_pad = vec![Goldilocks::ZERO; padded];
+    for (pos, &t) in tok.iter().enumerate() { tok_pad[pos] = Goldilocks::from_u64(t as u64); }
+    let mut mask = vec![Goldilocks::ZERO; padded];
+    for pos in 0..s { mask[pos] = Goldilocks::ONE; }
+    let mut mles: Vec<&[Goldilocks]> = vec![&eq_r];
+    for t in 0..m { mles.push(&aux.columns[t]); }
+    mles.push(&tok_pad);
+    mles.push(&mask);
+    let (routing, zr) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+
+    // Scatter-add sumcheck anchored at the output claim.
+    let eq_t = mle::eq_evals(r_t);
+    let mut r_prime = vec![Goldilocks::ZERO; padded];
+    for (pos, &t) in tok.iter().enumerate() { r_prime[pos] = eq_t[t as usize]; }
+    let eq_j = mle::eq_evals(r_j);
+    let mut w_prime = vec![Goldilocks::ZERO; padded];
+    for pos in 0..s {
+        let mut acc = Goldilocks::ZERO;
+        for j in 0..h { acc = acc + eq_j[j] * store.get(weighted)[pos * h + j]; }
+        w_prime[pos] = acc;
+    }
+    let mut gate_pad = vec![Goldilocks::ZERO; padded];
+    for pos in 0..s { gate_pad[pos] = store.get(gate)[pos]; }
+    let q_g: Vec<Goldilocks> = transcript.field_vec(arity);
+    let sum_terms = vec![(Goldilocks::ONE, vec![0usize, 1usize, 2usize])];
+    let sum_mles: [&[Goldilocks]; 3] = [&r_prime, &w_prime, &gate_pad];
+    let (sum, zg) = prove_virtual(&sum_mles, &sum_terms, v, transcript);
+    if sum.final_evals.len() != 3 || routing.final_evals.len() != m + 3 { return None; }
+
+    // Aux opening: the m selectors at zr (routing endpoints) and at zg (the
+    // scatter-add endpoint, needed for R'(zg)).
+    let zp = argmax_pad_point(&zr, arity);
+    let zpg = argmax_pad_point(&zg, arity);
+    let mut idxs: Vec<usize> = Vec::with_capacity(2 * m);
+    let mut points: Vec<Vec<Goldilocks>> = Vec::with_capacity(2 * m);
+    let mut values: Vec<Goldilocks> = Vec::with_capacity(2 * m);
+    for t in 0..m { idxs.push(t); points.push(zp.clone()); values.push(mle::eval(&aux.columns[t], &zp)); }
+    for t in 0..m { idxs.push(t); points.push(zpg.clone()); values.push(mle::eval(&aux.columns[t], &zpg)); }
+    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&t| aux.columns[t].clone()).collect();
+    let ctx = zkie_core::pcs::committed::BatchCtx {
+        commitment: aux.descriptor.commitment.clone(),
+        prover_data: aux.prover_data,
+        protocol: aux.protocol,
+        whir: aux.whir,
+        num_tables: aux.descriptor.columns,
+    };
+    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+
+    // Zero-extension to the tensors' own domains.
+    let lb = s.checked_next_power_of_two()?.trailing_zeros() as usize;
+    if zr.len() < lb || zg.len() < lb { return None; }
+    let pad_r = zero_ext_factor(&zr, lb);
+    let pad_g = zero_ext_factor(&zg, lb);
+    if pad_r == Goldilocks::ZERO || pad_g == Goldilocks::ZERO { return None; }
+    let mut w_point = r_j.to_vec();
+    w_point.extend_from_slice(&zg[..lb]);
+    let tok_key = TensorKey::Index(token_id).encoded()?;
+    let fe_sum = sum.final_evals.clone();
+    let fe_r = routing.final_evals.clone();
+    Some((ReverseGatherProof { routing, sum, aux_values: values, opening },
+        vec![
+            EvalClaim { tensor_id: weighted, point: w_point, value: fe_sum[1] * pad_g.inverse() },
+            EvalClaim { tensor_id: gate, point: zg[..lb].to_vec(), value: fe_sum[2] * pad_g.inverse() },
+            EvalClaim { tensor_id: tok_key, point: zr[..lb].to_vec(), value: fe_r[1 + m] * pad_r.inverse() },
+        ]))
+}
+
+fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+    descriptor: &AuxDescriptor, proof: &ReverseGatherProof, transcript: &mut Transcript)
+    -> Option<Vec<EvalClaim>>
+{
+    let (weighted, token_id, gate, out, m, h) = gather_dims(op)?;
+    let lg_h = h.trailing_zeros() as usize;
+    let out_key = TensorKey::Field(out).encoded()?;
+    let (qp, v) = argmax_claim(outs, out_key)?;
+    if qp.len() != lg_h + m.trailing_zeros() as usize { return None; }
+    let (r_j, r_t) = qp.split_at(lg_h);
+    if descriptor.role != AuxRole::GatherRouting || descriptor.columns != m { return None; }
+    let s = descriptor.len;
+    let arity = descriptor.arity;
+    if proof.aux_values.len() != 2 * m { return None; }
+
+    let q_r: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gamma = transcript.field();
+    let terms = gather_routing_terms(gamma, m);
+    let (okr, zr, fc_r) = verify_virtual(&proof.routing, &terms, Goldilocks::ZERO, arity, transcript);
+    if !okr { return None; }
+    let fe_r = &proof.routing.final_evals;
+    if fe_r.len() != m + 3 { return None; }
+    if fe_r[0] != mle::eq_poly(&q_r, &zr) { return None; }
+    for t in 0..m { if fe_r[1 + t] != proof.aux_values[t] { return None; } }
+    if fe_r[2 + m] != expert_mask_eval(&zr, s) { return None; }
+    if fc_r != virtual_eval(&terms, fe_r) { return None; }
+
+    // Aux opening at zr (routing endpoints) and zg (scatter-add endpoint).
+    let zp = argmax_pad_point(&zr, arity);
+    // Scatter-add: R'(z) is computed from the opened selectors only.
+    let q_g: Vec<Goldilocks> = transcript.field_vec(arity);
+    let sum_terms = vec![(Goldilocks::ONE, vec![0usize, 1usize, 2usize])];
+    let (ok, zg, fc) = verify_virtual(&proof.sum, &sum_terms, v, arity, transcript);
+    if !ok { return None; }
+    let fe = &proof.sum.final_evals;
+    if fe.len() != 3 { return None; }
+    let zpg = argmax_pad_point(&zg, arity);
+    let mut idxs: Vec<usize> = Vec::with_capacity(2 * m);
+    let mut points: Vec<Vec<Goldilocks>> = Vec::with_capacity(2 * m);
+    for t in 0..m { idxs.push(t); points.push(zp.clone()); }
+    for t in 0..m { idxs.push(t); points.push(zpg.clone()); }
+    let (whir, protocol) = aux_batch_whir(descriptor)?;
+    if !zkie_core::pcs::batch_open::verify_batch_open_committed(
+        &whir, &descriptor.commitment, &protocol, descriptor.columns,
+        &idxs, &points, &proof.aux_values, &proof.opening,
+    ) { return None; }
+    let eq_t = mle::eq_evals(r_t);
+    let mut rp_z = Goldilocks::ZERO;
+    for t in 0..m { rp_z = rp_z + eq_t[t] * proof.aux_values[m + t]; }
+    if fe[0] != rp_z || fc != fe[0] * fe[1] * fe[2] { return None; }
+    let _ = q_g;
+
+    let lb = s.checked_next_power_of_two()?.trailing_zeros() as usize;
+    if zr.len() < lb || zg.len() < lb { return None; }
+    let pad_r = zero_ext_factor(&zr, lb);
+    let pad_g = zero_ext_factor(&zg, lb);
+    if pad_r == Goldilocks::ZERO || pad_g == Goldilocks::ZERO { return None; }
+    let mut w_point = r_j.to_vec();
+    w_point.extend_from_slice(&zg[..lb]);
+    // tok endpoint from the routing virtual, mapped to the token tensor domain.
+    let tok_key = TensorKey::Index(token_id).encoded()?;
+    let tok_val = fe_r[1 + m] * pad_r.inverse();
+    Some(vec![
+        EvalClaim { tensor_id: weighted, point: w_point, value: fe[1] * pad_g.inverse() },
+        EvalClaim { tensor_id: gate, point: zg[..lb].to_vec(), value: fe[2] * pad_g.inverse() },
+        EvalClaim { tensor_id: tok_key, point: zr[..lb].to_vec(), value: tok_val },
+    ])
+}
+
+/// Reverse reduction proof. Its returned leaf claims still need independent/// Reverse reduction proof. Its returned leaf claims still need independent
 /// authentication against caller-trusted inputs and model commitments.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ReverseDagProof { steps: Vec<ReverseStep> }
@@ -215,6 +425,8 @@ enum ReverseReduction {
     Scale { proof: ReverseScaleProof },
     Argmax { proof: ReverseArgmaxProof },
     GatherMatMul { proof: ReverseGatherMatmulProof },
+    /// S7b: scatter-add with a replayed routing column.
+    Gather { proof: ReverseGatherProof },
     /// S7b: linear index relations (`out = scale*a + b`).
     CombineIdx { a: Goldilocks, b: Goldilocks },
     /// S7b: `out[i*b + j] = b*base[i] + j`.
@@ -1124,7 +1336,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, LookupPairs, LookupMultiplicity }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -1398,6 +1610,49 @@ fn prepare_expert_routing_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedA
     Some(prepared)
 }
 
+/// S7b: one-hot token-routing matrix for each Gather, one column per token
+/// over the position domain. The routing stays virtual: the verifier only
+/// opens these committed columns at transcript-derived points and ties them to
+/// the (claimed) token_id column; it never reads the routing table.
+fn gather_routing_aux_specs(ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<(usize, usize, usize, usize)>> {
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::Gather { token_id, m, h, .. } = op {
+            if !m.is_power_of_two() || !h.is_power_of_two() { return None; }
+            let key = TensorKey::Index(*token_id).encoded()?;
+            let s = *model.tensor_lengths.get(&key)?;
+            if s == 0 { return None; }
+            let arity = s.checked_next_power_of_two()?.trailing_zeros().max(5) as usize;
+            specs.push((i, s, arity, *m));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_gather_routing_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<PreparedAux>> {
+    let mut prepared = Vec::new();
+    for (op_index, len, arity, count) in gather_routing_aux_specs(ops, model)? {
+        let (token_id, m) = match &ops[op_index] { Op::Gather { token_id, m, .. } => (*token_id, *m), _ => return None };
+        let tok = store.idx.get(token_id)?;
+        if tok.len() != len { return None; }
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
+        for (pos, &t) in tok.iter().enumerate() {
+            let t = t as usize;
+            if t >= m { return None; }
+            columns[t][pos] = Goldilocks::ONE;
+        }
+        let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        let descriptor = AuxDescriptor { op_index, role: AuxRole::GatherRouting, len, arity, columns: count, commitment };
+        prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+    }
+    Some(prepared)
+}
+
 fn lookup_aux_specs(ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<(usize, AuxRole, usize, usize, usize)>> {    let mut specs = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         if let Op::Lookup { idx, table, .. } = op {
@@ -1460,7 +1715,11 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ExpertRouting, len, arity, cols))),
         None => return false,
     };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::LookupPairs => 4, AuxRole::LookupMultiplicity => 5 }));
+    match gather_routing_aux_specs(ops, model) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::GatherRouting, len, arity, cols))),
+        None => return false,
+    };
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -1860,10 +2119,12 @@ fn reverse_setup(ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript)
 }
 
 pub fn prove_reverse_dag(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript) -> Option<ReverseDagProof> {
-    prove_reverse_dag_inner(store, ops, seeds, transcript, &mut std::collections::BTreeMap::new(), None, None)
+    prove_reverse_dag_inner(store, ops, seeds, transcript, &mut std::collections::BTreeMap::new(), None, None, None)
 }
 
-fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>) -> Option<ReverseDagProof> {
+fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>) -> Option<ReverseDagProof> {
+    let replayed = execution.and_then(|e| replay_index_columns(ops, e));
+    let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
     let mut steps = Vec::new();
     for (op_index, op) in ops.iter().enumerate().rev() {
@@ -1948,20 +2209,36 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 }
                 ReverseReduction::GatherMatMul { proof }
             }
+            Op::Gather { .. } => {
+                let auxp = aux.remove(&(op_index, AuxRole::GatherRouting))?;
+                let pairs = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect::<Vec<_>>();
+                let (proof, incoming) = prove_reverse_gather(store, op, &pairs, auxp, transcript)?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::Gather { proof }
+            }
             Op::CombineIdx { a, b, scale, out: out_t, .. } => {
-                // S5 (reverse): out = scale*a + b at the claim point; both
-                // input values are carried and authenticated upstream. The
-                // u32 domain contract must be certifiable for the OUTPUT
-                // column: the verifier checks public index columns, and PadIdx
-                // copies preserve the bound; an arithmetic intermediate is not
-                // certifiable (a=MAX,b=1,scale=1 would make it 2^32), so it
-                // fails closed.
+                // S5 (reverse): out = scale*a + b at the claim point. When the
+                // verifier can replay the output (and inputs) from public
+                // data, the relation is checked against those exact columns;
+                // otherwise both input values are carried and authenticated
+                // upstream, and the u32 domain contract must be certifiable
+                // for the OUTPUT column (arithmetic intermediates are not).
                 if *scale >= (1usize << 32) { return None; }
                 let out_key = TensorKey::Index(*out_t).encoded()?;
-                if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
-                let av = idx_eval(store, *a, &point)?;
-                let bv = idx_eval(store, *b, &point)?;
-                if Goldilocks::from_u64(*scale as u64) * av + bv != value { return None; }
+                let (av, bv) = if let Some(col) = replayed.as_ref().and_then(|r| r.get(out_t).cloned()) {
+                    if replay_eval(&col, &point)? != value { return None; }
+                    (replay_eval(replayed.as_ref().and_then(|r| r.get(a))?, &point)?,
+                     replay_eval(replayed.as_ref().and_then(|r| r.get(b))?, &point)?)
+                } else {
+                    if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
+                    let av = idx_eval(store, *a, &point)?;
+                    let bv = idx_eval(store, *b, &point)?;
+                    if Goldilocks::from_u64(*scale as u64) * av + bv != value { return None; }
+                    (av, bv)
+                };
                 for (id, val) in [(*a, av), (*b, bv)] {
                     let key = TensorKey::Index(id).encoded()?;
                     absorb_reverse_claim(transcript, key, &point, val);
@@ -1971,17 +2248,23 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
             }
             Op::IdxBroadcast { base, b, out: out_t, .. } => {
                 // S5 (reverse): out[i*b + j] = b*base[i] + j; the low bits of
-                // the claim point are the closed-form j index. Same u32
-                // certification rule as CombineIdx for the output column.
+                // the claim point are the closed-form j index. Same replay /
+                // certification rule as CombineIdx.
                 if !b.is_power_of_two() || *b >= (1usize << 32) { return None; }
                 let out_key = TensorKey::Index(*out_t).encoded()?;
-                if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
                 let b_log = b.trailing_zeros() as usize;
                 if point.len() < b_log { return None; }
-                let (r_low, r_hi) = point.split_at(b_log);
-                let jval = mle_integer(r_low);
-                let bv = idx_eval(store, *base, r_hi)?;
-                if value != Goldilocks::from_u64(*b as u64) * bv + jval { return None; }
+                let (_r_low, r_hi) = point.split_at(b_log);
+                let bv = if let Some(col) = replayed.as_ref().and_then(|r| r.get(out_t).cloned()) {
+                    if replay_eval(&col, &point)? != value { return None; }
+                    replay_eval(replayed.as_ref().and_then(|r| r.get(base))?, r_hi)?
+                } else {
+                    if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
+                    let bv = idx_eval(store, *base, r_hi)?;
+                    let jval = mle_integer(&point[..b_log]);
+                    if value != Goldilocks::from_u64(*b as u64) * bv + jval { return None; }
+                    bv
+                };
                 let key = TensorKey::Index(*base).encoded()?;
                 absorb_reverse_claim(transcript, key, r_hi, bv);
                 claims.entry(key).or_default().push((r_hi.to_vec(), bv));
@@ -2051,10 +2334,12 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
 }
 
 pub fn verify_reverse_dag(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>> {
-    verify_reverse_dag_inner(ops, seeds, proof, transcript, &[], None, None)
+    verify_reverse_dag_inner(ops, seeds, proof, transcript, &[], None, None, None)
 }
 
-fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript, aux: &[AuxDescriptor], model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>) -> Option<Vec<EvalClaim>> {
+fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript, aux: &[AuxDescriptor], model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>) -> Option<Vec<EvalClaim>> {
+    let replayed = execution.and_then(|e| replay_index_columns(ops, e));
+    let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
     let mut steps = proof.steps.iter();
     for (op_index, op) in ops.iter().enumerate().rev() {
@@ -2133,29 +2418,53 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
             }
-            (Op::CombineIdx { a, b, scale, out: out_t, .. }, ReverseReduction::CombineIdx { a: av, b: bv }) => {
-                if *scale >= (1usize << 32) { return None; }
-                let out_key = TensorKey::Index(*out_t).encoded()?;
-                if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
-                if Goldilocks::from_u64(*scale as u64) * *av + *bv != value { return None; }
-                for (id, val) in [(*a, *av), (*b, *bv)] {
-                    let key = TensorKey::Index(id).encoded()?;
-                    absorb_reverse_claim(transcript, key, &point, val);
-                    claims.entry(key).or_default().push((point.clone(), val));
+            (Op::Gather { .. }, ReverseReduction::Gather { proof }) => {
+                let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::GatherRouting)?;
+                for c in verify_reverse_gather(op, &merged_out, descriptor, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
             }
-            (Op::IdxBroadcast { base, b, out: out_t, .. }, ReverseReduction::IdxBroadcast { base: bv }) => {
+            (Op::CombineIdx { a, b, scale, out: out_t, .. }, ReverseReduction::CombineIdx { a: _av, b: _bv }) => {
+                if *scale >= (1usize << 32) { return None; }
+                let out_key = TensorKey::Index(*out_t).encoded()?;
+                if let Some(col) = replayed.as_ref().and_then(|r| r.get(out_t).cloned()) {
+                    if replay_eval(&col, &point)? != value { return None; }
+                    let (ka, kb) = (TensorKey::Index(*a).encoded()?, TensorKey::Index(*b).encoded()?);
+                    let av = replay_eval(replayed.as_ref().and_then(|r| r.get(a))?, &point)?;
+                    let bv = replay_eval(replayed.as_ref().and_then(|r| r.get(b))?, &point)?;
+                    for (key, val) in [(ka, av), (kb, bv)] {
+                        absorb_reverse_claim(transcript, key, &point, val);
+                        claims.entry(key).or_default().push((point.clone(), val));
+                    }
+                } else {
+                    if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
+                    if Goldilocks::from_u64(*scale as u64) * *_av + *_bv != value { return None; }
+                    for (id, val) in [(*a, *_av), (*b, *_bv)] {
+                        let key = TensorKey::Index(id).encoded()?;
+                        absorb_reverse_claim(transcript, key, &point, val);
+                        claims.entry(key).or_default().push((point.clone(), val));
+                    }
+                }
+            }
+            (Op::IdxBroadcast { base, b, out: out_t, .. }, ReverseReduction::IdxBroadcast { base: _bv }) => {
                 if !b.is_power_of_two() || *b >= (1usize << 32) { return None; }
                 let out_key = TensorKey::Index(*out_t).encoded()?;
-                if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
                 let b_log = b.trailing_zeros() as usize;
                 if point.len() < b_log { return None; }
-                let (r_low, r_hi) = point.split_at(b_log);
-                let jval = mle_integer(r_low);
-                if value != Goldilocks::from_u64(*b as u64) * *bv + jval { return None; }
+                let (_r_low, r_hi) = point.split_at(b_log);
+                let bv = if let Some(col) = replayed.as_ref().and_then(|r| r.get(out_t).cloned()) {
+                    if replay_eval(&col, &point)? != value { return None; }
+                    replay_eval(replayed.as_ref().and_then(|r| r.get(base))?, r_hi)?
+                } else {
+                    if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
+                    let jval = mle_integer(&point[..b_log]);
+                    if value != Goldilocks::from_u64(*b as u64) * *_bv + jval { return None; }
+                    *_bv
+                };
                 let key = TensorKey::Index(*base).encoded()?;
-                absorb_reverse_claim(transcript, key, r_hi, *bv);
-                claims.entry(key).or_default().push((r_hi.to_vec(), *bv));
+                absorb_reverse_claim(transcript, key, r_hi, bv);
+                claims.entry(key).or_default().push((r_hi.to_vec(), bv));
             }
             (Op::PadIdx { base, len, base_len, .. }, ReverseReduction::PadIdx { base: bv }) => {
                 if *base_len == 0 || *base_len > *len { return None; }
@@ -7781,6 +8090,98 @@ pub struct BoundTokenBinding {
     pub opening: zkie_core::pcs::batch_open::BatchOpeningProof,
 }
 
+/// S7b: exactly replay every index tensor that is a deterministic function
+/// of the caller-authenticated public inputs (Scatter from a public `sel`,
+/// PadIdx, CombineIdx, IdxBroadcast), with the same checked u32 semantics as
+/// the forward. The verifier then knows these columns outright — a prover
+/// cannot deviate, and arithmetic intermediates are range-safe by
+/// construction. Index tensors derived from non-public data are absent and
+/// fail closed at their consumers.
+fn replay_index_columns(ops: &[Op], execution: &TrustedExecution)
+    -> Option<std::collections::BTreeMap<T, Vec<u32>>>
+{
+    if usize::BITS != 64 { return None; }
+    let tag = 1usize << (usize::BITS - 1);
+    let mut cols: std::collections::BTreeMap<T, Vec<u32>> = std::collections::BTreeMap::new();
+    for (id, vals) in &execution.inputs {
+        if id & tag == 0 { continue; }
+        let raw = id & !tag;
+        let mut out = Vec::with_capacity(vals.len());
+        for &v in vals {
+            let n = to_i64(v);
+            if n < 0 || (n as u64) >= (1u64 << 32) { return None; }
+            out.push(n as u32);
+        }
+        cols.insert(raw, out);
+    }
+    for _ in 0..=ops.len() {
+        let mut changed = false;
+        for op in ops {
+            match op {
+                Op::Scatter { sel, token_id, expert_of, m, n } => {
+                    if cols.contains_key(token_id) || cols.contains_key(expert_of) { continue; }
+                    if !m.is_power_of_two() || !n.is_power_of_two() { return None; }
+                    let selv = execution.inputs.get(sel)?;
+                    if selv.len() != m.checked_mul(*n)? { return None; }
+                    let mut row_sum: Option<usize> = None;
+                    for t in 0..*m {
+                        let mut ones = 0usize;
+                        for e in 0..*n {
+                            let v = to_i64(selv[t * n + e]);
+                            if v != 0 && v != 1 { return None; }
+                            if v == 1 { ones += 1; }
+                        }
+                        match row_sum { None => row_sum = Some(ones), Some(k) if k != ones => return None, _ => {} }
+                    }
+                    let (tok, exp) = crate::scatter::scatter_forward(selv, *m, *n);
+                    cols.insert(*token_id, tok);
+                    cols.insert(*expert_of, exp);
+                    changed = true;
+                }
+                Op::PadIdx { base, out, len, base_len } => {
+                    if let Some(mut b) = cols.get(base).cloned() {
+                        if b.len() != *base_len || *len < *base_len { return None; }
+                        b.resize(*len, 0);
+                        if cols.insert(*out, b).is_none() { changed = true; }
+                    }
+                }
+                Op::CombineIdx { a, b, out, scale } => {
+                    if let (Some(av), Some(bv)) = (cols.get(a).cloned(), cols.get(b).cloned()) {
+                        if *scale >= (1usize << 32) || av.len() != bv.len() { return None; }
+                        let mut o = Vec::with_capacity(av.len());
+                        for (x, y) in av.iter().zip(&bv) {
+                            o.push(x.checked_mul(*scale as u32)?.checked_add(*y)?);
+                        }
+                        if cols.insert(*out, o).is_none() { changed = true; }
+                    }
+                }
+                Op::IdxBroadcast { base, out, b } => {
+                    if let Some(bv) = cols.get(base).cloned() {
+                        if !b.is_power_of_two() || *b >= (1usize << 32) { return None; }
+                        let mut o = Vec::with_capacity(bv.len().checked_mul(*b)?);
+                        for &v in &bv {
+                            for j in 0..*b { o.push(v.checked_mul(*b as u32)?.checked_add(j as u32)?); }
+                        }
+                        if cols.insert(*out, o).is_none() { changed = true; }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !changed { break; }
+    }
+    Some(cols)
+}
+
+/// Evaluate a replayed u32 column over its zero-padded 2^point.len() domain.
+fn replay_eval(col: &[u32], point: &[Goldilocks]) -> Option<Goldilocks> {
+    let padded = 1usize.checked_shl(point.len() as u32)?;
+    if col.len() > padded { return None; }
+    let mut vals = vec![Goldilocks::ZERO; padded];
+    for (i, &v) in col.iter().enumerate() { vals[i] = Goldilocks::from_u64(v as u64); }
+    Some(mle::eval(&vals, point))
+}
+
 /// S7b: index tensors whose u32 domain the verifier can certify. A tensor is
 /// certified when it is a caller-authenticated public input/output (the
 /// verifier range-checks every value) or when a PadIdx copies it (PadIdx only
@@ -7845,6 +8246,17 @@ fn fill_index_shapes(ops: &[Op], lengths: &mut std::collections::BTreeMap<T, usi
                         ins(ka, len, lengths, &mut changed);
                         ins(kb, len, lengths, &mut changed);
                         ins(ko, len, lengths, &mut changed);
+                    }
+                }
+                Op::Gather { weighted, token_id, gate, out, m, h } => {
+                    let kt = TensorKey::Index(*token_id).encoded();
+                    let s = kt.and_then(|k| lengths.get(&k).copied());
+                    if let Some(s) = s {
+                        let wl = s.checked_mul(*h);
+                        let ol = m.checked_mul(*h);
+                        if let Some(l) = wl { ins(TensorKey::Field(*weighted).encoded(), l, lengths, &mut changed); }
+                        ins(TensorKey::Field(*gate).encoded(), s, lengths, &mut changed);
+                        if let Some(l) = ol { ins(TensorKey::Field(*out).encoded(), l, lengths, &mut changed); }
                     }
                 }
                 Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
@@ -7932,6 +8344,16 @@ fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<
                 let ko = TensorKey::Index(*out).encoded()?;
                 let lb = *model.tensor_lengths.get(&kb)?;
                 if *model.tensor_lengths.get(&ko)? != lb.checked_mul(*b)? { return None; }
+            }
+            Op::Gather { weighted, token_id, gate, out, m, h } => {
+                let kt = TensorKey::Index(*token_id).encoded()?;
+                let s = *model.tensor_lengths.get(&kt)?;
+                let kw = TensorKey::Field(*weighted).encoded()?;
+                let kg = TensorKey::Field(*gate).encoded()?;
+                let ko = TensorKey::Field(*out).encoded()?;
+                if *model.tensor_lengths.get(&kw)? != s.checked_mul(*h)?
+                    || *model.tensor_lengths.get(&kg)? != s
+                    || *model.tensor_lengths.get(&ko)? != m.checked_mul(*h)? { return None; }
             }
             _ => {}
         }
@@ -8142,6 +8564,7 @@ pub fn prove_committed_shard_dag_bound(
     prepared.extend(prepare_scale_aux(store, ops, model)?);
     prepared.extend(prepare_argmax_aux(store, ops)?);
     prepared.extend(prepare_expert_routing_aux(store, ops)?);
+    prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
     prepared.extend(prepare_lookup_aux(store, ops, model)?);
     prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
@@ -8151,9 +8574,9 @@ pub fn prove_committed_shard_dag_bound(
     let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux)?;
     let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
     let certified = certified_index_tensors(ops, execution);
-    let reverse = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified))?;
+    let reverse = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution))?;
     let (mut replay, replay_seeds) = execution_seeds(ops, model, execution, &aux)?;
-    let leaves = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model), Some(&certified))?;
+    let leaves = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model), Some(&certified), Some(execution))?;
     let groups = group_reverse_weights(model, ops, &leaves)?;
     let mut weight_openings = Vec::with_capacity(groups.len());
     for (bi, entries) in groups.iter().enumerate() {
@@ -8206,7 +8629,7 @@ pub fn verify_committed_shard_dag_bound(
     }
     let (mut transcript, seeds) = match execution_seeds(ops, model, execution, &proof.aux) { Some(v) => v, None => return false };
     let certified = certified_index_tensors(ops, execution);
-    let leaves = match verify_reverse_dag_inner(ops, &seeds, &proof.reverse, &mut transcript, &proof.aux, Some(model), Some(&certified)) {
+    let leaves = match verify_reverse_dag_inner(ops, &seeds, &proof.reverse, &mut transcript, &proof.aux, Some(model), Some(&certified), Some(execution)) {
         Some(v) => v, None => return false,
     };
     let weights: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
@@ -12950,32 +13373,41 @@ mod tests {
         assert!(!build(&honest_expert, &oor, None, None).0);
     }
 
-    /// S7: the gate-weighted MoE tail (BroadcastScale / Gather / Scatter /
-    /// CombineIdx) has no reverse reduction yet — the bound path must refuse
-    /// such graphs, so a tampered router gate cannot yield an accepted proof.
+    /// S7b: Scatter/Gather themselves now reduce in the bound path, but the
+    /// gate-weighted tail still contains the multiplicative BroadcastScale
+    /// product, which has no reverse reduction — the bound path must refuse
+    /// the graph (fail closed), so a tampered gate in that tail cannot yield
+    /// an accepted proof.
     #[test]
-    fn s7_gate_weighted_chain_fail_closed() {
+    fn s7b_gate_weighted_tail_fail_closed() {
         use zkie_core::pcs::whir::Whir;
-        let (m, h, p) = (4usize, 2usize, 2usize);
+        let (m, h) = (4usize, 4usize);
         let mut store = Store::new();
-        let weighted = store.push((0..m * p).map(|i| from_i64(i as i64 + 1)).collect());
-        let token_id = store.push_idx(vec![0u32, 1, 2, 3]);
-        let gate = store.push(vec![Goldilocks::ONE; m]);
+        let mut sel = vec![Goldilocks::ZERO; m];
+        for t in 0..m { sel[t] = Goldilocks::ONE; }
+        let sel_t = store.push(sel);
+        let token_id = store.push_idx(vec![]);
+        let expert_of = store.push_idx(vec![]);
+        let d = store.push((0..m * h).map(|i| from_i64(i as i64 + 1)).collect());
+        let gate_pos = store.push((0..m).map(|i| from_i64(i as i64 + 1)).collect());
+        let weighted = store.push(vec![]);
         let out = store.push(vec![]);
-        let ops = vec![Op::Gather { weighted, token_id, gate, out, m, h: p }];
+        let ops = vec![
+            Op::Scatter { sel: sel_t, token_id, expert_of, m, n: 1 },
+            Op::BroadcastScale { x: d, scale: gate_pos, out: weighted, h },
+            Op::Gather { weighted, token_id, gate: gate_pos, out, m, h },
+        ];
         let whir = Whir::new_testing(5);
-        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7-gate");
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7b-tail");
         forward_ops(&mut store, &ops);
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
-            .with_index_shapes(&[(token_id, m)].into());
-        let tok_key = TensorKey::Index(token_id).encoded().unwrap();
-        let tok_vals: Vec<Goldilocks> = store.idx[token_id].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+            .with_index_shapes(&[(token_id, m), (expert_of, m)].into());
         let execution = TrustedExecution {
-            inputs: [(weighted, store.get(weighted).to_vec()), (gate, store.get(gate).to_vec()), (tok_key, tok_vals)].into(),
+            inputs: [(sel_t, store.get(sel_t).to_vec()), (d, store.get(d).to_vec()), (gate_pos, store.get(gate_pos).to_vec())].into(),
             outputs: [(out, store.get(out).to_vec())].into(),
         };
         assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).is_none(),
-            "gate-weighted Gather must stay fail-closed until its reverse reduction lands");
+            "the multiplicative gate-weighted tail must stay fail-closed");
     }
 
     /// S7 (TL review): a short expert weight that pads into the SAME WHIR
@@ -13238,14 +13670,12 @@ mod tests {
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
-        // Forged CombineIdx relation.
-        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
-        let mut hit = false;
-        for step in &mut forged.reverse.steps {
-            if let ReverseReduction::CombineIdx { a: av, .. } = &mut step.reduction { *av += Goldilocks::ONE; hit = true; }
-        }
-        assert!(hit);
-        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        // CombineIdx is replay-checked: the carried values are ignored when the
+        // verifier can recompute the columns, so the relation is pinned by the
+        // public output instead. Tampering the public output must reject.
+        let mut bad_out = execution.clone();
+        bad_out.outputs.get_mut(&key(c)).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_out));
         // Forged PadIdx zero-extension value.
         let mut forged2: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
         for step in &mut forged2.reverse.steps {
@@ -13376,7 +13806,110 @@ mod tests {
         assert!(r.is_err(), "the checked forward must refuse the overflowing intermediate");
     }
 
-    /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and
+    /// S7b: Gather with a committed one-hot routing matrix (authenticated
+    /// routing, never read in full by the verifier). The token_id column is a
+    /// public input here (leaf-authenticated); the selector columns are only
+    /// opened at transcript-derived points. Scatter/top-k/uniqueness stay
+    /// fail-closed (S7c).
+    #[allow(clippy::type_complexity)]
+    fn s7b_gather_fixture() -> (Store, Vec<Op>, zkie_core::pcs::whir::Whir, Vec<CachedWeightBatch>, TrustedModelManifest, TrustedExecution, T, T, T) {
+        use zkie_core::pcs::whir::Whir;
+        let (m, h, s) = (4usize, 2usize, 8usize);
+        let mut store = Store::new();
+        let token_id = store.push_idx(vec![0u32, 0, 1, 1, 2, 2, 3, 3]);
+        let weighted = store.push((0..s * h).map(|i| from_i64((i as i64 % 7) + 1)).collect());
+        let gate = store.push((0..s).map(|i| from_i64((i as i64 % 3) + 1)).collect());
+        let out = store.push(vec![]);
+        let ops = vec![Op::Gather { weighted, token_id, gate, out, m, h }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7b-gather");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(token_id, s)].into());
+        let tok_key = TensorKey::Index(token_id).encoded().unwrap();
+        let to_g = |v: &[u32]| v.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect::<Vec<_>>();
+        let execution = TrustedExecution {
+            inputs: [
+                (weighted, store.get(weighted).to_vec()),
+                (gate, store.get(gate).to_vec()),
+                (tok_key, to_g(&store.idx[token_id])),
+            ].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        (store, ops, whir, cached, model, execution, weighted, gate, token_id)
+    }
+
+    #[test]
+    fn s7b_gather_authenticated_routing_roundtrip() {
+        let (mut store, ops, whir, cached, model, execution, weighted, gate, token_id) = s7b_gather_fixture();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // Tampered routing input (leaf/tie) must reject.
+        let tk = TensorKey::Index(token_id).encoded().unwrap();
+        let mut bad_tok = execution.clone();
+        bad_tok.inputs.get_mut(&tk).unwrap()[0] = Goldilocks::from_u64(1);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_tok));
+        // Tampered weighted/gate inputs (leaves) must reject.
+        let mut bad_w = execution.clone();
+        bad_w.inputs.get_mut(&weighted).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_w));
+        let mut bad_g = execution.clone();
+        bad_g.inputs.get_mut(&gate).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_g));
+        // Forged selector openings (counts side) must reject.
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::Gather { proof: p } = &mut step.reduction {
+                p.aux_values[0] += Goldilocks::ONE;
+                hit = true;
+            }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        // Forged gate endpoint breaks the scatter-add identity.
+        let mut forged2: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for step in &mut forged2.reverse.steps {
+            if let ReverseReduction::Gather { proof: p } = &mut step.reduction { p.sum.final_evals[2] += Goldilocks::ONE; }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged2, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// S7c boundary: Scatter has no authenticated-routing reverse reduction yet
+    /// (the routing must be reduced to the router's authenticated selector,
+    /// not replayed by the verifier), so any graph containing it fails closed.
+    /// Top-k, active-pair uniqueness and the router-gate chain are NOT yet
+    /// satisfied — this slice does not complete S7.
+    #[test]
+    fn s7c_scatter_still_fail_closed() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, n) = (4usize, 4usize);
+        let mut store = Store::new();
+        let mut sel = vec![Goldilocks::ZERO; m * n];
+        for t in 0..m { sel[t * n + (t % n)] = Goldilocks::ONE; }
+        let sel_t = store.push(sel);
+        let token_id = store.push_idx(vec![]);
+        let expert_of = store.push_idx(vec![]);
+        let ops = vec![Op::Scatter { sel: sel_t, token_id, expert_of, m, n }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-scatter");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(token_id, m), (expert_of, m)].into());
+        let tk = TensorKey::Index(token_id).encoded().unwrap();
+        let ek = TensorKey::Index(expert_of).encoded().unwrap();
+        let to_g = |v: &[u32]| v.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect::<Vec<_>>();
+        let execution = TrustedExecution {
+            inputs: [(sel_t, store.get(sel_t).to_vec())].into(),
+            outputs: [(tk, to_g(&store.idx[token_id])), (ek, to_g(&store.idx[expert_of]))].into(),
+        };
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).is_none(),
+            "Scatter must stay fail-closed until the authenticated-routing reduction lands");
+    }
+
+    /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and    /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and
     /// sumcheck are both emptied must be rejected (empty lists can never skip
     /// non-empty computation).
     #[test]

@@ -1,6 +1,13 @@
 # S7 · MoE expert binding in the bound reverse path — protocol design
 
-Status: **STAGED / PARTIAL — S7 is NOT complete.** The GatherMatMul
+Status: **STAGED / PARTIAL — S7 is NOT complete.** The Gather reduction now
+uses an authenticated one-hot routing matrix (committed aux, opened only at
+transcript-derived points) — the verifier never reads the routing table.
+A verifier-side public-index replay prototype was rejected by review and
+removed; Scatter keeps failing closed until its permutation/compaction
+reduction lands.
+
+Status (earlier): **STAGED / PARTIAL — S7 is NOT complete.** The GatherMatMul
 expert-FFN core is implemented and tested on an isolated small MoE graph;
 the linear index ops (CombineIdx/IdxBroadcast/PadIdx) are implemented and
 tested as the first S7b batch. Scatter/Gather and the gate-weighted tail remain fail-closed. The
