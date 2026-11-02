@@ -52,6 +52,17 @@
 ### 阶段 E · 性能优化（依赖 S1–S9）
 - [ ] O1–O7（Argmax 公开选择器归约 / 边界 claims 合并 / 去堆分配 / eq 闭式求值 / 权重分组加载 / 拆 witness 与证明构建 / 同表 LogUp 共享）
 
+## Reverse-verification 工作线（bound API）
+
+8e4bc10 引入 `prove/verify_committed_shard_dag_bound` 后，逐 op 反向归约工作线（3915b32 → `reverse:` 提交）：
+
+- **Argmax 反向归约修复**：gate/d1/d2 乘法关系不再点态比较 MLE 值——点态乘积的 MLE ≠ MLE 的乘积，旧检查连诚实证明都拒绝（随机点上 `gate-MLE(q) ≠ sel-MLE(q)·x-MLE(q)`）。改为 S5 同款 eq 加权整列 virtual（乘积在项内，claim 0 迫使点态关系在随机 eq 点消失）：gate `eq·(sel·x−gate)`、d1 `eq·(sel·x−sel·thr_b−d1)`、d2 `eq·(thr_b−x−sel·thr_b+sel·x−d2)`，thr_b = thr 行广播列。端点认证 = aux sel opening（col 0 @ z）+ 返回 claims（x/thr/gate/d1/d2 经上游链或 leaf 绑定认证——leaf 绑定扩展到公开 outputs）。d2 bits 解码、tie = d2−before+sel 为线性关系保持点态校验（并修 verify 侧 av 偏移 bug，d2_tie 读错索引）。thr_sum 的 eq 核改用 thr claim 点 qt（原 r_rows 与端点检查 eq_poly(qt,·) 不一致，死代码 qt_rows 落位）。
+  - **sel_bool / bit_bool 补 eq 加权**（review 发现）：原 terms 只用索引 1/2，只检查全局和 Σ b(1−b)=0——非布尔元素可跨位置抵消（如 8 个 1/2 与 1 个 2）。每项乘上 eq 列（含 sel·before 项），claim 0 变为在随机 eq 点的逐位置关系。回归：`argmax_sel_bool_eq_weighting_rejects_cancelling_nonboolean_witness`、`argmax_bit_bool_eq_weighting_rejects_cancelling_nonboolean_witness`（未加权和为零的非布尔 witness，修复前可通过、修复后拒绝）。
+- **bound API 的 S6 迁移**：`LanguageModel` statement 接入 bound 验证——序列检查全用公开数据（prompt/response + 公开 argmax outputs，proof 不携带 tokens）；tie 规则由 Argmax 归约的首个最大绑定强制（公开 argmax 伪造并列第二个 → out_sum/归约拒绝）；per-Argmax selector openings（ArgmaxWitness aux 列 0 在公开 argmax 推导的 per-position 点 == 1，points 由 verifier 重推导，换点/换公开 argmax 均拒绝）；embedding token binding（第一个 Lookup 的 LookupPairs aux 列 0 在 r 点 opening，claimed = 公开 tokens 重算 x̂(r)，r 在 `b"zkie-committed-public-v1"` 上派生）。aux 批 opening 的 whir 重建必须用批量变量数 vars（commit_batch 返回的 whir 尺寸），用 arity 会 panic。
+- **遗留测试迁移**：`committed_shard_dag_roundtrip`（投影链）、`s6_lm_honest_roundtrip`、`s6_tie_rule_rejected`（+ 公开 argmax 伪造并列第二个拒绝）、`s6_empty_prompt_roundtrip`、`s6_generic_skips_sequence`、`argmax_selection_openings_are_individual`（换点 + 公开 argmax 改列拒绝）迁移到 bound API。`s2_committed_scatter_gather_roundtrip` 改为显式拒绝回归：bound 路径尚无 Scatter/Gather 反向归约（S7 MoE 专家绑定的前置工作），committed verifier 必须明确拒绝（不默默通过）——诚实 roundtrip 恢复留给 S7。
+- 删除 3915b32 遗留的全部临时 eprintln 诊断。
+- 回归：`committed_argmax_chain_binds_all_outputs_and_tie_rule` 绿（含 aux_values / gate_rel.final_evals / sel 端点 4 类伪造拒绝）；zkie-ops lib 111 绿；core 66 绿、engine 3 绿、models 全绿、examples build ok。
+
 ## 反例回归
 
 每个 S 修复后，把已复现攻击固化为应拒绝的回归测试：

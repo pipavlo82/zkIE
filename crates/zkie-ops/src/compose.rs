@@ -404,10 +404,11 @@ struct ReverseArgmaxProof {
     before_sum: VirtualProof,
     out_sum: VirtualProof,
     thr_sum: VirtualProof,
+    gate_rel: VirtualProof,
+    d1_rel: VirtualProof,
+    d2_rel: VirtualProof,
     aux_values: Vec<Goldilocks>,
     opening: zkie_core::pcs::batch_open::BatchOpeningProof,
-    x_evals: [Goldilocks; 4],
-    thr_evals: [Goldilocks; 2],
 }
 
 fn argmax_pad_point(point: &[Goldilocks], arity: usize) -> Vec<Goldilocks> {
@@ -442,10 +443,39 @@ fn argmax_coeff_col(eq_rows: &[Goldilocks], coeff: &[Goldilocks], m: usize, n: u
     out
 }
 
+/// Shared by prove/verify and the malicious-witness regressions: the
+/// eq-weighted sel_bool relation terms. Every term carries the eq column
+/// (index 0) — claim 0 then forces the per-position relation
+/// `sel(1-sel) + g·before(1-before) + g²·sel·before` to vanish at the random
+/// eq point; an unweighted global sum could hide non-boolean entries by
+/// cross-position cancellation.
+fn argmax_sel_bool_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+    vec![
+        (Goldilocks::ONE, vec![0usize, 1usize]),
+        (-Goldilocks::ONE, vec![0usize, 1usize, 1usize]),
+        (gamma, vec![0usize, 2usize]),
+        (-gamma, vec![0usize, 2usize, 2usize]),
+        (gamma * gamma, vec![0usize, 1usize, 2usize]),
+    ]
+}
+
+/// Shared by prove/verify and the regressions: the eq-weighted bit_bool
+/// relation terms for `count` bit columns (mle indices 1..=count), each
+/// term carrying the eq column at index 0.
+fn argmax_bit_bool_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec<usize>)> {
+    let mut terms = Vec::with_capacity(2 * count);
+    let mut gp = Goldilocks::ONE;
+    for i in 0..count {
+        terms.push((gp, vec![0usize, 1 + i]));
+        terms.push((-gp, vec![0usize, 1 + i, 1 + i]));
+        gp = gp * gamma;
+    }
+    terms
+}
+
 fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseArgmaxProof, Vec<EvalClaim>)>
 {
-    eprintln!("argmax-enter outs={}", outs.len());
     let (x, sel, thr, gate, d1, d2, out, m, n) = match op {
         Op::Argmax { x, sel, thr, gate, d1, d2, out, m, n } => (*x, *sel, *thr, *gate, *d1, *d2, *out, *m, *n),
         _ => return None,
@@ -458,44 +488,58 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
     let len = 1usize.checked_shl(arity as u32)?;
     let (qs, vs) = argmax_claim(outs, sel)?;
     let (qt, vt) = argmax_claim(outs, thr)?;
-    let (qg, vg) = argmax_claim(outs, gate)?;
+    let (_qg, _vg) = argmax_claim(outs, gate)?;
     let (qd, vd) = argmax_claim(outs, d1)?;
     let (q2, v2) = argmax_claim(outs, d2)?;
     let out_key = TensorKey::Index(out).encoded()?;
     let (qo, vo) = argmax_claim(outs, out_key)?;
-    eprintln!("argmax-claims qs={} qg={} qd={} q2={} qt={} qo={} arity={} lgm={}", qs.len(), qg.len(), qd.len(), q2.len(), qt.len(), qo.len(), arity, lgm);
-    if qs.len() != arity || qg.len() != arity || qd.len() != arity || q2.len() != arity
-        || qt.len() != lgm || qo.len() != lgm { eprintln!("argmax-len"); return None; }
+    if qs.len() != arity || qd.len() != arity || q2.len() != arity
+        || qt.len() != lgm || qo.len() != lgm { return None; }
     let cols = &aux.columns;
     let col_eval = |i: usize, p: &[Goldilocks]| mle::eval(&cols[i], &argmax_pad_point(p, arity));
     let mut xp = store.get(x).to_vec(); xp.resize(len, Goldilocks::ZERO);
     let thrv = store.get(thr).to_vec();
-    eprintln!("argmax-thr-len={} m={}", thrv.len(), m);
-    if thrv.len() != m { eprintln!("argmax-thr-bad"); return None; }
+    if thrv.len() != m { return None; }
     let row_of = |p: &[Goldilocks]| -> Vec<Goldilocks> { p[lgn..lgn + lgm].to_vec() };
-    let x_at = |p: &[Goldilocks]| mle::eval(&xp, &argmax_pad_point(p, arity));
 
-    // Pointwise bindings at the claim points.
-    if col_eval(0, &qs) != vs { eprintln!("argmax-fail sel vs={} aux={}", to_i64(vs), to_i64(col_eval(0, &qs))); return None; }
-    eprintln!("argmax-step selok");
-    let sel_g = col_eval(0, &qg);
-    let x_g = x_at(&qg);
-    if vg != sel_g * x_g { eprintln!("argmax-fail gate vg={} sel={} x={} prod={} direct_g={} direct_sel={} direct_x={}", to_i64(vg), to_i64(sel_g), to_i64(x_g), to_i64(sel_g * x_g), to_i64(mle::eval(store.get(gate), &argmax_pad_point(&qg, arity))), to_i64(mle::eval(store.get(sel), &argmax_pad_point(&qg, arity))), to_i64(mle::eval(store.get(x), &argmax_pad_point(&qg, arity)))); return None; }
-    eprintln!("argmax-step gateok");
-    let sel_d = col_eval(0, &qd);
-    let x_d = x_at(&qd);
-    let thr_d = mle::eval(&thrv, &row_of(&qd));
-    if vd != Goldilocks::ZERO || vd != sel_d * (x_d - thr_d) { eprintln!("argmax-fail d1 vd={} sel={} x={} thr={}", to_i64(vd), to_i64(sel_d), to_i64(x_d), to_i64(thr_d)); return None; }
-    eprintln!("argmax-step d1ok");
-    let sel_2 = col_eval(0, &q2);
-    let x_2 = x_at(&q2);
-    let thr_2 = mle::eval(&thrv, &row_of(&q2));
-    if v2 != (Goldilocks::ONE - sel_2) * (thr_2 - x_2) { eprintln!("argmax-fail d2"); return None; }
-    eprintln!("argmax-step d2ok");
+    // Pointwise bindings at the claim points (linear relations only).
+    if col_eval(0, &qs) != vs { return None; }
+    if vd != Goldilocks::ZERO { return None; }
     let mut d2_at_q2 = Goldilocks::ZERO;
     for b in 0..ARGMAX_D2_BITS { d2_at_q2 = d2_at_q2 + Goldilocks::from_u64(1u64 << b) * col_eval(ARGMAX_D2_COL + b, &q2); }
-    if d2_at_q2 != v2 { eprintln!("argmax-fail d2bits"); return None; }
-    eprintln!("argmax-step d2bitsok");
+    if d2_at_q2 != v2 { return None; }
+
+    // S5: gate = sel*x, d1 = sel*(x-thr), d2 = (1-sel)*(thr-x) are
+    // MULTIPLICATIVE relations: the MLE of the pointwise product is not the
+    // product of the MLEs, so each is proven as an eq-weighted whole-column
+    // virtual with the products inside the summed terms (same construction
+    // as the S5 topk gate/d1/d2 virtuals). Claim 0 forces the
+    // multilinearization (i.e. the pointwise relation) to vanish at the
+    // random eq point; the endpoint evaluation is authenticated via the aux
+    // opening (sel) and the returned claims (x / thr / gate / d1 / d2).
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let q_rel: Vec<Goldilocks> = transcript.field_vec(arity);
+    let eq_rel = mle::eq_evals(&q_rel);
+    let thr_b: Vec<Goldilocks> = thrv.iter().flat_map(|&v| std::iter::repeat(v).take(n)).collect();
+    let gate_terms = vec![
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 3usize]),
+    ];
+    let (gate_rel, zg) = prove_virtual(&[&eq_rel, &cols[0], &xp, store.get(gate)], &gate_terms, Goldilocks::ZERO, transcript);
+    let d1_terms = vec![
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 1usize, 3usize]),
+        (neg, vec![0usize, 4usize]),
+    ];
+    let (d1_rel, zd1) = prove_virtual(&[&eq_rel, &cols[0], &xp, &thr_b, store.get(d1)], &d1_terms, Goldilocks::ZERO, transcript);
+    let d2_terms = vec![
+        (Goldilocks::ONE, vec![0usize, 3usize]),
+        (neg, vec![0usize, 2usize]),
+        (neg, vec![0usize, 1usize, 3usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 4usize]),
+    ];
+    let (d2_rel, zd2) = prove_virtual(&[&eq_rel, &cols[0], &xp, &thr_b, store.get(d2)], &d2_terms, Goldilocks::ZERO, transcript);
 
     // Challenge points.
     let q_bool = transcript.field_vec(arity);
@@ -518,29 +562,21 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
     let qo_rows = mle::eq_evals(&qo);
     let out_coeff = argmax_coeff_col(&qo_rows, &(0..n).map(|j| Goldilocks::from_u64(j as u64)).collect::<Vec<_>>(), m, n, arity);
     let qt_rows = mle::eq_evals(&qt);
+    let thr_rows_col = argmax_coeff_col(&qt_rows, &ones, m, n, arity);
 
     // Virtual proofs (aux evals at endpoints are opened in one batch below).
     let eq_bool = mle::eq_evals(&q_bool);
     let mut mles: Vec<&[Goldilocks]> = vec![&eq_bool, &cols[0], &cols[1]];
-    let g = gamma_bool;
-    let terms = vec![
-        (Goldilocks::ONE, vec![1usize]),
-        (-Goldilocks::ONE, vec![1usize, 1usize]),
-        (g, vec![2usize]),
-        (-g, vec![2usize, 2usize]),
-        (g * g, vec![1usize, 2usize]),
-    ];
+    // Shared constructor: every term is eq-weighted (index 0) — claim 0
+    // forces the per-position relation to vanish AT the random eq point; an
+    // unweighted global sum could hide non-boolean entries by cross-position
+    // cancellation.
+    let terms = argmax_sel_bool_terms(gamma_bool);
     let (sel_bool, z1) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
     let eq_bit = mle::eq_evals(&q_bit);
     mles = vec![&eq_bit];
     for i in 0..(ARGMAX_D2_BITS + ARGMAX_TIE_BITS) { mles.push(&cols[ARGMAX_D2_COL + i]); }
-    let mut bit_terms = Vec::new();
-    let mut gp = Goldilocks::ONE;
-    for i in 0..(ARGMAX_D2_BITS + ARGMAX_TIE_BITS) {
-        bit_terms.push((gp, vec![1 + i]));
-        bit_terms.push((-gp, vec![1 + i, 1 + i]));
-        gp = gp * gamma_bit;
-    }
+    let bit_terms = argmax_bit_bool_terms(gamma_bit, ARGMAX_D2_BITS + ARGMAX_TIE_BITS);
     let (bit_bool, z2) = prove_virtual(&mles, &bit_terms, Goldilocks::ZERO, transcript);
     let mles_rs: Vec<&[Goldilocks]> = vec![&eq_rows_col, &cols[0]];
     let (row_sum, z3) = prove_virtual(&mles_rs, &[(Goldilocks::ONE, vec![0usize, 1usize])], Goldilocks::ONE, transcript);
@@ -548,7 +584,7 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
     let (before_sum, z4) = prove_virtual(&mles_bs, &[(Goldilocks::ONE, vec![0usize, 1usize])], before_r, transcript);
     let mles_os: Vec<&[Goldilocks]> = vec![&out_coeff, &cols[0]];
     let (out_sum, z5) = prove_virtual(&mles_os, &[(Goldilocks::ONE, vec![0usize, 1usize])], vo, transcript);
-    let mles_ts: Vec<&[Goldilocks]> = vec![&eq_rows_col, &cols[0], &xp];
+    let mles_ts: Vec<&[Goldilocks]> = vec![&thr_rows_col, &cols[0], &xp];
     let (thr_sum, z6) = prove_virtual(&mles_ts, &[(Goldilocks::ONE, vec![0usize, 1usize, 2usize])], vt, transcript);
     let zs = [&z1, &z2, &z3, &z4, &z5, &z6];
 
@@ -558,19 +594,14 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
     let mut values: Vec<Goldilocks> = Vec::new();
     macro_rules! push { ($idx:expr, $point:expr, $val:expr) => {{ idxs.push($idx); points.push($point); values.push($val); }}; }
     push!(0, argmax_pad_point(&qs, arity), vs);
-    push!(0, argmax_pad_point(&qg, arity), sel_g);
-    push!(0, argmax_pad_point(&qd, arity), sel_d);
-    push!(0, argmax_pad_point(&q2, arity), sel_2);
     push!(ARGMAX_BEFORE_COL, argmax_pad_point(&r_before, arity), before_r);
     for b in 0..ARGMAX_D2_BITS { push!(ARGMAX_D2_COL + b, argmax_pad_point(&q2, arity), col_eval(ARGMAX_D2_COL + b, &q2)); }
     push!(ARGMAX_BEFORE_COL, argmax_pad_point(&q_tie, arity), col_eval(ARGMAX_BEFORE_COL, &q_tie));
     push!(0, argmax_pad_point(&q_tie, arity), col_eval(0, &q_tie));
     for b in 0..ARGMAX_D2_BITS { push!(ARGMAX_D2_COL + b, argmax_pad_point(&q_tie, arity), col_eval(ARGMAX_D2_COL + b, &q_tie)); }
     for b in 0..ARGMAX_TIE_BITS { push!(ARGMAX_TIE_COL + b, argmax_pad_point(&q_tie, arity), col_eval(ARGMAX_TIE_COL + b, &q_tie)); }
-    let mut sel_idx_fixed = Vec::new();
     for z in zs {
         let zp = argmax_pad_point(z, arity);
-        sel_idx_fixed.push(values.len());
         push!(0, zp.clone(), mle::eval(&cols[0], &zp));
     }
     // sel_bool also needs before.
@@ -581,21 +612,29 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
         bit_idx.push(values.len());
         push!(ARGMAX_D2_COL + i, argmax_pad_point(&z2, arity), mle::eval(&cols[ARGMAX_D2_COL + i], &argmax_pad_point(&z2, arity)));
     }
+    // sel at the three relation-virtual endpoints (authenticated against
+    // final_evals[1] on the verify side).
+    push!(0, argmax_pad_point(&zg, arity), col_eval(0, &zg));
+    push!(0, argmax_pad_point(&zd1, arity), col_eval(0, &zd1));
+    push!(0, argmax_pad_point(&zd2, arity), col_eval(0, &zd2));
     let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&i| cols[i].clone()).collect();
     let ctx = zkie_core::pcs::committed::BatchCtx { commitment: aux.descriptor.commitment.clone(), prover_data: aux.prover_data, protocol: aux.protocol, whir: aux.whir, num_tables: aux.descriptor.columns };
     let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
 
-    let x_evals = [x_g, x_d, x_2, mle::eval(&xp, &argmax_pad_point(&z6, arity))];
+    let x_z6 = thr_sum.final_evals[2];
     let claims = vec![
-        EvalClaim { tensor_id: x, point: qg.clone(), value: x_evals[0] },
-        EvalClaim { tensor_id: x, point: qd.clone(), value: x_evals[1] },
-        EvalClaim { tensor_id: x, point: q2.clone(), value: x_evals[2] },
-        EvalClaim { tensor_id: x, point: z6.clone(), value: x_evals[3] },
-        EvalClaim { tensor_id: thr, point: row_of(&qd), value: thr_d },
-        EvalClaim { tensor_id: thr, point: row_of(&q2), value: thr_2 },
+        EvalClaim { tensor_id: x, point: zg.clone(), value: gate_rel.final_evals[2] },
+        EvalClaim { tensor_id: x, point: zd1.clone(), value: d1_rel.final_evals[2] },
+        EvalClaim { tensor_id: x, point: zd2.clone(), value: d2_rel.final_evals[2] },
+        EvalClaim { tensor_id: x, point: z6.clone(), value: x_z6 },
+        EvalClaim { tensor_id: thr, point: row_of(&zd1), value: d1_rel.final_evals[3] },
+        EvalClaim { tensor_id: thr, point: row_of(&zd2), value: d2_rel.final_evals[3] },
+        EvalClaim { tensor_id: gate, point: zg.clone(), value: gate_rel.final_evals[3] },
+        EvalClaim { tensor_id: d1, point: zd1.clone(), value: d1_rel.final_evals[4] },
+        EvalClaim { tensor_id: d2, point: zd2.clone(), value: d2_rel.final_evals[4] },
     ];
     Some((ReverseArgmaxProof { sel_bool, bit_bool, row_sum, before_sum, out_sum, thr_sum,
-        aux_values: values, opening, x_evals, thr_evals: [thr_d, thr_2] }, claims))
+        gate_rel, d1_rel, d2_rel, aux_values: values, opening }, claims))
 }
 
 fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
@@ -612,15 +651,54 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     let arity = descriptor.arity;
     let (qs, vs) = argmax_claim(outs, sel)?;
     let (qt, vt) = argmax_claim(outs, thr)?;
-    let (qg, vg) = argmax_claim(outs, gate)?;
+    let (_qg, _vg) = argmax_claim(outs, gate)?;
     let (qd, vd) = argmax_claim(outs, d1)?;
     let (q2, v2) = argmax_claim(outs, d2)?;
     let out_key = TensorKey::Index(out).encoded()?;
     let (qo, vo) = argmax_claim(outs, out_key)?;
-    if qs.len() != arity || qg.len() != arity || qd.len() != arity || q2.len() != arity
+    if qs.len() != arity || qd.len() != arity || q2.len() != arity
         || qt.len() != lgm || qo.len() != lgm { return None; }
     if descriptor.role != AuxRole::ArgmaxWitness || descriptor.len != m.checked_mul(n)? { return None; }
     let row_of = |p: &[Goldilocks]| -> Vec<Goldilocks> { p[lgn..lgn + lgm].to_vec() };
+
+    // Pointwise linear binding at the claim points.
+    if vd != Goldilocks::ZERO { return None; }
+
+    // S5 gate/d1/d2 relation virtuals (mirror of the prove side): the eq
+    // point q_rel is squeezed once and shared; each virtual claims 0, which
+    // forces the multilinearization (i.e. the pointwise relation) to vanish
+    // at q_rel. The endpoint evaluations carried in final_evals are
+    // authenticated below: sel against the aux opening, x/thr/gate/d1/d2
+    // through the returned claims.
+    if proof.gate_rel.final_evals.len() != 4 || proof.d1_rel.final_evals.len() != 5
+        || proof.d2_rel.final_evals.len() != 5 { return None; }
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let q_rel: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gate_terms = vec![
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 3usize]),
+    ];
+    let (okg, zg, fg) = verify_virtual(&proof.gate_rel, &gate_terms, Goldilocks::ZERO, arity, transcript);
+    if !okg || fg != virtual_eval(&gate_terms, &proof.gate_rel.final_evals)
+        || proof.gate_rel.final_evals[0] != mle::eq_poly(&q_rel, &zg) { return None; }
+    let d1_terms = vec![
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 1usize, 3usize]),
+        (neg, vec![0usize, 4usize]),
+    ];
+    let (okd, zd1, fd1) = verify_virtual(&proof.d1_rel, &d1_terms, Goldilocks::ZERO, arity, transcript);
+    if !okd || fd1 != virtual_eval(&d1_terms, &proof.d1_rel.final_evals)
+        || proof.d1_rel.final_evals[0] != mle::eq_poly(&q_rel, &zd1) { return None; }
+    let d2_terms = vec![
+        (Goldilocks::ONE, vec![0usize, 3usize]),
+        (neg, vec![0usize, 2usize]),
+        (neg, vec![0usize, 1usize, 3usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 4usize]),
+    ];
+    let (ok2r, zd2, fd2) = verify_virtual(&proof.d2_rel, &d2_terms, Goldilocks::ZERO, arity, transcript);
+    if !ok2r || fd2 != virtual_eval(&d2_terms, &proof.d2_rel.final_evals)
+        || proof.d2_rel.final_evals[0] != mle::eq_poly(&q_rel, &zd2) { return None; }
 
     let q_bool = transcript.field_vec(arity);
     let gamma_bool = transcript.field();
@@ -637,32 +715,22 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     for k in 0..n { suffix[k] = acc; acc = acc + eq_col[k]; }
     let before_coeff = argmax_coeff_col(&eq_rows, &suffix, m, n, arity);
     let ones = vec![Goldilocks::ONE; n];
-    let eq_rows_col = argmax_coeff_col(&eq_rows, &ones, m, n, arity);
-    let _ = &eq_rows_col;
     let out_coeff = argmax_coeff_col(&mle::eq_evals(&qo), &(0..n).map(|j| Goldilocks::from_u64(j as u64)).collect::<Vec<_>>(), m, n, arity);
     let qt_rows = mle::eq_evals(&qt);
+    // The thr_sum virtual's eq kernel is qt-derived (its claim vt is the
+    // thr value at qt); the endpoint check below evaluates eq_poly(qt, row)
+    // directly, so the column itself is only built on the prove side.
+    let _thr_rows_col = argmax_coeff_col(&qt_rows, &ones, m, n, arity);
 
     // Replay virtual proofs to derive endpoints and check the round arithmetic.
     let eq_bool = mle::eq_evals(&q_bool);
-    let g = gamma_bool;
-    let terms = vec![
-        (Goldilocks::ONE, vec![1usize]),
-        (-Goldilocks::ONE, vec![1usize, 1usize]),
-        (g, vec![2usize]),
-        (-g, vec![2usize, 2usize]),
-        (g * g, vec![1usize, 2usize]),
-    ];
-    let before_r = *proof.aux_values.get(4)?;
+    // Shared constructor; mirrors the prove side exactly.
+    let terms = argmax_sel_bool_terms(gamma_bool);
+    let before_r = *proof.aux_values.get(1)?;
     let (ok1, z1, f1) = verify_virtual(&proof.sel_bool, &terms, Goldilocks::ZERO, arity, transcript);
     if !ok1 { return None; }
     let eq_bit = mle::eq_evals(&q_bit);
-    let mut bit_terms = Vec::new();
-    let mut gp = Goldilocks::ONE;
-    for i in 0..(ARGMAX_D2_BITS + ARGMAX_TIE_BITS) {
-        bit_terms.push((gp, vec![1 + i]));
-        bit_terms.push((-gp, vec![1 + i, 1 + i]));
-        gp = gp * gamma_bit;
-    }
+    let bit_terms = argmax_bit_bool_terms(gamma_bit, ARGMAX_D2_BITS + ARGMAX_TIE_BITS);
     let (ok2, z2, f2) = verify_virtual(&proof.bit_bool, &bit_terms, Goldilocks::ZERO, arity, transcript);
     if !ok2 { return None; }
     let (ok3, z3, f3) = verify_virtual(&proof.row_sum, &[(Goldilocks::ONE, vec![0usize, 1usize])], Goldilocks::ONE, arity, transcript);
@@ -673,17 +741,13 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     if !ok5 { return None; }
     let (ok6, z6, f6) = verify_virtual(&proof.thr_sum, &[(Goldilocks::ONE, vec![0usize, 1usize, 2usize])], vt, arity, transcript);
     if !ok6 { return None; }
-    if proof.aux_values.len() != 4 + 1 + ARGMAX_D2_BITS + 1 + 1 + ARGMAX_D2_BITS + ARGMAX_TIE_BITS + 6 + 1 + (ARGMAX_D2_BITS + ARGMAX_TIE_BITS) { return None; }
+    if proof.aux_values.len() != 2 + ARGMAX_D2_BITS + 2 + ARGMAX_D2_BITS + ARGMAX_TIE_BITS + 6 + 1 + (ARGMAX_D2_BITS + ARGMAX_TIE_BITS) + 3 { return None; }
 
     // Rebuild the exact opening list.
     let mut idxs: Vec<usize> = Vec::new();
     let mut points: Vec<Vec<Goldilocks>> = Vec::new();
-    let mut keys: Vec<usize> = Vec::new();
-    macro_rules! push { ($idx:expr, $point:expr) => {{ idxs.push($idx); points.push($point); keys.push($idx); }}; }
+    macro_rules! push { ($idx:expr, $point:expr) => {{ idxs.push($idx); points.push($point); }}; }
     push!(0, argmax_pad_point(&qs, arity));
-    push!(0, argmax_pad_point(&qg, arity));
-    push!(0, argmax_pad_point(&qd, arity));
-    push!(0, argmax_pad_point(&q2, arity));
     push!(ARGMAX_BEFORE_COL, argmax_pad_point(&r_before, arity));
     for b in 0..ARGMAX_D2_BITS { push!(ARGMAX_D2_COL + b, argmax_pad_point(&q2, arity)); }
     push!(ARGMAX_BEFORE_COL, argmax_pad_point(&q_tie, arity));
@@ -703,6 +767,12 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
         bit_idx.push(idxs.len());
         push!(ARGMAX_D2_COL + i, argmax_pad_point(&z2, arity));
     }
+    let sel_gate_idx = idxs.len();
+    push!(0, argmax_pad_point(&zg, arity));
+    let sel_d1_idx = idxs.len();
+    push!(0, argmax_pad_point(&zd1, arity));
+    let sel_d2_idx = idxs.len();
+    push!(0, argmax_pad_point(&zd2, arity));
     let padded = 1usize.checked_shl(arity as u32)?;
     let vars = descriptor.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
     let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
@@ -711,21 +781,23 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &descriptor.commitment, &protocol, descriptor.columns, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
     let av = &proof.aux_values;
 
-    // Pointwise bindings against the committed aux.
+    // Pointwise bindings against the committed aux (linear relations).
     if av[0] != vs { return None; }
-    if vg != av[1] * proof.x_evals[0] { return None; }
-    if vd != Goldilocks::ZERO || vd != av[2] * (proof.x_evals[1] - proof.thr_evals[0]) { return None; }
-    if v2 != (Goldilocks::ONE - av[3]) * (proof.thr_evals[1] - proof.x_evals[2]) { return None; }
+    // Relation-virtual endpoints: the aux sel value must match the value
+    // carried in each virtual's final_evals.
+    if av[sel_gate_idx] != proof.gate_rel.final_evals[1] { return None; }
+    if av[sel_d1_idx] != proof.d1_rel.final_evals[1] { return None; }
+    if av[sel_d2_idx] != proof.d2_rel.final_evals[1] { return None; }
     let mut d2_q2 = Goldilocks::ZERO;
     let mut d2_tie = Goldilocks::ZERO;
     let mut tie_gap = Goldilocks::ZERO;
     for b in 0..ARGMAX_D2_BITS {
-        d2_q2 = d2_q2 + Goldilocks::from_u64(1u64 << b) * av[5 + b];
-        d2_tie = d2_tie + Goldilocks::from_u64(1u64 << b) * av[5 + ARGMAX_D2_BITS + 6 + b];
+        d2_q2 = d2_q2 + Goldilocks::from_u64(1u64 << b) * av[2 + b];
+        d2_tie = d2_tie + Goldilocks::from_u64(1u64 << b) * av[2 + ARGMAX_D2_BITS + 2 + b];
     }
-    let before_tie = av[5 + ARGMAX_D2_BITS];
-    let sel_tie = av[5 + ARGMAX_D2_BITS + 1];
-    for b in 0..ARGMAX_TIE_BITS { tie_gap = tie_gap + Goldilocks::from_u64(1u64 << b) * av[5 + ARGMAX_D2_BITS + 2 + ARGMAX_D2_BITS + b]; }
+    let before_tie = av[2 + ARGMAX_D2_BITS];
+    let sel_tie = av[2 + ARGMAX_D2_BITS + 1];
+    for b in 0..ARGMAX_TIE_BITS { tie_gap = tie_gap + Goldilocks::from_u64(1u64 << b) * av[2 + ARGMAX_D2_BITS + 2 + ARGMAX_D2_BITS + b]; }
     if d2_q2 != v2 { return None; }
     if tie_gap != d2_tie - before_tie + sel_tie { return None; }
 
@@ -748,12 +820,15 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     if f6 != virtual_eval(&[(Goldilocks::ONE, vec![0usize, 1usize, 2usize])], &[known_thr, sel_z(5), x_z]) { return None; }
 
     Some(vec![
-        EvalClaim { tensor_id: x, point: qg.clone(), value: proof.x_evals[0] },
-        EvalClaim { tensor_id: x, point: qd.clone(), value: proof.x_evals[1] },
-        EvalClaim { tensor_id: x, point: q2.clone(), value: proof.x_evals[2] },
+        EvalClaim { tensor_id: x, point: zg.clone(), value: proof.gate_rel.final_evals[2] },
+        EvalClaim { tensor_id: x, point: zd1.clone(), value: proof.d1_rel.final_evals[2] },
+        EvalClaim { tensor_id: x, point: zd2.clone(), value: proof.d2_rel.final_evals[2] },
         EvalClaim { tensor_id: x, point: z6p, value: x_z },
-        EvalClaim { tensor_id: thr, point: row_of(&qd), value: proof.thr_evals[0] },
-        EvalClaim { tensor_id: thr, point: row_of(&q2), value: proof.thr_evals[1] },
+        EvalClaim { tensor_id: thr, point: row_of(&zd1), value: proof.d1_rel.final_evals[3] },
+        EvalClaim { tensor_id: thr, point: row_of(&zd2), value: proof.d2_rel.final_evals[3] },
+        EvalClaim { tensor_id: gate, point: zg.clone(), value: proof.gate_rel.final_evals[3] },
+        EvalClaim { tensor_id: d1, point: zd1.clone(), value: proof.d1_rel.final_evals[4] },
+        EvalClaim { tensor_id: d2, point: zd2.clone(), value: proof.d2_rel.final_evals[4] },
     ])
 }
 
@@ -1515,14 +1590,9 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::Scale { proof }
             }
             Op::Argmax { .. } => {
-                eprintln!("argmax-arm outs={}", out_claims.len());
                 let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
-                let prepared_aux = match aux.remove(&(op_index, AuxRole::ArgmaxWitness)) {
-                    Some(a) => a,
-                    None => { eprintln!("argmax-no-aux"); return None; }
-                };
+                let prepared_aux = aux.remove(&(op_index, AuxRole::ArgmaxWitness))?;
                 let reduced = prove_reverse_argmax(store, op, &pairs, prepared_aux, transcript);
-                if reduced.is_none() { eprintln!("argmax-reduction-none"); }
                 let (proof, incoming) = reduced?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
@@ -7207,6 +7277,34 @@ pub struct BoundExecutionProof {
     aux: Vec<AuxDescriptor>,
     reverse: ReverseDagProof,
     weight_openings: Vec<WeightBatchOpening>,
+    sel_openings: Vec<BoundSelOpening>,
+    token_binding: Option<BoundTokenBinding>,
+}
+
+/// S6 (bound path): per-Argmax individual selector openings. The selector
+/// column is the ArgmaxWitness aux column 0 — the SAME committed column the
+/// Argmax reverse reduction binds via its relation virtuals — and one opening
+/// per position pins `sel(i, argmax[i]) == 1` at the per-position points
+/// derived from the PUBLIC argmax output. A claimed argmax pointing at a
+/// column where the committed selector is 0 (e.g. the tied second maximum,
+/// or a forged prompt-row position) is rejected.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct BoundSelOpening {
+    pub points: Vec<Vec<Goldilocks>>,
+    pub claimed: Vec<Goldilocks>,
+    pub opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+}
+
+/// S6 (bound path): the embedding lookup's index witness column (LookupPairs
+/// aux column 0 of the first `Op::Lookup`) is batch-opened at a fresh random
+/// point r with claimed value `x_hat(r)` recomputed by the verifier from the
+/// caller's public tokens — the public prompt/response is bound into the
+/// committed computation.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct BoundTokenBinding {
+    pub point: Vec<Goldilocks>,
+    pub claimed: Goldilocks,
+    pub opening: zkie_core::pcs::batch_open::BatchOpeningProof,
 }
 
 fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<std::collections::BTreeMap<T, (usize, usize)>> {
@@ -7275,13 +7373,89 @@ fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &Trusted
     Some((transcript, seeds))
 }
 
+/// Rebuild the WHIR instance + batch-opening protocol that authenticate an
+/// aux descriptor's commitment (mirrors the verify-side rebuild in
+/// verify_reverse_argmax).
+fn aux_batch_whir(descriptor: &AuxDescriptor) -> Option<(zkie_core::pcs::whir::Whir, zkie_core::pcs::whir::OpeningProtocol)> {
+    let padded = 1usize.checked_shl(descriptor.arity as u32)?;
+    let vars = descriptor.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+    let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+    let protocol = whir.batch_opening_protocol(descriptor.columns, descriptor.arity);
+    Some((whir, protocol))
+}
+
+/// S6 (bound prove): per-Argmax selector openings on the ArgmaxWitness aux
+/// column 0 at the per-position points (i, argmax[i]) claimed 1, plus the
+/// embedding token binding — the first Lookup's LookupPairs aux column 0
+/// opened at a fresh transcript-derived point r. Both are built against the
+/// SAME aux commitments the reverse reduction consumes.
+fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], ops_per_shard: usize)
+    -> Option<(Vec<BoundSelOpening>, Option<BoundTokenBinding>)>
+{
+    let aux_ctx = |auxp: &PreparedAux| -> Option<zkie_core::pcs::committed::BatchCtx> {
+        let arity = auxp.descriptor.arity;
+        let vars = auxp.descriptor.columns.checked_mul(1usize << arity)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        // commit_batch returns a whir sized for the BATCH variable count
+        // (vars); the opening must use the same sizing.
+        let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+        let protocol = whir.batch_opening_protocol(auxp.descriptor.columns, arity);
+        Some(zkie_core::pcs::committed::BatchCtx {
+            commitment: auxp.descriptor.commitment.clone(),
+            prover_data: auxp.prover_data.clone(),
+            protocol,
+            whir,
+            num_tables: auxp.descriptor.columns,
+        })
+    };
+    let mut sel_openings = Vec::new();
+    for (op_index, op) in ops.iter().enumerate() {
+        if let Op::Argmax { out, m, n, .. } = op {
+            let auxp = prepared.iter().find(|p| p.descriptor.op_index == op_index && p.descriptor.role == AuxRole::ArgmaxWitness)?;
+            let outs = store.idx.get(*out)?;
+            if outs.len() != *m { return None; }
+            let arity = auxp.descriptor.arity;
+            let cols0 = &auxp.columns[0];
+            let mut points = Vec::with_capacity(*m);
+            let claimed = vec![Goldilocks::ONE; *m];
+            for i in 0..*m {
+                let col = outs[i] as usize;
+                if col >= *n { return None; }
+                let idx = i * *n + col;
+                points.push((0..arity).map(|b| Goldilocks::from_u64(((idx >> b) & 1) as u64)).collect());
+            }
+            let idxs = vec![0usize; *m];
+            let tensors: Vec<Vec<Goldilocks>> = (0..*m).map(|_| cols0.clone()).collect();
+            let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(aux_ctx(auxp)?, &idxs, &tensors, &points, &claimed).ok()?;
+            sel_openings.push(BoundSelOpening { points, claimed, opening });
+        }
+    }
+    let token_binding = (|| -> Option<BoundTokenBinding> {
+        let first_lookup = ops.iter().position(|op| matches!(op, Op::Lookup { .. }))?;
+        let auxp = prepared.iter().find(|p| p.descriptor.op_index == first_lookup && p.descriptor.role == AuxRole::LookupPairs)?;
+        let x_col = &auxp.columns[0];
+        if x_col.is_empty() || !x_col.len().is_power_of_two() { return None; }
+        let arity = auxp.descriptor.arity;
+        let mut ts = Transcript::new(b"zkie-committed-public-v1");
+        absorb_statement(&mut ts, ops, ops_per_shard);
+        for p in prepared {
+            ts.absorb(&bincode::serialize(&p.descriptor).unwrap());
+        }
+        let r: Vec<Goldilocks> = ts.field_vec(arity);
+        let claimed = mle::eval(x_col, &r);
+        let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(aux_ctx(auxp)?, &[0usize], &[x_col.clone()], &[r.clone()], &[claimed]).ok()?;
+        Some(BoundTokenBinding { point: r, claimed, opening })
+    })();
+    Some((sel_openings, token_binding))
+}
+
 pub fn prove_committed_shard_dag_bound(
     store: &mut Store, ops: &[Op], ops_per_shard: usize,
     whir: &zkie_core::pcs::whir::Whir, cached: &[CachedWeightBatch],
     _tokens_t: T, _argmax_t: T, model: &TrustedModelManifest, execution: &TrustedExecution,
 ) -> Option<BoundExecutionProof> {
     let _ = (ops_per_shard, whir);
-    eprintln!("bound-stage A");
     trusted_weight_locations(model, ops)?;
     if cached.len() != model.batches.len() { return None; }
     for (cached, expected) in cached.iter().zip(&model.batches) {
@@ -7301,7 +7475,6 @@ pub fn prove_committed_shard_dag_bound(
             if idx.len() != expected.len() || idx.iter().zip(expected).any(|(&a, &b)| Goldilocks::from_u64(a as u64) != b) { return None; }
         }
     }
-    eprintln!("bound-stage B");
     forward_ops(store, ops);
     for (&id, expected) in &execution.outputs {
         if usize::BITS != 64 { return None; }
@@ -7313,31 +7486,21 @@ pub fn prove_committed_shard_dag_bound(
             if idx.len() != expected.len() || idx.iter().zip(expected).any(|(&a, &b)| Goldilocks::from_u64(a as u64) != b) { return None; }
         }
     }
-    eprintln!("bound-stage C");
     let mut prepared = prepare_projection_aux(store, ops)?;
-    eprintln!("bound-stage C1");
     prepared.extend(prepare_scale_aux(store, ops, model)?);
-    eprintln!("bound-stage C2");
     prepared.extend(prepare_argmax_aux(store, ops)?);
-    eprintln!("bound-stage C3");
     prepared.extend(prepare_lookup_aux(store, ops, model)?);
-    eprintln!("bound-stage C4");
     prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
-    eprintln!("bound-stage D");
+    // S6 (bound): selector openings + embedding token binding, built against
+    // the same aux commitments the reverse reduction uses.
+    let (sel_openings, token_binding) = prove_bound_lm_bindings(&prepared, store, ops, ops_per_shard)?;
     let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux)?;
-    eprintln!("bound-stage D1");
     let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
-    eprintln!("bound-stage E");
     let reverse = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model))?;
-    eprintln!("bound-stage E1");
     let (mut replay, replay_seeds) = execution_seeds(ops, model, execution, &aux)?;
-    eprintln!("bound-stage F");
     let leaves = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model))?;
-    eprintln!("bound-stage F1");
-    eprintln!("bound-stage G");
     let groups = group_reverse_weights(model, ops, &leaves)?;
-    eprintln!("bound-stage G1");
     let mut weight_openings = Vec::with_capacity(groups.len());
     for (bi, entries) in groups.iter().enumerate() {
         let table_idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
@@ -7365,7 +7528,7 @@ pub fn prove_committed_shard_dag_bound(
         let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &table_idxs, &opened, &points, &claimed).ok()?;
         weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: Some(opening) });
     }
-    Some(BoundExecutionProof { aux, reverse, weight_openings })
+    Some(BoundExecutionProof { aux, reverse, weight_openings, sel_openings, token_binding })
 }
 
 pub fn verify_committed_shard_dag_bound(
@@ -7374,7 +7537,7 @@ pub fn verify_committed_shard_dag_bound(
     statement: &PublicStatement, model: &TrustedModelManifest, execution: &TrustedExecution,
 ) -> bool {
     let _ = (ops_per_shard, whir);
-    if !matches!(statement, PublicStatement::Generic) || trusted_weight_locations(model, ops).is_none() { return false; }
+    if trusted_weight_locations(model, ops).is_none() { return false; }
     let (mut transcript, seeds) = match execution_seeds(ops, model, execution, &proof.aux) { Some(v) => v, None => return false };
     let leaves = match verify_reverse_dag_inner(ops, &seeds, &proof.reverse, &mut transcript, &proof.aux, Some(model)) {
         Some(v) => v, None => return false,
@@ -7382,9 +7545,15 @@ pub fn verify_committed_shard_dag_bound(
     let weights: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
     for c in &leaves {
         if weights.contains(&c.tensor_id) { continue; }
-        let input = match execution.inputs.get(&c.tensor_id) { Some(v) => v, None => return false };
-        if !input.len().is_power_of_two() || c.point.len() != input.len().trailing_zeros() as usize
-            || mle::eval(input, &c.point) != c.value { return false; }
+        // Leaf claims are authenticated against the public execution data:
+        // inputs directly, and outputs via the extended binding (the Argmax
+        // reverse reduction returns claims on its public output columns).
+        let tensor = match execution.inputs.get(&c.tensor_id).or_else(|| execution.outputs.get(&c.tensor_id)) {
+            Some(v) => v,
+            None => return false,
+        };
+        if !tensor.len().is_power_of_two() || c.point.len() != tensor.len().trailing_zeros() as usize
+            || mle::eval(tensor, &c.point) != c.value { return false; }
     }
     let groups = match group_reverse_weights(model, ops, &leaves) { Some(g) => g, None => return false };
     if proof.weight_openings.len() != groups.len() { return false; }
@@ -7403,6 +7572,98 @@ pub fn verify_committed_shard_dag_bound(
             }
             _ => return false,
         }
+    }
+    // S6 (bound): per-Argmax individual selector openings at the
+    // per-position points derived from the PUBLIC argmax outputs. The
+    // committed selector column is the ArgmaxWitness aux column 0 — the same
+    // column the Argmax reverse reduction binds — and each opening must
+    // prove sel(i, argmax[i]) == 1, so a claimed argmax pointing at a column
+    // where the selector is 0 (tied second maximum, forged prompt row) is
+    // rejected.
+    let argmax_ops: Vec<(usize, T, usize, usize)> = ops.iter().enumerate().filter_map(|(i, op)| match op {
+        Op::Argmax { out, m, n, .. } => Some((i, *out, *m, *n)),
+        _ => None,
+    }).collect();
+    if proof.sel_openings.len() != argmax_ops.len() { return false; }
+    for (k, &(op_index, out_t, m, n)) in argmax_ops.iter().enumerate() {
+        let so = &proof.sel_openings[k];
+        let out_key = match TensorKey::Index(out_t).encoded() { Some(k) => k, None => return false };
+        let argmax_vals = match execution.outputs.get(&out_key) { Some(v) => v, None => return false };
+        if argmax_vals.len() != m || so.points.len() != m || so.claimed.len() != m { return false; }
+        let descriptor = match proof.aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ArgmaxWitness) {
+            Some(d) => d, None => return false,
+        };
+        let arity = descriptor.arity;
+        let mut points = Vec::with_capacity(m);
+        for i in 0..m {
+            let col = to_i64(argmax_vals[i]);
+            if col < 0 || (col as usize) >= n { return false; }
+            let idx = i * n + col as usize;
+            points.push((0..arity).map(|b| Goldilocks::from_u64(((idx >> b) & 1) as u64)).collect());
+        }
+        if so.points != points { return false; }
+        if so.claimed.iter().any(|&c| c != Goldilocks::ONE) { return false; }
+        let (whir, protocol) = match aux_batch_whir(descriptor) { Some(v) => v, None => return false };
+        let idxs = vec![0usize; m];
+        if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &descriptor.commitment, &protocol, descriptor.columns, &idxs, &points, &so.claimed, &so.opening) { return false; }
+    }
+    // S6 (bound): language-model sequence checks + embedding token binding.
+    // The caller's prompt/response are authoritative; the proof never
+    // carries tokens.
+    if let PublicStatement::LanguageModel { prompt, response, next_token } = statement {
+        if argmax_ops.len() != 1 { return false; }
+        let (_, out_t, m, n) = argmax_ops[0];
+        let mut tokens = prompt.clone();
+        tokens.extend_from_slice(response);
+        if tokens.len() != m { return false; }
+        for &t in &tokens {
+            if (t as usize) >= n {
+                return false; // vocab range (padded vocab columns are masked)
+            }
+        }
+        let out_key = match TensorKey::Index(out_t).encoded() { Some(k) => k, None => return false };
+        let argmax_vals = match execution.outputs.get(&out_key) { Some(v) => v, None => return false };
+        if argmax_vals.len() != m { return false; }
+        for i in prompt.len().saturating_sub(1)..m.saturating_sub(1) {
+            if argmax_vals[i] != Goldilocks::from_u64(tokens[i + 1] as u64) {
+                return false; // teacher forcing i = prompt_len-1 .. m-2
+            }
+        }
+        if let Some(nt) = next_token {
+            if argmax_vals[m - 1] != Goldilocks::from_u64(*nt as u64) {
+                return false; // last row predicts a token outside the sequence
+            }
+        }
+        // Token binding: the first Lookup's index witness column (LookupPairs
+        // aux column 0) is opened at a fresh random point r with claimed
+        // x_hat(r) recomputed from the public tokens.
+        let tb = match &proof.token_binding { Some(tb) => tb, None => return false };
+        let first_lookup = match ops.iter().position(|op| matches!(op, Op::Lookup { .. })) { Some(p) => p, None => return false };
+        let table_t = match &ops[first_lookup] { Op::Lookup { table, .. } => *table, _ => return false };
+        let descriptor = match proof.aux.iter().find(|a| a.op_index == first_lookup && a.role == AuxRole::LookupPairs) {
+            Some(d) => d, None => return false,
+        };
+        let col_len = 1usize.checked_shl(descriptor.arity as u32).unwrap_or(0);
+        if col_len == 0 || col_len % m != 0 { return false; }
+        let d = col_len / m;
+        if d == 0 { return false; }
+        let table_len = match model.lookup_lengths.get(&table_t) { Some(&l) => l, None => return false };
+        if table_len % d != 0 { return false; }
+        let base = table_len / d;
+        if base != n {
+            return false; // the expansion base must equal the argmax column count
+        }
+        let mut ts = Transcript::new(b"zkie-committed-public-v1");
+        absorb_statement(&mut ts, ops, ops_per_shard);
+        for a in &proof.aux { ts.absorb(&bincode::serialize(a).unwrap()); }
+        let r: Vec<Goldilocks> = ts.field_vec(descriptor.arity);
+        if tb.point != r { return false; }
+        let x_hat = embedding_x_hat(&tokens, base, d, &r);
+        if tb.claimed != x_hat {
+            return false; // proof-carried claimed value must match the recomputed one
+        }
+        let (whir, protocol) = match aux_batch_whir(descriptor) { Some(v) => v, None => return false };
+        if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &descriptor.commitment, &protocol, descriptor.columns, &[0usize], &[r], &[x_hat], &tb.opening) { return false; }
     }
     true
 }
@@ -9630,9 +9891,105 @@ mod tests {
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
         let mut forged2: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
         for step in &mut forged2.reverse.steps {
-            if let ReverseReduction::Argmax { proof } = &mut step.reduction { proof.x_evals[0] += Goldilocks::ONE; }
+            if let ReverseReduction::Argmax { proof } = &mut step.reduction { proof.gate_rel.final_evals[2] += Goldilocks::ONE; }
         }
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged2, &PublicStatement::Generic, &model, &execution));
+        // Forging a relation-virtual endpoint eval on an OUTPUT column must
+        // also be rejected (the endpoint check and the leaf binding both
+        // catch it).
+        let mut forged3: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for step in &mut forged3.reverse.steps {
+            if let ReverseReduction::Argmax { proof } = &mut step.reduction { proof.gate_rel.final_evals[3] += Goldilocks::ONE; }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged3, &PublicStatement::Generic, &model, &execution));
+        // Forging the aux sel value at a relation-virtual endpoint must be
+        // rejected by the aux opening cross-check.
+        let mut forged4: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for step in &mut forged4.reverse.steps {
+            if let ReverseReduction::Argmax { proof } = &mut step.reduction { proof.d1_rel.final_evals[1] += Goldilocks::ONE; }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged4, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// S5-style regression for the Argmax sel_bool virtual: WITHOUT the eq
+    /// weighting the virtual only checks the GLOBAL sum Σ sel(1-sel) == 0,
+    /// so cross-position cancellation can hide non-boolean entries. This
+    /// witness has sel = 1/2 on 8 positions (each contributing +1/4) and
+    /// sel = 2 on one (-2): all unweighted sums vanish, yet per-position
+    /// booleanity fails — the eq-weighted claim-0 identity must NOT be
+    /// certifiable for it. Uses the PRODUCTION terms constructor shared
+    /// with prove/verify_reverse_argmax, so dropping the eq weighting in
+    /// production turns this test red.
+    #[test]
+    fn argmax_sel_bool_eq_weighting_rejects_cancelling_nonboolean_witness() {
+        let arity = 5usize;
+        let len = 1usize << arity;
+        let half = Goldilocks::from_u64(2).inverse();
+        let mut sel = vec![Goldilocks::ZERO; len];
+        for p in 0..8 { sel[p] = half; }
+        sel[8] = Goldilocks::from_u64(2);
+        let before = vec![Goldilocks::ZERO; len];
+        // The unweighted global sums vanish (the pre-fix check passed this):
+        let mut unweighted = Goldilocks::ZERO;
+        for p in 0..len {
+            unweighted = unweighted + sel[p] * (Goldilocks::ONE - sel[p]);
+        }
+        assert_eq!(unweighted, Goldilocks::ZERO);
+        let mut tp = Transcript::new(b"zkie-argmax-selbool-malicious");
+        let q: Vec<Goldilocks> = tp.field_vec(arity);
+        let eq = mle::eq_evals(&q);
+        let g = tp.field();
+        let terms = argmax_sel_bool_terms(g);
+        assert!(terms.iter().all(|(_, idxs)| idxs.first() == Some(&0usize)),
+            "production sel_bool terms must be eq-weighted (index 0)");
+        let mles: Vec<&[Goldilocks]> = vec![&eq, &sel, &before];
+        let (proof, _z) = prove_virtual(&mles, &terms, Goldilocks::ZERO, &mut tp);
+        let mut tv = Transcript::new(b"zkie-argmax-selbool-malicious");
+        let qv: Vec<Goldilocks> = tv.field_vec(arity);
+        let gv = tv.field();
+        assert_eq!(gv, g);
+        let (ok, zv, fc) = verify_virtual(&proof, &terms, Goldilocks::ZERO, arity, &mut tv);
+        if ok {
+            let ev = [mle::eq_poly(&qv, &zv), mle::eval(&sel, &zv), mle::eval(&before, &zv)];
+            assert_ne!(fc, virtual_eval(&terms, &ev),
+                "a non-boolean witness with vanishing unweighted sums must not certify the zero claim");
+        }
+    }
+
+    /// Same regression for the Argmax bit_bool virtual: bit = 1/2 on 8
+    /// positions and 2 on one makes the unweighted sum vanish while the
+    /// per-position booleanity fails. Uses the PRODUCTION terms constructor.
+    #[test]
+    fn argmax_bit_bool_eq_weighting_rejects_cancelling_nonboolean_witness() {
+        let arity = 5usize;
+        let len = 1usize << arity;
+        let half = Goldilocks::from_u64(2).inverse();
+        let mut bit = vec![Goldilocks::ZERO; len];
+        for p in 0..8 { bit[p] = half; }
+        bit[8] = Goldilocks::from_u64(2);
+        let mut unweighted = Goldilocks::ZERO;
+        for p in 0..len {
+            unweighted = unweighted + bit[p] * (Goldilocks::ONE - bit[p]);
+        }
+        assert_eq!(unweighted, Goldilocks::ZERO);
+        let mut tp = Transcript::new(b"zkie-argmax-bitbool-malicious");
+        let q: Vec<Goldilocks> = tp.field_vec(arity);
+        let eq = mle::eq_evals(&q);
+        let g = tp.field();
+        let terms = argmax_bit_bool_terms(g, 1);
+        assert!(terms.iter().all(|(_, idxs)| idxs.first() == Some(&0usize)),
+            "production bit_bool terms must be eq-weighted (index 0)");
+        let mles: Vec<&[Goldilocks]> = vec![&eq, &bit];
+        let (proof, _z) = prove_virtual(&mles, &terms, Goldilocks::ZERO, &mut tp);
+        let mut tv = Transcript::new(b"zkie-argmax-bitbool-malicious");
+        let qv: Vec<Goldilocks> = tv.field_vec(arity);
+        let _gv = tv.field();
+        let (ok, zv, fc) = verify_virtual(&proof, &terms, Goldilocks::ZERO, arity, &mut tv);
+        if ok {
+            let ev = [mle::eq_poly(&qv, &zv), mle::eval(&bit, &zv)];
+            assert_ne!(fc, virtual_eval(&terms, &ev),
+                "a non-boolean bit witness with vanishing unweighted sums must not certify the zero claim");
+        }
     }
 
     #[test]
@@ -10122,33 +10479,42 @@ mod tests {
 
         let whir = Whir::new_testing(5); // m*d = 32 = 2^5
         let cached = commit_model_weights(&store, &ops, "/tmp/zkie-test-cache");
-        let tokens_t = store.push_idx(vec![]);
-        let argmax_t = store.push_idx(vec![]);
-        let mut proof =
-            prove_committed_shard_dag(&mut store, &ops, 2, &whir, &cached, tokens_t, argmax_t);
-        assert_eq!(proof.boundary_tensors.len(), 1);
-        assert_eq!(proof.boundary_commitments.len(), 1);
-        assert_eq!(proof.cross_binds.len(), 1);
-        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof, &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)));
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec())].into(),
+            outputs: [(outs[3], store.get(outs[3]).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 2, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &execution));
 
-        // Serialization roundtrip through the root-only bytes entry.
+        // Serialization roundtrip through the bytes entry.
         let bytes = bincode::serialize(&proof).unwrap();
-        assert!(verify_committed_shard_dag_bytes(
+        assert!(verify_committed_shard_dag_bound_bytes(
             &bytes,
-            &store.owned_slices(),
             &ops,
             2,
             &whir,
-            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            &PublicStatement::Generic, &model, &execution
         ));
 
-        // Tamper a boundary opening value -> the committed cross-bind must
-        // reject (the verifier rebuilds the claim set itself, S2, so the
-        // proof carries no claim list to tamper).
-        if let Some((_, opened)) = proof.cross_binds[0].openings.first_mut() {
-            *opened = *opened + Goldilocks::ONE;
+        // Tamper a projection reduction's matmul rounds -> the reverse chain
+        // must reject (the verifier rebuilds the claim set itself, S2).
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::Projection { proof: p } = &mut step.reduction {
+                p.matmul.sumcheck.rounds.clear();
+                hit = true;
+            }
         }
-        assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof, &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)));
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 2, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+
+        // A wrong public output must reject.
+        let mut bad = execution.clone();
+        bad.outputs.get_mut(&outs[3]).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &bad));
     }
 
 
@@ -10977,31 +11343,46 @@ mod tests {
     fn s6_lm_honest_roundtrip() {
         let base = 8usize;
         let tokens: Vec<u32> = (0..8).collect();
-        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+        let (mut store, ops, whir, cached, _tokens_t, _argmax_t) =
             s6_lm_setup(0x61, &tokens, base, false);
-        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        let (emb_idx, sel, thr, gate, d1, d2, out) = match (&ops[0], &ops[2]) {
+            (Op::Lookup { idx, .. }, Op::Argmax { sel, thr, gate, d1, d2, out, .. }) =>
+                (*idx, *sel, *thr, *gate, *d1, *d2, *out),
+            _ => unreachable!(),
+        };
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(emb_idx, base * base), (out, base)].into());
+        let emb_idx_key = TensorKey::Index(emb_idx).encoded().unwrap();
+        let emb_idx_vals: Vec<Goldilocks> = store.idx.get(emb_idx).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let out_vals: Vec<Goldilocks> = store.idx.get(out).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(emb_idx_key, emb_idx_vals)].into(),
+            outputs: [
+                (sel, store.get(sel).to_vec()),
+                (thr, store.get(thr).to_vec()),
+                (gate, store.get(gate).to_vec()),
+                (d1, store.get(d1).to_vec()),
+                (d2, store.get(d2).to_vec()),
+                (out_key, out_vals),
+            ].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
         assert!(proof.token_binding.is_some());
         let stmt = PublicStatement::LanguageModel {
             prompt: tokens[..3].to_vec(),
             response: tokens[3..].to_vec(),
             next_token: Some(0),
         };
-        assert!(verify_committed_shard_dag(
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &proof,
-            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
-        ));
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &stmt, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
-        assert!(verify_committed_shard_dag_bytes(
+        assert!(verify_committed_shard_dag_bound_bytes(
             &bytes,
-            &store.owned_slices(),
             &ops,
             1,
             &whir,
-            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            &stmt, &model, &execution
         ));
     }
 
@@ -11206,14 +11587,39 @@ mod tests {
 
     /// S6: explicit tie rule — the public sequence must claim the FIRST index
     /// achieving the row maximum (the `argmax_forward` rule). Claiming the
-    /// tied second maximum is rejected; the honest first maximum passes.
+    /// tied second maximum is rejected (both by the teacher-forcing check
+    /// and, when the public argmax itself is forged, by the Argmax
+    /// reduction's first-max binding); the honest first maximum passes.
     #[test]
     fn s6_tie_rule_rejected() {
         let base = 8usize;
         let tokens: Vec<u32> = (0..8).collect();
-        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+        let (mut store, ops, whir, cached, _tokens_t, _argmax_t) =
             s6_lm_setup(0x69, &tokens, base, true); // row t=2 ties k=3 and k=4
-        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        let (emb_idx, sel, thr, gate, d1, d2, out) = match (&ops[0], &ops[2]) {
+            (Op::Lookup { idx, .. }, Op::Argmax { sel, thr, gate, d1, d2, out, .. }) =>
+                (*idx, *sel, *thr, *gate, *d1, *d2, *out),
+            _ => unreachable!(),
+        };
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(emb_idx, base * base), (out, base)].into());
+        let emb_idx_key = TensorKey::Index(emb_idx).encoded().unwrap();
+        let emb_idx_vals: Vec<Goldilocks> = store.idx.get(emb_idx).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let out_vals: Vec<Goldilocks> = store.idx.get(out).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(emb_idx_key, emb_idx_vals)].into(),
+            outputs: [
+                (sel, store.get(sel).to_vec()),
+                (thr, store.get(thr).to_vec()),
+                (gate, store.get(gate).to_vec()),
+                (d1, store.get(d1).to_vec()),
+                (d2, store.get(d2).to_vec()),
+                (out_key, out_vals),
+            ].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
         // honest argmax[2] = 3 (first maximum); the caller claims 4.
         let stmt_bad = PublicStatement::LanguageModel {
             prompt: tokens[..3].to_vec(),
@@ -11221,26 +11627,30 @@ mod tests {
             next_token: Some(0),
         };
         let bytes = bincode::serialize(&proof).unwrap();
-        assert!(!verify_committed_shard_dag_bytes(
+        assert!(!verify_committed_shard_dag_bound_bytes(
             &bytes,
-            &store.owned_slices(),
             &ops,
             1,
             &whir,
-            &stmt_bad, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            &stmt_bad, &model, &execution
         ));
+        // Forging the public argmax itself to the tied second maximum must
+        // also reject: the Argmax reduction binds out to the FIRST maximum
+        // selector column.
+        let mut tied_exec = execution.clone();
+        tied_exec.outputs.get_mut(&out_key).unwrap()[2] = Goldilocks::from_u64(4);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &tied_exec));
         let stmt_ok = PublicStatement::LanguageModel {
             prompt: tokens[..3].to_vec(),
             response: tokens[3..].to_vec(),
             next_token: Some(0),
         };
-        assert!(verify_committed_shard_dag_bytes(
+        assert!(verify_committed_shard_dag_bound_bytes(
             &bytes,
-            &store.owned_slices(),
             &ops,
             1,
             &whir,
-            &stmt_ok, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            &stmt_ok, &model, &execution
         ));
     }
 
@@ -11250,43 +11660,112 @@ mod tests {
     fn s6_empty_prompt_roundtrip() {
         let base = 8usize;
         let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 0];
-        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+        let (mut store, ops, whir, cached, _tokens_t, _argmax_t) =
             s6_lm_setup(0x6A, &tokens, base, false);
-        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        let (emb_idx, sel, thr, gate, d1, d2, out) = match (&ops[0], &ops[2]) {
+            (Op::Lookup { idx, .. }, Op::Argmax { sel, thr, gate, d1, d2, out, .. }) =>
+                (*idx, *sel, *thr, *gate, *d1, *d2, *out),
+            _ => unreachable!(),
+        };
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(emb_idx, base * base), (out, base)].into());
+        let emb_idx_key = TensorKey::Index(emb_idx).encoded().unwrap();
+        let emb_idx_vals: Vec<Goldilocks> = store.idx.get(emb_idx).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let out_vals: Vec<Goldilocks> = store.idx.get(out).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(emb_idx_key, emb_idx_vals)].into(),
+            outputs: [
+                (sel, store.get(sel).to_vec()),
+                (thr, store.get(thr).to_vec()),
+                (gate, store.get(gate).to_vec()),
+                (d1, store.get(d1).to_vec()),
+                (d2, store.get(d2).to_vec()),
+                (out_key, out_vals),
+            ].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
         let bytes = bincode::serialize(&proof).unwrap();
         let stmt = PublicStatement::LanguageModel {
             prompt: vec![],
             response: tokens.clone(),
             next_token: None,
         };
-        assert!(verify_committed_shard_dag_bytes(
+        assert!(verify_committed_shard_dag_bound_bytes(
             &bytes,
-            &store.owned_slices(),
             &ops,
             1,
             &whir,
-            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            &stmt, &model, &execution
         ));
     }
 
     /// S6: non-language statements (Generic) skip the sequence checks — the
-    /// proof-carried tokens are not consulted, matching TimesFM-style usage.
+    /// bound proof carries no tokens at all, matching TimesFM-style usage.
     #[test]
     fn s6_generic_skips_sequence() {
         let base = 8usize;
         let tokens: Vec<u32> = (0..8).collect();
-        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+        let (mut store, ops, whir, cached, _tokens_t, _argmax_t) =
             s6_lm_setup(0x6B, &tokens, base, false);
-        let mut proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        proof.tokens = vec![9, 9, 9, 9, 9, 9, 9, 9]; // garbage tokens are not consulted
+        let (emb_idx, sel, thr, gate, d1, d2, out) = match (&ops[0], &ops[2]) {
+            (Op::Lookup { idx, .. }, Op::Argmax { sel, thr, gate, d1, d2, out, .. }) =>
+                (*idx, *sel, *thr, *gate, *d1, *d2, *out),
+            _ => unreachable!(),
+        };
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(emb_idx, base * base), (out, base)].into());
+        let emb_idx_key = TensorKey::Index(emb_idx).encoded().unwrap();
+        let emb_idx_vals: Vec<Goldilocks> = store.idx.get(emb_idx).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let out_vals: Vec<Goldilocks> = store.idx.get(out).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(emb_idx_key, emb_idx_vals)].into(),
+            outputs: [
+                (sel, store.get(sel).to_vec()),
+                (thr, store.get(thr).to_vec()),
+                (gate, store.get(gate).to_vec()),
+                (d1, store.get(d1).to_vec()),
+                (d2, store.get(d2).to_vec()),
+                (out_key, out_vals),
+            ].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
         let bytes = bincode::serialize(&proof).unwrap();
-        assert!(verify_committed_shard_dag_bytes(
+        assert!(verify_committed_shard_dag_bound_bytes(
             &bytes,
-            &store.owned_slices(),
             &ops,
             1,
             &whir,
-            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            &PublicStatement::Generic, &model, &execution
+        ));
+        // Under Generic the token binding is not consulted: tampering its
+        // claimed value must NOT affect verification...
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        forged.token_binding.as_mut().unwrap().claimed += Goldilocks::ONE;
+        let forged_bytes = bincode::serialize(&forged).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(
+            &forged_bytes,
+            &ops,
+            1,
+            &whir,
+            &PublicStatement::Generic, &model, &execution
+        ));
+        // ...while the same tamper must reject under the LanguageModel
+        // statement (x_hat is recomputed from the public tokens).
+        let stmt = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        assert!(!verify_committed_shard_dag_bound_bytes(
+            &forged_bytes,
+            &ops,
+            1,
+            &whir,
+            &stmt, &model, &execution
         ));
     }
 
@@ -11389,9 +11868,12 @@ mod tests {
         assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
     }
 
-    /// S2: honest committed roundtrip with Scatter + Gather — the committed
-    /// perm/gather fractional sections (fracs re-proven on the committed
-    /// transcripts, shard transcript frac-free) must verify end to end.
+    /// S2 legacy: the OLD committed path verified Scatter + Gather through
+    /// its perm/gather fractional sections (fracs re-proven on the committed
+    /// transcripts). The bound API superseded that path and has no
+    /// Scatter/Gather reverse reductions yet (S7, MoE expert binding) — the
+    /// committed verifier must explicitly REFUSE such graphs (never silently
+    /// pass through) until those land.
     #[test]
     fn s2_committed_scatter_gather_roundtrip() {
         use crate::scatter::scatter_forward;
@@ -11509,20 +11991,30 @@ mod tests {
 
         let whir = Whir::new_testing(5);
         let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache6");
-        let tokens_t = store.push_idx(vec![]);
-        let argmax_t = store.push_idx(vec![]);
-        let proof =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        assert!(!proof.perm_batches.is_empty());
-        assert!(!proof.gather_batches.is_empty());
-        assert!(verify_committed_shard_dag(
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &proof
-        ,            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
-        ));
+        forward_ops(&mut store, &ops);
+        // S2 legacy: the OLD committed path carried perm/gather fractional
+        // sections for Scatter/Gather; the bound API has no reverse
+        // reductions for them yet (tracked under S7, MoE expert binding).
+        // Until they land, the committed verifier must explicitly REFUSE
+        // scatter/gather graphs — never silently pass through. The refusal
+        // must come from the unsupported op, not from a malformed execution:
+        // the public execution below matches the graph exactly.
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx_seg_t, s * h), (idx_w_t, s * h * p), (idx_gate_t, s)].into());
+        let sel_vals = store.get(sel_t).to_vec();
+        let seg_idx_key = TensorKey::Index(idx_seg_t).encoded().unwrap();
+        let w_idx_key = TensorKey::Index(idx_w_t).encoded().unwrap();
+        let to_g = |v: &[u32]| v.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect::<Vec<_>>();
+        let execution = TrustedExecution {
+            inputs: [
+                (sel_t, sel_vals),
+                (seg_idx_key, to_g(&store.idx[idx_seg_t])),
+                (w_idx_key, to_g(&store.idx[idx_w_t])),
+            ].into(),
+            outputs: [(out_t, store.get(out_t).to_vec())].into(),
+        };
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).is_none(),
+            "Scatter/Gather graphs must be refused until the S7 MoE bindings land");
     }
 
     /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and
@@ -11683,49 +12175,68 @@ mod tests {
         }];
 
         let whir = Whir::new_testing(5);
-        let tokens_t = store.push_idx(vec![]);
-        let argmax_t = store.push_idx(vec![]);
-        let cached = Vec::new();
-        let mut proof = prove_committed_shard_dag(
-            &mut store,
-            &ops,
-            1,
-            &whir,
-            &[],
+        let cache_dir = std::env::temp_dir().join("zkie-argmax-selopening");
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(out, m)].into());
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let out_vals: Vec<Goldilocks> = store.idx.get(out).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec())].into(),
+            outputs: [
+                (sel, store.get(sel).to_vec()),
+                (thr, store.get(thr).to_vec()),
+                (gate, store.get(gate).to_vec()),
+                (d1, store.get(d1).to_vec()),
+                (d2, store.get(d2).to_vec()),
+                (out_key, out_vals),
+            ].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
 
-            tokens_t,
-            argmax_t,
-        );
-
+        // One selector-opening group per Argmax op, one individual opening
+        // per position (the points are derived from the public argmax).
         assert_eq!(proof.sel_openings.len(), 1);
-        assert_eq!(proof.sel_openings[0].openings.len(), m);
-        assert!(verify_committed_shard_dag(
-            &store.owned_slices(),
+        assert_eq!(proof.sel_openings[0].points.len(), m);
+        assert!(verify_committed_shard_dag_bound(
             &ops,
             1,
             &whir,
-            &proof
-        ,            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            &proof,
+            &PublicStatement::Generic, &model, &execution
         ));
         let bytes = bincode::serialize(&proof).unwrap();
-        assert!(verify_committed_shard_dag_bytes(
+        assert!(verify_committed_shard_dag_bound_bytes(
             &bytes,
-            &store.owned_slices(),
             &ops,
             1,
             &whir,
-            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            &PublicStatement::Generic, &model, &execution
         ));
 
-        proof.sel_openings[0].points[0][0] =
-            proof.sel_openings[0].points[0][0] + Goldilocks::ONE;
-        assert!(!verify_committed_shard_dag(
-            &store.owned_slices(),
+        // Tampering a per-position point must reject: the verifier re-derives
+        // the points from the public argmax.
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        forged.sel_openings[0].points[0][0] =
+            forged.sel_openings[0].points[0][0] + Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(
             &ops,
             1,
             &whir,
-            &proof
-        ,            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            &forged,
+            &PublicStatement::Generic, &model, &execution
+        ));
+        // A wrong public argmax position must also reject: the derived point
+        // lands on a selector-0 column.
+        let mut bad = execution.clone();
+        bad.outputs.get_mut(&out_key).unwrap()[0] = Goldilocks::from_u64(5);
+        assert!(!verify_committed_shard_dag_bound(
+            &ops,
+            1,
+            &whir,
+            &proof,
+            &PublicStatement::Generic, &model, &bad
         ));
     }
 
