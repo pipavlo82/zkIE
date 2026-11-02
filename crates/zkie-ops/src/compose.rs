@@ -395,7 +395,7 @@ fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     ])
 }
 
-/// Reverse reduction proof. Its returned leaf claims still need independent/// Reverse reduction proof. Its returned leaf claims still need independent
+/// Reverse reduction proof. Its returned leaf claims still need independent
 /// authentication against caller-trusted inputs and model commitments.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ReverseDagProof { steps: Vec<ReverseStep> }
@@ -8296,6 +8296,42 @@ fn graph_exact_shapes(ops: &[Op])
         Some(())
     }
     for op in ops {
+        // S7b (TL review): every supported reverse op with statement-dimension
+        // shapes is pinned exactly here, so field-leaf zero-extension can never
+        // authenticate a short tensor that the forward would have consumed at
+        // full length.
+        match op {
+            Op::MatMul { a, b, c, m, k, n } => {
+                if !m.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two() { return None; }
+                let (la, lb, lc) = (m.checked_mul(*k)?, k.checked_mul(*n)?, m.checked_mul(*n)?);
+                put(TensorKey::Field(*a).encoded()?, la, (0, la, 0, 0), &mut out)?;
+                put(TensorKey::Field(*b).encoded()?, lb, (0, lb, 0, 0), &mut out)?;
+                put(TensorKey::Field(*c).encoded()?, lc, (0, lc, 0, 0), &mut out)?;
+            }
+            Op::Projection { x, w, bias, out: po, rem, m, k, n, .. } => {
+                if !m.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two() { return None; }
+                let (lx, lw, lo) = (m.checked_mul(*k)?, k.checked_mul(*n)?, m.checked_mul(*n)?);
+                for (id, l) in [(*x, lx), (*w, lw), (*bias, lo), (*po, lo), (*rem, lo)] {
+                    put(TensorKey::Field(id).encoded()?, l, (0, l, 0, 0), &mut out)?;
+                }
+            }
+            Op::Argmax { x, sel, thr, gate, d1, d2, out: ao, m, n } => {
+                if !m.is_power_of_two() || !n.is_power_of_two() { return None; }
+                let len = m.checked_mul(*n)?;
+                for id in [*x, *sel, *gate, *d1, *d2] {
+                    put(TensorKey::Field(id).encoded()?, len, (0, len, 0, 0), &mut out)?;
+                }
+                put(TensorKey::Field(*thr).encoded()?, *m, (0, *m, 0, 0), &mut out)?;
+                put(TensorKey::Index(*ao).encoded()?, *m, (0, *m, 0, 0), &mut out)?;
+            }
+            Op::Transpose { x, out: to, m, k } => {
+                if !m.is_power_of_two() || !k.is_power_of_two() { return None; }
+                let l = m.checked_mul(*k)?;
+                put(TensorKey::Field(*x).encoded()?, l, (0, l, 0, 0), &mut out)?;
+                put(TensorKey::Field(*to).encoded()?, l, (0, l, 0, 0), &mut out)?;
+            }
+            _ => {}
+        }
         if let Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } = op {
             if !s.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two()
                 || !n_experts.is_power_of_two() || *n_experts < 2 { return None; }
@@ -8306,16 +8342,17 @@ fn graph_exact_shapes(ops: &[Op])
             // Shape-only layout identity (never the input/output role): a
             // tensor may legally be the output of one op and the input of
             // the next when the actual shapes agree.
-            put(fa, s.checked_mul(*k)?, (2, *s, *k, 0), &mut out)?;
+            let (la, lc) = (s.checked_mul(*k)?, s.checked_mul(*n)?);
+            put(fa, la, (0, la, 0, 0), &mut out)?;
             put(fw, n_experts.checked_mul(*k)?.checked_mul(*n)?,
-                (3, *n_experts, *k, *n), &mut out)?;
-            put(fc, s.checked_mul(*n)?, (2, *s, *n, 0), &mut out)?;
-            put(ie, *s, (1, *s, 0, 0), &mut out)?;
+                (1, *n_experts, *k, *n), &mut out)?;
+            put(fc, lc, (0, lc, 0, 0), &mut out)?;
+            put(ie, *s, (0, *s, 0, 0), &mut out)?;
         }
         if let Op::PadIdx { base, out: out_t, len, base_len } = op {
             if *base_len == 0 || *base_len > *len || !len.is_power_of_two() { return None; }
-            put(TensorKey::Index(*base).encoded()?, *base_len, (1, *base_len, 0, 0), &mut out)?;
-            put(TensorKey::Index(*out_t).encoded()?, *len, (1, *len, 0, 0), &mut out)?;
+            put(TensorKey::Index(*base).encoded()?, *base_len, (0, *base_len, 0, 0), &mut out)?;
+            put(TensorKey::Index(*out_t).encoded()?, *len, (0, *len, 0, 0), &mut out)?;
         }
     }
     Some(out)
@@ -13539,6 +13576,41 @@ mod tests {
         bad_out.outputs.get_mut(&c).unwrap().truncate(3);
         assert!(!verify_committed_shard_dag_bound_bytes(
             &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &bad_out));
+    }
+
+    /// S7b (TL review of 67ccf1b): a short ordinary MatMul input that pads into
+    /// the same bucket must be rejected — the exact graph shape m*k is pinned
+    /// against the manifest, so zero-extension cannot authenticate a shorter
+    /// tensor than the forward consumes.
+    #[test]
+    fn s7b_matmul_short_input_same_padding_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, k, n) = (1usize, 4usize, 1usize);
+        let mut store = Store::new();
+        let a = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let b = store.push(vec![from_i64(1), from_i64(0), from_i64(0), from_i64(1)]);
+        let c = store.push(vec![]);
+        let ops = vec![Op::MatMul { a, b, c, m, k, n }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7b-mm-shape");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(a, store.get(a).to_vec())].into(),
+            outputs: [(c, store.get(c).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        // Malicious manifest: a declared length 3 (pads to the same bucket).
+        let mut bad_model = model.clone();
+        bad_model.tensor_lengths.insert(a, 3);
+        assert!(trusted_weight_locations(&bad_model, &ops).is_none(),
+            "MatMul a must be exactly m*k");
+        let mut bad_exec = execution.clone();
+        bad_exec.inputs.get_mut(&a).unwrap().truncate(3);
+        assert!(!verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &bad_model, &bad_exec));
     }
 
     /// S7 (TL review): the same weight tensor used with two different expert
