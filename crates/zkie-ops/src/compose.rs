@@ -174,6 +174,10 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
         Op::GatherMatMul { a, expert_of, w, c, .. } => {
             Some((vec![f(*a)?, i(*expert_of)?, f(*w)?], vec![f(*c)?]))
         }
+        Op::TopKSelect { x, sel, thr, gate, d1, d2, .. } => Some((
+            vec![f(*x)?],
+            vec![f(*sel)?, f(*thr)?, f(*gate)?, f(*d1)?, f(*d2)?],
+        )),
         Op::CombineIdx { a, b, out, .. } => Some((vec![i(*a)?, i(*b)?], vec![i(*out)?])),
         Op::Gather { weighted, token_id, gate, out, .. } => {
             Some((vec![f(*weighted)?, i(*token_id)?, f(*gate)?], vec![f(*out)?]))
@@ -395,6 +399,373 @@ fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     ])
 }
 
+const TK_RANGE_BITS: usize = 16;
+const TK_COLS: usize = 3 + 2 * TK_RANGE_BITS;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseTopKSelectProof {
+    arity: usize,
+    witness_commitment: zkie_core::pcs::whir::Commitment,
+    sel_bool: VirtualProof,
+    row_sum: VirtualProof,
+    gate_rel: VirtualProof,
+    d1_rel: VirtualProof,
+    d2_rel: VirtualProof,
+    bit_bool: VirtualProof,
+    /// Witness-column evaluations, in the exact order rebuilt by the verifier.
+    aux_values: Vec<Goldilocks>,
+    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+}
+
+/// Witness layout: 0 = sel, 1 = gate, 2 = thr_b (row broadcast),
+/// 3..3+R = d1 bits, 3+R..3+2R = d2 bits; all over the padded m*n domain.
+fn topk_sel_bool_terms() -> Vec<(Goldilocks, Vec<usize>)> {
+    vec![(Goldilocks::ONE, vec![0, 1, 1]), (-Goldilocks::ONE, vec![0, 1])]
+}
+fn topk_gate_terms() -> Vec<(Goldilocks, Vec<usize>)> {
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    vec![(Goldilocks::ONE, vec![0, 1, 2]), (neg, vec![0, 3])]
+}
+fn topk_d1_terms() -> Vec<(Goldilocks, Vec<usize>)> {
+    // One identity: eq*(sel*x - sel*thr_b - sum_b 2^b*bit1_b) == 0. No gamma
+    // mixing here (each bit term is part of the same equation).
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let mut terms = vec![(Goldilocks::ONE, vec![0, 1, 2]), (neg, vec![0, 1, 3])];
+    for b in 0..TK_RANGE_BITS {
+        terms.push((-Goldilocks::from_u64(1u64 << b), vec![0, 4 + b]));
+    }
+    terms
+}
+fn topk_d2_terms() -> Vec<(Goldilocks, Vec<usize>)> {
+    // One identity: eq*(thr_b - x - sel*thr_b + sel*x - d2) == 0.
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let mut terms = vec![
+        (Goldilocks::ONE, vec![0, 3]),
+        (neg, vec![0, 2]),
+        (neg, vec![0, 1, 3]),
+        (Goldilocks::ONE, vec![0, 1, 2]),
+    ];
+    for b in 0..TK_RANGE_BITS {
+        terms.push((-Goldilocks::from_u64(1u64 << b), vec![0, 4 + b]));
+    }
+    terms
+}
+fn topk_bit_terms(gamma: Goldilocks, bits: usize) -> Vec<(Goldilocks, Vec<usize>)> {
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let mut terms = Vec::with_capacity(2 * bits);
+    let mut gp = Goldilocks::ONE;
+    for b in 0..bits {
+        terms.push((gp, vec![0, 1 + b, 1 + b]));
+        terms.push((neg * gp, vec![0, 1 + b]));
+        gp = gp * gamma;
+    }
+    terms
+}
+
+fn topk_dims(op: &Op) -> Option<(T, T, T, T, T, T, usize, usize, usize)> {
+    match op {
+        Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k } => {
+            if !m.is_power_of_two() || !n.is_power_of_two() || *k == 0 || *k > *n { return None; }
+            Some((*x, *sel, *thr, *gate, *d1, *d2, *m, *n, *k))
+        }
+        _ => None,
+    }
+}
+
+fn topk_witness_columns(store: &Store, op: &Op, arity: usize) -> Option<Vec<Vec<Goldilocks>>> {
+    let (_x, sel_t, thr_t, gate_t, d1_t, d2_t, m, n, k) = topk_dims(op)?;
+    let len = m.checked_mul(n)?;
+    let padded = 1usize.checked_shl(arity as u32)?;
+    if padded < len { return None; }
+    let sel = store.get(sel_t);
+    let gate = store.get(gate_t);
+    let thr = store.get(thr_t);
+    let d1 = store.get(d1_t);
+    let d2 = store.get(d2_t);
+    if sel.len() != len || gate.len() != len || thr.len() != m || d1.len() != len || d2.len() != len { return None; }
+    let mut cols = vec![vec![Goldilocks::ZERO; padded]; TK_COLS];
+    for row in 0..m {
+        let mut ones = 0usize;
+        for e in 0..n {
+            let at = row * n + e;
+            let s = sel[at];
+            if s != Goldilocks::ZERO && s != Goldilocks::ONE { return None; }
+            if s == Goldilocks::ONE { ones += 1; }
+            cols[0][at] = s;
+            cols[1][at] = gate[at];
+            cols[2][at] = thr[row];
+            let v1 = to_i64(d1[at]);
+            let v2 = to_i64(d2[at]);
+            if v1 < 0 || (v1 as u64) >= (1u64 << TK_RANGE_BITS) { return None; }
+            if v2 < 0 || (v2 as u64) >= (1u64 << TK_RANGE_BITS) { return None; }
+            for b in 0..TK_RANGE_BITS {
+                cols[3 + b][at] = Goldilocks::from_u64(((v1 as u64) >> b) & 1);
+                cols[3 + TK_RANGE_BITS + b][at] = Goldilocks::from_u64(((v2 as u64) >> b) & 1);
+            }
+        }
+        if ones != k { return None; }
+    }
+    Some(cols)
+}
+
+#[allow(clippy::type_complexity)]
+fn topk_opening_layout(z1: &[Goldilocks], z2: &[Goldilocks], z3: &[Goldilocks],
+    z4: &[Goldilocks], z5: &[Goldilocks], z6: &[Goldilocks],
+    qs: &[Goldilocks], qt: &[Goldilocks], qg: &[Goldilocks], qd: &[Goldilocks], q2: &[Goldilocks],
+    arity: usize, lgn: usize)
+    -> Vec<(usize, Vec<Goldilocks>)>
+{
+    let pad = |z: &[Goldilocks]| argmax_pad_point(z, arity);
+    let mut e: Vec<(usize, Vec<Goldilocks>)> = Vec::new();
+    e.push((0, pad(z1)));
+    e.push((0, pad(z2)));
+    e.push((0, pad(z3)));
+    e.push((1, pad(z3)));
+    e.push((0, pad(z4)));
+    e.push((2, pad(z4)));
+    for b in 0..TK_RANGE_BITS { e.push((3 + b, pad(z4))); }
+    e.push((0, pad(z5)));
+    e.push((2, pad(z5)));
+    for b in 0..TK_RANGE_BITS { e.push((3 + TK_RANGE_BITS + b, pad(z5))); }
+    for b in 0..(2 * TK_RANGE_BITS) { e.push((3 + b, pad(z6))); }
+    e.push((0, pad(qs)));
+    e.push((1, pad(qg)));
+    let mut qtb = vec![Goldilocks::ZERO; lgn];
+    qtb.extend_from_slice(qt);
+    e.push((2, pad(&qtb)));
+    for b in 0..TK_RANGE_BITS { e.push((3 + b, pad(qd))); }
+    for b in 0..TK_RANGE_BITS { e.push((3 + TK_RANGE_BITS + b, pad(q2))); }
+    e
+}
+
+fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+    transcript: &mut Transcript) -> Option<(ReverseTopKSelectProof, Vec<EvalClaim>)>
+{
+    let (x, sel_t, thr_t, gate_t, d1_t, d2_t, m, n, k) = topk_dims(op)?;
+    let len = m.checked_mul(n)?;
+    let lgn = n.trailing_zeros() as usize;
+    let lgm = m.trailing_zeros() as usize;
+    let arity = len.trailing_zeros().max(5) as usize;
+    let padded = 1usize.checked_shl(arity as u32)?;
+    let cols = topk_witness_columns(store, op, arity)?;
+    let claim = |id: T| -> Option<(Vec<Goldilocks>, Goldilocks)> {
+        let key = TensorKey::Field(id).encoded()?;
+        outs.iter().find(|o| o.0 == key).map(|o| (o.1.clone(), o.2))
+    };
+    let (qs, _) = claim(sel_t)?;
+    let (qt, _) = claim(thr_t)?;
+    let (qg, _) = claim(gate_t)?;
+    let (qd, _) = claim(d1_t)?;
+    let (q2, _) = claim(d2_t)?;
+    if qs.len() != lgn + lgm || qg.len() != lgn + lgm || qd.len() != lgn + lgm
+        || q2.len() != lgn + lgm || qt.len() != lgm { return None; }
+
+    let num_vars = TK_COLS.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
+    let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+    let refs: Vec<&[Goldilocks]> = cols.iter().map(Vec::as_slice).collect();
+    let (commitment, prover_data, protocol, batch_whir) = whir.commit_batch(&refs);
+    transcript.absorb(b"zkie-topk-witness-v1");
+    transcript.absorb(&bincode::serialize(&commitment).ok()?);
+
+    let mut xp = store.get(x).to_vec(); xp.resize(padded, Goldilocks::ZERO);
+    let q1: Vec<Goldilocks> = transcript.field_vec(arity);
+    let eq1 = mle::eq_evals(&q1);
+    let (sel_bool, z1) = prove_virtual(&[&eq1, &cols[0]], &topk_sel_bool_terms(), Goldilocks::ZERO, transcript);
+    let r_rows: Vec<Goldilocks> = transcript.field_vec(lgm);
+    let eq_rows = mle::eq_evals(&r_rows);
+    let mut eq_rows_b = vec![Goldilocks::ZERO; padded];
+    for row in 0..m { for e in 0..n { eq_rows_b[row * n + e] = eq_rows[row]; } }
+    let (row_sum, z2) = prove_virtual(&[&cols[0], &eq_rows_b], &[(Goldilocks::ONE, vec![0usize, 1usize])], Goldilocks::from_u64(k as u64), transcript);
+    let q2v: Vec<Goldilocks> = transcript.field_vec(arity);
+    let eq2 = mle::eq_evals(&q2v);
+    let (gate_rel, z3) = prove_virtual(&[&eq2, &cols[0], &xp, &cols[1]], &topk_gate_terms(), Goldilocks::ZERO, transcript);
+    let q3: Vec<Goldilocks> = transcript.field_vec(arity);
+    let eq3 = mle::eq_evals(&q3);
+    let mut mles3: Vec<&[Goldilocks]> = vec![&eq3, &cols[0], &xp, &cols[2]];
+    for b in 0..TK_RANGE_BITS { mles3.push(&cols[3 + b]); }
+    let (d1_rel, z4) = prove_virtual(&mles3, &topk_d1_terms(), Goldilocks::ZERO, transcript);
+    let q4: Vec<Goldilocks> = transcript.field_vec(arity);
+    let eq4 = mle::eq_evals(&q4);
+    let mut mles4: Vec<&[Goldilocks]> = vec![&eq4, &cols[0], &xp, &cols[2]];
+    for b in 0..TK_RANGE_BITS { mles4.push(&cols[3 + TK_RANGE_BITS + b]); }
+    let (d2_rel, z5) = prove_virtual(&mles4, &topk_d2_terms(), Goldilocks::ZERO, transcript);
+    let q5: Vec<Goldilocks> = transcript.field_vec(arity);
+    let eq5 = mle::eq_evals(&q5);
+    let gamma5 = transcript.field();
+    let mut mles5: Vec<&[Goldilocks]> = vec![&eq5];
+    for b in 0..TK_RANGE_BITS { mles5.push(&cols[3 + b]); }
+    for b in 0..TK_RANGE_BITS { mles5.push(&cols[3 + TK_RANGE_BITS + b]); }
+    let (bit_bool, z6) = prove_virtual(&mles5, &topk_bit_terms(gamma5, 2 * TK_RANGE_BITS), Goldilocks::ZERO, transcript);
+
+    let entries = topk_opening_layout(&z1, &z2, &z3, &z4, &z5, &z6, &qs, &qt, &qg, &qd, &q2, arity, lgn);
+    let idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
+    let points: Vec<Vec<Goldilocks>> = entries.iter().map(|e| e.1.clone()).collect();
+    let values: Vec<Goldilocks> = entries.iter().map(|e| mle::eval(&cols[e.0], &e.1)).collect();
+    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&c| cols[c].clone()).collect();
+    let ctx = zkie_core::pcs::committed::BatchCtx {
+        commitment: commitment.clone(), prover_data, protocol, whir: batch_whir, num_tables: TK_COLS,
+    };
+    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+
+    let xk = TensorKey::Field(x).encoded()?;
+    // The x column is zero-extended to the padded flat domain; map each
+    // endpoint back to x's own domain: x~(z) = pad * x~(z[..lgn+lgm]).
+    let x_claim = |z: &[Goldilocks], v: Goldilocks| -> Option<EvalClaim> {
+        if z.len() < lgn + lgm { return None; }
+        let pad = zero_ext_factor(z, lgn + lgm);
+        if pad == Goldilocks::ZERO { return None; }
+        Some(EvalClaim { tensor_id: xk, point: z[..lgn + lgm].to_vec(), value: v * pad.inverse() })
+    };
+    let claims = vec![
+        x_claim(&z3, gate_rel.final_evals[2])?,
+        x_claim(&z4, d1_rel.final_evals[2])?,
+        x_claim(&z5, d2_rel.final_evals[2])?,
+    ];
+    Some((ReverseTopKSelectProof { arity, witness_commitment: commitment, sel_bool, row_sum,
+        gate_rel, d1_rel, d2_rel, bit_bool, aux_values: values, opening }, claims))
+}
+
+fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+    proof: &ReverseTopKSelectProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+{
+    let (x, sel_t, thr_t, gate_t, d1_t, d2_t, m, n, k) = topk_dims(op)?;
+    let len = m.checked_mul(n)?;
+    let lgn = n.trailing_zeros() as usize;
+    let lgm = m.trailing_zeros() as usize;
+    let arity = len.trailing_zeros().max(5) as usize;
+    if proof.arity != arity
+        || proof.sel_bool.final_evals.len() != 2
+        || proof.row_sum.final_evals.len() != 2
+        || proof.gate_rel.final_evals.len() != 4
+        || proof.d1_rel.final_evals.len() != 4 + TK_RANGE_BITS
+        || proof.d2_rel.final_evals.len() != 4 + TK_RANGE_BITS
+        || proof.bit_bool.final_evals.len() != 1 + 2 * TK_RANGE_BITS { return None; }
+    let claim = |id: T| -> Option<(Vec<Goldilocks>, Goldilocks)> {
+        let key = TensorKey::Field(id).encoded()?;
+        outs.iter().find(|o| o.0 == key).map(|o| (o.1.clone(), o.2))
+    };
+    let (qs, vs) = claim(sel_t)?;
+    let (qt, vt) = claim(thr_t)?;
+    let (qg, vg) = claim(gate_t)?;
+    let (qd, vd) = claim(d1_t)?;
+    let (q2, v2) = claim(d2_t)?;
+    if qs.len() != lgn + lgm || qg.len() != lgn + lgm || qd.len() != lgn + lgm
+        || q2.len() != lgn + lgm || qt.len() != lgm { return None; }
+    let padded = 1usize.checked_shl(arity as u32)?;
+    let num_vars = TK_COLS.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
+    // Opening verification must use the BATCH variable count (what
+    // commit_batch sizes its whir to), not the column arity.
+    let whir = zkie_core::pcs::whir::Whir::with_params(num_vars, 90, pow);
+    let protocol = whir.batch_opening_protocol(TK_COLS, arity);
+    transcript.absorb(b"zkie-topk-witness-v1");
+    transcript.absorb(&bincode::serialize(&proof.witness_commitment).ok()?);
+
+    let q1: Vec<Goldilocks> = transcript.field_vec(arity);
+    let (ok, z1, f1) = verify_virtual(&proof.sel_bool, &topk_sel_bool_terms(), Goldilocks::ZERO, arity, transcript);
+    if !ok { return None; }
+    let r_rows: Vec<Goldilocks> = transcript.field_vec(lgm);
+    let (ok, z2, f2) = verify_virtual(&proof.row_sum, &[(Goldilocks::ONE, vec![0usize, 1usize])], Goldilocks::from_u64(k as u64), arity, transcript);
+    if !ok { return None; }
+    let q2v: Vec<Goldilocks> = transcript.field_vec(arity);
+    let (ok, z3, f3) = verify_virtual(&proof.gate_rel, &topk_gate_terms(), Goldilocks::ZERO, arity, transcript);
+    if !ok { return None; }
+    let q3: Vec<Goldilocks> = transcript.field_vec(arity);
+    let (ok, z4, f4) = verify_virtual(&proof.d1_rel, &topk_d1_terms(), Goldilocks::ZERO, arity, transcript);
+    if !ok { return None; }
+    let q4: Vec<Goldilocks> = transcript.field_vec(arity);
+    let (ok, z5, f5) = verify_virtual(&proof.d2_rel, &topk_d2_terms(), Goldilocks::ZERO, arity, transcript);
+    if !ok { return None; }
+    let q5: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gamma5 = transcript.field();
+    let (ok, z6, f6) = verify_virtual(&proof.bit_bool, &topk_bit_terms(gamma5, 2 * TK_RANGE_BITS), Goldilocks::ZERO, arity, transcript);
+    if !ok { return None; }
+
+    let entries = topk_opening_layout(&z1, &z2, &z3, &z4, &z5, &z6, &qs, &qt, &qg, &qd, &q2, arity, lgn);
+    if proof.aux_values.len() != entries.len() { return None; }
+    let idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
+    let points: Vec<Vec<Goldilocks>> = entries.iter().map(|e| e.1.clone()).collect();
+    if !zkie_core::pcs::batch_open::verify_batch_open_committed(
+        &whir, &proof.witness_commitment, &protocol, TK_COLS, &idxs, &points, &proof.aux_values, &proof.opening,
+    ) { return None; }
+    let av = &proof.aux_values;
+    let mut o = 0usize;
+    let sel1 = av[o]; o += 1;
+    let sel2 = av[o]; o += 1;
+    let sel3 = av[o]; let gate3 = av[o + 1]; o += 2;
+    let sel4 = av[o]; let thr4 = av[o + 1]; let bits1 = &av[o + 2..o + 2 + TK_RANGE_BITS]; o += 2 + TK_RANGE_BITS;
+    let sel5 = av[o]; let thr5 = av[o + 1]; let bits2 = &av[o + 2..o + 2 + TK_RANGE_BITS]; o += 2 + TK_RANGE_BITS;
+    let bb = &av[o..o + 2 * TK_RANGE_BITS]; o += 2 * TK_RANGE_BITS;
+    let out_sel = av[o]; o += 1;
+    let out_gate = av[o]; o += 1;
+    let out_thr = av[o]; o += 1;
+    let out_d1_bits = &av[o..o + TK_RANGE_BITS]; o += TK_RANGE_BITS;
+    let out_d2_bits = &av[o..o + TK_RANGE_BITS]; o += TK_RANGE_BITS;
+    if o != av.len() { return None; }
+
+    // sel Boolean.
+    let fe = &proof.sel_bool.final_evals;
+    let mut ev = [mle::eq_poly(&q1, &z1), sel1];
+    if f1 != virtual_eval(&topk_sel_bool_terms(), &ev) || fe[0] != ev[0] || fe[1] != ev[1] { return None; }
+    // Exactly k per row.
+    let fe = &proof.row_sum.final_evals;
+    // The row-broadcast column lives on the padded flat domain: its MLE at z
+    // factors as (zero-extension beyond lgn+lgm) * eq_poly(rows, z_row).
+    if lgn + lgm > z2.len() { return None; }
+    let row_hi = zero_ext_factor(&z2, lgn + lgm);
+    let ev2 = [sel2, row_hi * mle::eq_poly(&r_rows, &z2[lgn..lgn + lgm])];
+    if f2 != ev2[0] * ev2[1] || fe[0] != ev2[0] || fe[1] != ev2[1] { return None; }
+    // gate = sel*x.
+    let fe = &proof.gate_rel.final_evals;
+    let x3 = fe[2];
+    let ev3 = [mle::eq_poly(&q2v, &z3), sel3, x3, gate3];
+    if f3 != virtual_eval(&topk_gate_terms(), &ev3) || fe[0] != ev3[0]
+        || fe[1] != ev3[1] || fe[3] != ev3[3] { return None; }
+    // d1 = sel*(x - thr_b).
+    let fe = &proof.d1_rel.final_evals;
+    let x4 = fe[2];
+    let ev4: Vec<Goldilocks> = std::iter::once(mle::eq_poly(&q3, &z4)).chain(std::iter::once(sel4))
+        .chain(std::iter::once(x4)).chain(std::iter::once(thr4))
+        .chain(bits1.iter().copied()).collect();
+    if f4 != virtual_eval(&topk_d1_terms(), &ev4)
+        || fe[0] != ev4[0] || fe[1] != sel4 || fe[3] != thr4
+        || fe[4..].iter().zip(bits1).any(|(a, b)| a != b) { return None; }
+    // d2 = (1-sel)*(thr_b - x).
+    let fe = &proof.d2_rel.final_evals;
+    let x5 = fe[2];
+    let ev5: Vec<Goldilocks> = std::iter::once(mle::eq_poly(&q4, &z5)).chain(std::iter::once(sel5))
+        .chain(std::iter::once(x5)).chain(std::iter::once(thr5))
+        .chain(bits2.iter().copied()).collect();
+    if f5 != virtual_eval(&topk_d2_terms(), &ev5)
+        || fe[0] != ev5[0] || fe[1] != sel5 || fe[3] != thr5
+        || fe[4..].iter().zip(bits2).any(|(a, b)| a != b) { return None; }
+    // Witness bits Boolean.
+    let fe = &proof.bit_bool.final_evals;
+    let mut ev6 = vec![mle::eq_poly(&q5, &z6)];
+    ev6.extend_from_slice(bb);
+    if f6 != virtual_eval(&topk_bit_terms(gamma5, 2 * TK_RANGE_BITS), &ev6) || fe[0] != ev6[0]
+        || fe[1..].iter().zip(bb).any(|(a, b)| a != b) { return None; }
+
+    // Output claims against the same committed witness columns.
+    let mut d1v = Goldilocks::ZERO;
+    let mut d2v = Goldilocks::ZERO;
+    for b in 0..TK_RANGE_BITS {
+        d1v = d1v + Goldilocks::from_u64(1u64 << b) * out_d1_bits[b];
+        d2v = d2v + Goldilocks::from_u64(1u64 << b) * out_d2_bits[b];
+    }
+    if out_sel != vs || out_gate != vg || out_thr != vt || d1v != vd || d2v != v2 { return None; }
+
+    let xk = TensorKey::Field(x).encoded()?;
+    let x_claim = |z: &[Goldilocks], v: Goldilocks| -> Option<EvalClaim> {
+        if z.len() < lgn + lgm { return None; }
+        let pad = zero_ext_factor(z, lgn + lgm);
+        if pad == Goldilocks::ZERO { return None; }
+        Some(EvalClaim { tensor_id: xk, point: z[..lgn + lgm].to_vec(), value: v * pad.inverse() })
+    };
+    Some(vec![x_claim(&z3, x3)?, x_claim(&z4, x4)?, x_claim(&z5, x5)?])
+}
+
 /// Reverse reduction proof. Its returned leaf claims still need independent
 /// authentication against caller-trusted inputs and model commitments.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -427,6 +798,8 @@ enum ReverseReduction {
     GatherMatMul { proof: ReverseGatherMatmulProof },
     /// S7b: scatter-add with a replayed routing column.
     Gather { proof: ReverseGatherProof },
+    /// S7c: top-k router authentication (sel/thr/gate, 16-bit gap ranges).
+    TopKSelect { proof: ReverseTopKSelectProof },
     /// S7b: linear index relations (`out = scale*a + b`).
     CombineIdx { a: Goldilocks, b: Goldilocks },
     /// S7b: `out[i*b + j] = b*base[i] + j`.
@@ -2141,7 +2514,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
             out_claims.push(ReverseOutputClaim { tensor_id: id, merge, point, value });
         }
         if out_claims.is_empty() { continue; }
-        if !matches!(op, Op::Argmax { .. }) && out_claims.len() != 1 { return None; }
+        if !matches!(op, Op::Argmax { .. } | Op::TopKSelect { .. }) && out_claims.len() != 1 { return None; }
         let point = out_claims[0].point.clone();
         let value = out_claims[0].value;
         let reduction = match op {
@@ -2198,6 +2571,15 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
                 ReverseReduction::Argmax { proof }
+            }
+            Op::TopKSelect { .. } => {
+                let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
+                let (proof, incoming) = prove_reverse_topk(store, op, &pairs, transcript)?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::TopKSelect { proof }
             }
             Op::GatherMatMul { .. } => {
                 let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
@@ -2348,7 +2730,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
             if let Some(cs) = claims.remove(&id) { local.push((id, cs)); }
         }
         if local.is_empty() { continue; }
-        if !matches!(op, Op::Argmax { .. }) && local.len() != 1 { return None; }
+        if !matches!(op, Op::Argmax { .. } | Op::TopKSelect { .. }) && local.len() != 1 { return None; }
         let step = steps.next()?;
         if step.outputs.len() != local.len() { return None; }
         let mut point = Vec::new();
@@ -2407,6 +2789,12 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
             (Op::Argmax { .. }, ReverseReduction::Argmax { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ArgmaxWitness)?;
                 for c in verify_reverse_argmax(op, &merged_out, descriptor, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+            }
+            (Op::TopKSelect { .. }, ReverseReduction::TopKSelect { proof }) => {
+                for c in verify_reverse_topk(op, &merged_out, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -8289,7 +8677,13 @@ fn graph_exact_shapes(ops: &[Op])
     fn put(id: T, len: usize, layout: (u8, usize, usize, usize),
            out: &mut std::collections::BTreeMap<T, (usize, (u8, usize, usize, usize))>) -> Option<()> {
         if let Some(&(old_len, old_layout)) = out.get(&id) {
-            if old_len != len || old_layout != layout { return None; }
+            if old_len != len { return None; }
+            // The same committed tensor may be shared between a GatherMatMul
+            // expert weight and an ordinary matrix use (the flat layouts are
+            // compatible, e.g. (E,K,N) vs (E*K,N)). Only two EXPERT
+            // factorizations must agree; a plain layout carries no
+            // factorization claim.
+            if old_layout.0 == 1 && layout.0 == 1 && old_layout != layout { return None; }
         } else {
             out.insert(id, (len, layout));
         }
@@ -8323,6 +8717,14 @@ fn graph_exact_shapes(ops: &[Op])
                 }
                 put(TensorKey::Field(*thr).encoded()?, *m, (0, *m, 0, 0), &mut out)?;
                 put(TensorKey::Index(*ao).encoded()?, *m, (0, *m, 0, 0), &mut out)?;
+            }
+            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, .. } => {
+                if !m.is_power_of_two() || !n.is_power_of_two() { return None; }
+                let len = m.checked_mul(*n)?;
+                for id in [*x, *sel, *gate, *d1, *d2] {
+                    put(TensorKey::Field(id).encoded()?, len, (0, len, 0, 0), &mut out)?;
+                }
+                put(TensorKey::Field(*thr).encoded()?, *m, (0, *m, 0, 0), &mut out)?;
             }
             Op::Transpose { x, out: to, m, k } => {
                 if !m.is_power_of_two() || !k.is_power_of_two() { return None; }
@@ -13613,6 +14015,48 @@ mod tests {
             &bytes, &ops, 1, &whir, &PublicStatement::Generic, &bad_model, &bad_exec));
     }
 
+    /// S7b (TL review of 63a8fa4): a trusted weight may be shared between a
+    /// GatherMatMul expert use and an ordinary MatMul use when the flat
+    /// layouts agree ((E,K,N) vs (E*K,N)); the shape checks must accept it,
+    /// while still rejecting conflicting expert factorizations.
+    #[test]
+    fn s7b_shared_weight_expert_and_matmul_accepted() {
+        use zkie_core::pcs::whir::Whir;
+        let s = 8usize;
+        let (e_count, k, n) = (4usize, 4usize, 2usize);
+        let mut store = Store::new();
+        let a1 = store.push((0..s * k).map(|i| from_i64((i as i64 % 5) + 1)).collect());
+        let eo1 = store.push_idx(vec![0u32, 1, 2, 3, 0, 1, 2, 3]);
+        let w = store.push((0..e_count * k * n).map(|i| from_i64((i as i64 % 7) + 1)).collect());
+        let c1 = store.push(vec![]);
+        // Ordinary MatMul reading the same flat weight as (E*K) x N.
+        let x = store.push((0..4 * (e_count * k)).map(|i| from_i64((i as i64 % 3) + 1)).collect());
+        let c2 = store.push(vec![]);
+        let ops = vec![
+            Op::GatherMatMul { a: a1, expert_of: eo1, w, c: c1, s, k, n, n_experts: e_count },
+            Op::MatMul { a: x, b: w, c: c2, m: 4, k: e_count * k, n },
+        ];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7b-shared-w");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(eo1, s)].into());
+        assert!(trusted_weight_locations(&model, &ops).is_some(),
+            "compatible expert/plain sharing must be accepted");
+        let tk = TensorKey::Index(eo1).encoded().unwrap();
+        let to_g = |v: &[u32]| v.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect::<Vec<_>>();
+        let execution = TrustedExecution {
+            inputs: [
+                (a1, store.get(a1).to_vec()),
+                (tk, to_g(&store.idx[eo1])),
+                (x, store.get(x).to_vec()),
+            ].into(),
+            outputs: [(c1, store.get(c1).to_vec()), (c2, store.get(c2).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+    }
+
     /// S7 (TL review): the same weight tensor used with two different expert
     /// layouts (same total length) must be rejected as a same-id conflict.
     #[test]
@@ -14086,6 +14530,69 @@ mod tests {
         let mut bad3 = execution.clone();
         bad3.inputs.get_mut(&tk).unwrap()[0] = Goldilocks::from_u64(1);
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad3));
+    }
+
+    /// S7c: TopKSelect reverse reduction — the router selector is
+    /// authenticated by proof relations (Boolean + exactly k per row,
+    /// gate = x*sel, d1/d2 threshold gaps with 16-bit range witnesses); the
+    /// witness columns are committed and only opened at derived points.
+    #[test]
+    fn s7c_topk_select_bound_roundtrip() {
+        use zkie_core::pcs::whir::Whir;
+        use zkie_core::common::fixed_point::from_i64;
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        let (m, n, k) = (4usize, 4usize, 2usize);
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let (thr_v, sel_v, gate_v, d1_v, d2_v) = topk_forward(&xv, m, n, k);
+        store.v[sel] = TensorData::Owned(sel_v.clone());
+        store.v[thr] = TensorData::Owned(thr_v.clone());
+        store.v[gate] = TensorData::Owned(gate_v.clone());
+        store.v[d1] = TensorData::Owned(d1_v.clone());
+        store.v[d2] = TensorData::Owned(d2_v.clone());
+        let ops = vec![Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-topk");
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(x, xv)].into(),
+            outputs: [
+                (sel, sel_v), (thr, thr_v), (gate, gate_v), (d1, d1_v), (d2, d2_v),
+            ].into(),
+        };
+        let mut store2 = Store::new();
+        let _ = &mut store2;
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // Tampering any public output must reject.
+        for id in [sel, thr, gate, d1, d2] {
+            let mut bad = execution.clone();
+            bad.outputs.get_mut(&id).unwrap()[0] += Goldilocks::ONE;
+            assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad));
+        }
+        // Tampering the score input must reject.
+        let mut bad_in = execution.clone();
+        bad_in.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_in));
+        // Forged witness opening (selector endpoint) must reject.
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::TopKSelect { proof: p } = &mut step.reduction {
+                p.aux_values[0] += Goldilocks::ONE;
+                hit = true;
+            }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
     }
 
     /// S7c boundary: Scatter has no authenticated-routing reverse reduction yet
