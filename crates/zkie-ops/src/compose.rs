@@ -8651,8 +8651,18 @@ pub fn verify_committed_shard_dag_bound(
             let mut vals = vec![Goldilocks::ZERO; padded];
             for (i, &v) in tensor.iter().enumerate() { vals[i] = v; }
             if mle::eval(&vals, &c.point) != c.value { return false; }
-        } else if !tensor.len().is_power_of_two() || c.point.len() != tensor.len().trailing_zeros() as usize
-            || mle::eval(tensor, &c.point) != c.value { return false; }
+        } else {
+            // Field tensors follow the same zero-extension convention: a
+            // non-power-of-two length is evaluated over the zero-padded
+            // 2^ceil(log2 len) domain. Reductions that emit claims on such
+            // tensors (e.g. Gather with a non-power-of-two position count)
+            // use the identical convention, so the protocol stays consistent.
+            let padded = match tensor.len().checked_next_power_of_two() { Some(v) => v, None => return false };
+            if padded == 0 || c.point.len() != padded.trailing_zeros() as usize { return false; }
+            let mut vals = vec![Goldilocks::ZERO; padded];
+            for (i, &v) in tensor.iter().enumerate() { vals[i] = v; }
+            if mle::eval(&vals, &c.point) != c.value { return false; }
+        }
     }
     let groups = match group_reverse_weights(model, ops, &leaves) { Some(g) => g, None => return false };
     if proof.weight_openings.len() != groups.len() { return false; }
@@ -13875,6 +13885,49 @@ mod tests {
             if let ReverseReduction::Gather { proof: p } = &mut step.reduction { p.sum.final_evals[2] += Goldilocks::ONE; }
         }
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged2, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// S7b (TL review): non-power-of-two position count (s=3) with public
+    /// field leaves (weighted 3*h, gate 3). The zero-extension convention is
+    /// applied consistently in the Gather reduction and the leaf check.
+    #[test]
+    fn s7b_gather_non_power_of_two_positions_roundtrip() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, h, s) = (4usize, 2usize, 3usize);
+        let mut store = Store::new();
+        let token_id = store.push_idx(vec![0u32, 1, 2]);
+        let weighted = store.push((0..s * h).map(|i| from_i64((i as i64 % 7) + 1)).collect());
+        let gate = store.push((0..s).map(|i| from_i64((i as i64 % 3) + 1)).collect());
+        let out = store.push(vec![]);
+        let ops = vec![Op::Gather { weighted, token_id, gate, out, m, h }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7b-gather3");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(token_id, s)].into());
+        let tk = TensorKey::Index(token_id).encoded().unwrap();
+        let to_g = |v: &[u32]| v.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect::<Vec<_>>();
+        let execution = TrustedExecution {
+            inputs: [
+                (weighted, store.get(weighted).to_vec()),
+                (gate, store.get(gate).to_vec()),
+                (tk, to_g(&store.idx[token_id])),
+            ].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        let mut bad = execution.clone();
+        bad.inputs.get_mut(&gate).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad));
+        let mut bad2 = execution.clone();
+        bad2.inputs.get_mut(&weighted).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad2));
+        let mut bad3 = execution.clone();
+        bad3.inputs.get_mut(&tk).unwrap()[0] = Goldilocks::from_u64(1);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad3));
     }
 
     /// S7c boundary: Scatter has no authenticated-routing reverse reduction yet
