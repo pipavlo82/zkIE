@@ -7385,12 +7385,40 @@ fn aux_batch_whir(descriptor: &AuxDescriptor) -> Option<(zkie_core::pcs::whir::W
     Some((whir, protocol))
 }
 
+/// S6 (bound): the token-binding challenge r is derived on a transcript
+/// that canonically binds the COMPLETE trusted statement BEFORE sampling r:
+/// the caller's public statement (prompt/response/next_token), the trusted
+/// model, the public execution, the op graph, and the aux commitments. A
+/// prover therefore cannot adapt the claimed token sequence to a known r
+/// (which would let an MLE collision at r pass a binding for the wrong
+/// sequence). Shared by prove/verify and the replay regression.
+fn token_binding_challenge(
+    statement: &PublicStatement,
+    model: &TrustedModelManifest,
+    execution: &TrustedExecution,
+    ops: &[Op],
+    ops_per_shard: usize,
+    aux: &[AuxDescriptor],
+    arity: usize,
+) -> Vec<Goldilocks> {
+    let mut ts = Transcript::new(b"zkie-committed-public-v1");
+    ts.absorb(&bincode::serialize(statement).unwrap());
+    ts.absorb(&bincode::serialize(model).unwrap());
+    ts.absorb(&bincode::serialize(execution).unwrap());
+    absorb_statement(&mut ts, ops, ops_per_shard);
+    for a in aux {
+        ts.absorb(&bincode::serialize(a).unwrap());
+    }
+    ts.field_vec(arity)
+}
+
 /// S6 (bound prove): per-Argmax selector openings on the ArgmaxWitness aux
 /// column 0 at the per-position points (i, argmax[i]) claimed 1, plus the
 /// embedding token binding — the first Lookup's LookupPairs aux column 0
 /// opened at a fresh transcript-derived point r. Both are built against the
 /// SAME aux commitments the reverse reduction consumes.
-fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], ops_per_shard: usize)
+fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], ops_per_shard: usize,
+    statement: &PublicStatement, model: &TrustedModelManifest, execution: &TrustedExecution, aux: &[AuxDescriptor])
     -> Option<(Vec<BoundSelOpening>, Option<BoundTokenBinding>)>
 {
     let aux_ctx = |auxp: &PreparedAux| -> Option<zkie_core::pcs::committed::BatchCtx> {
@@ -7437,12 +7465,9 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
         let x_col = &auxp.columns[0];
         if x_col.is_empty() || !x_col.len().is_power_of_two() { return None; }
         let arity = auxp.descriptor.arity;
-        let mut ts = Transcript::new(b"zkie-committed-public-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
-        for p in prepared {
-            ts.absorb(&bincode::serialize(&p.descriptor).unwrap());
-        }
-        let r: Vec<Goldilocks> = ts.field_vec(arity);
+        // The challenge binds the COMPLETE trusted statement (public
+        // statement + model + execution + graph + aux commitments).
+        let r: Vec<Goldilocks> = token_binding_challenge(statement, model, execution, ops, ops_per_shard, aux, arity);
         let claimed = mle::eval(x_col, &r);
         let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(aux_ctx(auxp)?, &[0usize], &[x_col.clone()], &[r.clone()], &[claimed]).ok()?;
         Some(BoundTokenBinding { point: r, claimed, opening })
@@ -7453,7 +7478,7 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
 pub fn prove_committed_shard_dag_bound(
     store: &mut Store, ops: &[Op], ops_per_shard: usize,
     whir: &zkie_core::pcs::whir::Whir, cached: &[CachedWeightBatch],
-    _tokens_t: T, _argmax_t: T, model: &TrustedModelManifest, execution: &TrustedExecution,
+    _tokens_t: T, _argmax_t: T, statement: &PublicStatement, model: &TrustedModelManifest, execution: &TrustedExecution,
 ) -> Option<BoundExecutionProof> {
     let _ = (ops_per_shard, whir);
     trusted_weight_locations(model, ops)?;
@@ -7494,7 +7519,7 @@ pub fn prove_committed_shard_dag_bound(
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
     // S6 (bound): selector openings + embedding token binding, built against
     // the same aux commitments the reverse reduction uses.
-    let (sel_openings, token_binding) = prove_bound_lm_bindings(&prepared, store, ops, ops_per_shard)?;
+    let (sel_openings, token_binding) = prove_bound_lm_bindings(&prepared, store, ops, ops_per_shard, statement, model, execution, &aux)?;
     let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux)?;
     let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
     let reverse = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model))?;
@@ -7653,10 +7678,9 @@ pub fn verify_committed_shard_dag_bound(
         if base != n {
             return false; // the expansion base must equal the argmax column count
         }
-        let mut ts = Transcript::new(b"zkie-committed-public-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
-        for a in &proof.aux { ts.absorb(&bincode::serialize(a).unwrap()); }
-        let r: Vec<Goldilocks> = ts.field_vec(descriptor.arity);
+        // Shared derivation: binds the COMPLETE trusted statement before
+        // sampling r (public statement + model + execution + graph + aux).
+        let r: Vec<Goldilocks> = token_binding_challenge(statement, model, execution, ops, ops_per_shard, &proof.aux, descriptor.arity);
         if tb.point != r { return false; }
         let x_hat = embedding_x_hat(&tokens, base, d, &r);
         if tb.claimed != x_hat {
@@ -9503,7 +9527,7 @@ mod tests {
         let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, vec![from_i64(-1), from_i64(0), from_i64(1), from_i64(2)])].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let mut bad = execution.clone();
         bad.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
@@ -9520,7 +9544,7 @@ mod tests {
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
         let expected: Vec<_> = [-21, -6, 9, 27].into_iter().map(from_i64).collect();
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let mut bad_in = execution.clone();
         bad_in.inputs.get_mut(&x).unwrap()[1] += Goldilocks::ONE;
@@ -9540,7 +9564,7 @@ mod tests {
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
         let expected: Vec<_> = [-2, -1, 0, 2].into_iter().map(from_i64).collect();
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
         let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
@@ -9570,7 +9594,7 @@ mod tests {
         let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, vec![Goldilocks::ZERO; 4])].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
         let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
@@ -9588,7 +9612,7 @@ mod tests {
         let ops3 = vec![Op::Scale { x: x3, out: out3, factor: 0, shift: 3 }];
         let model3 = TrustedModelManifest::from_offline_commitment(&[], &store3.owned_slices(), &ops3);
         let execution3 = TrustedExecution { inputs: [(x3, store3.get(x3).to_vec())].into(), outputs: [(out3, vec![Goldilocks::ZERO; 4])].into() };
-        let proof3 = prove_committed_shard_dag_bound(&mut store3, &ops3, 1, &whir, &[], 0, 0, &model3, &execution3).unwrap();
+        let proof3 = prove_committed_shard_dag_bound(&mut store3, &ops3, 1, &whir, &[], 0, 0, &PublicStatement::Generic, &model3, &execution3).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops3, 1, &whir, &proof3, &PublicStatement::Generic, &model3, &execution3));
         let mut bad_out3 = execution3.clone();
         bad_out3.outputs.get_mut(&out3).unwrap()[0] = Goldilocks::ONE;
@@ -9636,7 +9660,7 @@ mod tests {
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
         let expected: Vec<_> = [2, 1, 0, -1].into_iter().map(from_i64).collect();
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let mut bad_in = execution.clone();
         bad_in.inputs.get_mut(&x).unwrap()[2] += Goldilocks::ONE;
@@ -9870,7 +9894,7 @@ mod tests {
                 (out_key, out_vals),
             ].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
@@ -10006,7 +10030,7 @@ mod tests {
         let expected: Vec<_> = [0,4,1,5,2,6,3,7].into_iter().map(from_i64).collect();
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
         let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 2, &whir, &cache, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 2, &whir, &cache, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let mut bad = execution.clone();
         bad.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
@@ -10058,7 +10082,7 @@ mod tests {
         let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops).with_index_shapes(&[(idx, 4usize)].into());
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, vec![from_i64(-10), from_i64(-1), from_i64(8), from_i64(16)])].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 5, &whir, &cache, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 5, &whir, &cache, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 5, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 5, &whir, &PublicStatement::Generic, &model, &execution));
@@ -10120,7 +10144,7 @@ mod tests {
         let index_key = TensorKey::Index(idx).encoded().unwrap();
         let execution = TrustedExecution { inputs: [(index_key, vec![from_i64(1), from_i64(0), from_i64(3), from_i64(2)])].into(), outputs: [(out, vec![from_i64(3), from_i64(7), from_i64(5), from_i64(9)])].into() };
         let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let mut wrong_namespace = execution.clone();
         let values = wrong_namespace.inputs.remove(&index_key).unwrap();
@@ -10197,7 +10221,7 @@ mod tests {
         let trusted_a = TrustedModelManifest::from_offline_commitment(&cache_a, &store.owned_slices(), &ops);
         forward_ops(&mut store, &ops);
         let execution_a = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(c, store.get(c).to_vec())].into() };
-        let proof_a = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache_a, token, argmax, &trusted_a, &execution_a).unwrap();
+        let proof_a = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache_a, token, argmax, &PublicStatement::Generic, &trusted_a, &execution_a).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof_a, &PublicStatement::Generic, &trusted_a, &execution_a));
         let mut wrong_input = execution_a.clone();
         wrong_input.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
@@ -10209,7 +10233,7 @@ mod tests {
         let trusted_b = TrustedModelManifest::from_offline_commitment(&cache_b, &store.owned_slices(), &ops);
         forward_ops(&mut store, &ops);
         let execution_b = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(c, store.get(c).to_vec())].into() };
-        let proof_b = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache_b, token, argmax, &trusted_b, &execution_b).unwrap();
+        let proof_b = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache_b, token, argmax, &PublicStatement::Generic, &trusted_b, &execution_b).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof_b, &PublicStatement::Generic, &trusted_b, &execution_b));
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof_b, &PublicStatement::Generic, &trusted_a, &execution_b));
     }
@@ -10229,7 +10253,7 @@ mod tests {
             let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
             let output: Vec<_> = values.iter().map(|&v| from_i64(to_i64(v).max(0))).collect();
             let execution = TrustedExecution { inputs: [(x, values.clone())].into(), outputs: [(out, output)].into() };
-            let mut proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &model, &execution).unwrap();
+            let mut proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
             assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
             let mut bad_positive = execution.clone();
             bad_positive.outputs.get_mut(&out).unwrap()[0] = Goldilocks::ZERO;
@@ -10245,7 +10269,7 @@ mod tests {
             let mut outside = execution.clone();
             outside.inputs.get_mut(&x).unwrap()[0] = from_i64(limit);
             outside.outputs.get_mut(&out).unwrap()[0] = from_i64(limit);
-            assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &model, &outside).is_none());
+            assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &PublicStatement::Generic, &model, &outside).is_none());
         }
     }
 
@@ -10264,7 +10288,7 @@ mod tests {
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
         let expected = vec![from_i64(-1), from_i64(0), from_i64(1), from_i64(2)];
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
     }
 
@@ -10285,7 +10309,7 @@ mod tests {
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
         forward_ops(&mut store, &ops);
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, store.get(out).to_vec())].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, token, argmax, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, token, argmax, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
@@ -10321,7 +10345,7 @@ mod tests {
             inputs: [(a, store.get(a).to_vec()), (b, store.get(b).to_vec())].into(),
             outputs: [(out, store.get(out).to_vec())].into(),
         };
-        let mut proof = prove_committed_shard_dag_bound(&mut store, &ops, 2, &whir, &cache, token, argmax, &model, &execution).unwrap();
+        let mut proof = prove_committed_shard_dag_bound(&mut store, &ops, 2, &whir, &cache, token, argmax, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let mut wrong = execution.clone();
         wrong.inputs.get_mut(&a).unwrap()[0] += Goldilocks::ONE;
@@ -10485,7 +10509,7 @@ mod tests {
             inputs: [(x, store.get(x).to_vec())].into(),
             outputs: [(outs[3], store.get(outs[3]).to_vec())].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 2, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 2, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &execution));
 
         // Serialization roundtrip through the bytes entry.
@@ -10628,7 +10652,7 @@ mod tests {
         forward_ops(&mut store, &ops);
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, store.get(out).to_vec())].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(!proof.weight_openings.is_empty());
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
@@ -10681,7 +10705,7 @@ mod tests {
             inputs: [(x, store.get(x).to_vec()), (idx_key, idx_values)].into(),
             outputs: [(out, store.get(out).to_vec()), (act, store.get(act).to_vec())].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         // Forge: drop the table commitment/opening as if the table were an
         // identity table. The verifier's identity branch is statement-driven,
@@ -10733,7 +10757,7 @@ mod tests {
             inputs: [(x, store.get(x).to_vec()), (idx_key, idx_values)].into(),
             outputs: [(out, store.get(out).to_vec()), (act, store.get(act).to_vec())].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         // Re-commit the padded table, honestly open at an arbitrary point, and
         // move the table opening there. The verifier derives the leaf point
@@ -11368,13 +11392,13 @@ mod tests {
                 (out_key, out_vals),
             ].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
-        assert!(proof.token_binding.is_some());
         let stmt = PublicStatement::LanguageModel {
             prompt: tokens[..3].to_vec(),
             response: tokens[3..].to_vec(),
             next_token: Some(0),
         };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &stmt, &model, &execution).unwrap();
+        assert!(proof.token_binding.is_some());
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &stmt, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bound_bytes(
@@ -11619,7 +11643,12 @@ mod tests {
                 (out_key, out_vals),
             ].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let stmt_ok = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &stmt_ok, &model, &execution).unwrap();
         // honest argmax[2] = 3 (first maximum); the caller claims 4.
         let stmt_bad = PublicStatement::LanguageModel {
             prompt: tokens[..3].to_vec(),
@@ -11640,11 +11669,6 @@ mod tests {
         let mut tied_exec = execution.clone();
         tied_exec.outputs.get_mut(&out_key).unwrap()[2] = Goldilocks::from_u64(4);
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &tied_exec));
-        let stmt_ok = PublicStatement::LanguageModel {
-            prompt: tokens[..3].to_vec(),
-            response: tokens[3..].to_vec(),
-            next_token: Some(0),
-        };
         assert!(verify_committed_shard_dag_bound_bytes(
             &bytes,
             &ops,
@@ -11685,19 +11709,87 @@ mod tests {
                 (out_key, out_vals),
             ].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
-        let bytes = bincode::serialize(&proof).unwrap();
         let stmt = PublicStatement::LanguageModel {
             prompt: vec![],
             response: tokens.clone(),
             next_token: None,
         };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &stmt, &model, &execution).unwrap();
+        let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bound_bytes(
             &bytes,
             &ops,
             1,
             &whir,
             &stmt, &model, &execution
+        ));
+    }
+
+    /// S6 (bound): the token-binding challenge r binds the COMPLETE public
+    /// statement — any change to the statement (even one that still passes
+    /// the sequence checks) changes r, so the original proof must reject.
+    /// Without this binding a prover could adaptively pick a sequence whose
+    /// x̂ collides with the committed witness column at a known r.
+    #[test]
+    fn s6_token_binding_challenge_binds_public_statement() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, _tokens_t, _argmax_t) =
+            s6_lm_setup(0x6D, &tokens, base, false);
+        let (emb_idx, sel, thr, gate, d1, d2, out) = match (&ops[0], &ops[2]) {
+            (Op::Lookup { idx, .. }, Op::Argmax { sel, thr, gate, d1, d2, out, .. }) =>
+                (*idx, *sel, *thr, *gate, *d1, *d2, *out),
+            _ => unreachable!(),
+        };
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(emb_idx, base * base), (out, base)].into());
+        let emb_idx_key = TensorKey::Index(emb_idx).encoded().unwrap();
+        let emb_idx_vals: Vec<Goldilocks> = store.idx.get(emb_idx).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let out_vals: Vec<Goldilocks> = store.idx.get(out).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(emb_idx_key, emb_idx_vals)].into(),
+            outputs: [
+                (sel, store.get(sel).to_vec()),
+                (thr, store.get(thr).to_vec()),
+                (gate, store.get(gate).to_vec()),
+                (d1, store.get(d1).to_vec()),
+                (d2, store.get(d2).to_vec()),
+                (out_key, out_vals),
+            ].into(),
+        };
+        // Both statements satisfy the honest sequence checks; they differ
+        // only in whether the last-row prediction is pinned.
+        let stmt_a = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        let stmt_b = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: tokens[3..].to_vec(),
+            next_token: None,
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &stmt_a, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &stmt_a, &model, &execution));
+        // The derived challenge must actually depend on the statement.
+        let arity = proof.aux.iter()
+            .find(|a| a.role == AuxRole::LookupPairs && a.op_index == ops.iter().position(|op| matches!(op, Op::Lookup { .. })).unwrap())
+            .unwrap().arity;
+        let r_a = token_binding_challenge(&stmt_a, &model, &execution, &ops, 1, &proof.aux, arity);
+        let r_b = token_binding_challenge(&stmt_b, &model, &execution, &ops, 1, &proof.aux, arity);
+        assert_ne!(r_a, r_b, "the token-binding challenge must depend on the public statement");
+        // The proof built under stmt_a must reject under stmt_b even though
+        // stmt_b passes the sequence checks: tb.point was derived under
+        // stmt_a's challenge.
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(!verify_committed_shard_dag_bound_bytes(
+            &bytes,
+            &ops,
+            1,
+            &whir,
+            &stmt_b, &model, &execution
         ));
     }
 
@@ -11732,7 +11824,7 @@ mod tests {
                 (out_key, out_vals),
             ].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bound_bytes(
             &bytes,
@@ -11802,7 +11894,7 @@ mod tests {
             inputs: [(x, store.get(x).to_vec()), (idx_key, idx_values)].into(),
             outputs: [(out, store.get(out).to_vec()), (act, store.get(act).to_vec())].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let mut table_committed = false;
         for step in &proof.reverse.steps {
@@ -11854,7 +11946,7 @@ mod tests {
             inputs: [(x, store.get(x).to_vec()), (idx_key, idx_values)].into(),
             outputs: [(out, store.get(out).to_vec()), (act, store.get(act).to_vec())].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let mut table_identity = false;
         for step in &proof.reverse.steps {
@@ -12013,7 +12105,7 @@ mod tests {
             ].into(),
             outputs: [(out_t, store.get(out_t).to_vec())].into(),
         };
-        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).is_none(),
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).is_none(),
             "Scatter/Gather graphs must be refused until the S7 MoE bindings land");
     }
 
@@ -12037,7 +12129,7 @@ mod tests {
         forward_ops(&mut store, &ops);
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, store.get(out).to_vec())].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(!proof.weight_openings.is_empty());
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
@@ -12093,7 +12185,7 @@ mod tests {
         forward_ops(&mut store, &ops);
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, store.get(out).to_vec())].into() };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(proof.weight_openings.len() >= 2);
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
@@ -12193,7 +12285,7 @@ mod tests {
                 (out_key, out_vals),
             ].into(),
         };
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
 
         // One selector-opening group per Argmax op, one individual opening
         // per position (the points are derived from the public argmax).
