@@ -3,8 +3,9 @@
 This document describes the intended committed verifier schedule. It is not a
 claim that all operators or the complete protocol have been migrated or audited.
 The current bound proof supports Add, MatMul, Projection, Scale, Transpose,
-bounded ReLU, GeluIndex, Lookup, Argmax and the GatherMatMul expert-FFN core
-(staged part of S7; S7 itself remains incomplete). The bound entry also
+bounded ReLU, GeluIndex, Lookup, Argmax, the GatherMatMul expert-FFN core and
+the linear index ops CombineIdx/IdxBroadcast/PadIdx (staged parts of S7; S7
+itself remains incomplete). The bound entry also
 supports the LanguageModel public statement (S6). Still fail closed:
 Scatter, Gather, BatchedMatMul, CombineIdx, IdxBroadcast, PadIdx,
 BroadcastScale, Softmax, TopKSelect, SoftmaxIndex, StableSoftmaxIndex,

@@ -174,6 +174,9 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
         Op::GatherMatMul { a, expert_of, w, c, .. } => {
             Some((vec![f(*a)?, i(*expert_of)?, f(*w)?], vec![f(*c)?]))
         }
+        Op::CombineIdx { a, b, out, .. } => Some((vec![i(*a)?, i(*b)?], vec![i(*out)?])),
+        Op::IdxBroadcast { base, out, .. } => Some((vec![i(*base)?], vec![i(*out)?])),
+        Op::PadIdx { base, out, .. } => Some((vec![i(*base)?], vec![i(*out)?])),
         Op::Argmax { x, out, sel, thr, gate, d1, d2, .. } => Some((
             vec![f(*x)?],
             vec![i(*out)?, f(*sel)?, f(*thr)?, f(*gate)?, f(*d1)?, f(*d2)?],
@@ -212,6 +215,12 @@ enum ReverseReduction {
     Scale { proof: ReverseScaleProof },
     Argmax { proof: ReverseArgmaxProof },
     GatherMatMul { proof: ReverseGatherMatmulProof },
+    /// S7b: linear index relations (`out = scale*a + b`).
+    CombineIdx { a: Goldilocks, b: Goldilocks },
+    /// S7b: `out[i*b + j] = b*base[i] + j`.
+    IdxBroadcast { base: Goldilocks },
+    /// S7b: `out` is `base` zero-padded to `len`.
+    PadIdx { base: Goldilocks },
     Transpose,
 }
 
@@ -863,6 +872,17 @@ fn expert_routing_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec
     }
     terms.push((-onehot_w, vec![0usize, 2 + count])); //        − eq·mask
     terms
+}
+
+/// Evaluate a (possibly non-power-of-two) index tensor as a field column,
+/// zero-padded to the 2^point.len() domain. Used by the S7b index reductions.
+fn idx_eval(store: &Store, id: T, point: &[Goldilocks]) -> Option<Goldilocks> {
+    let xs = store.idx.get(id)?;
+    let padded = 1usize.checked_shl(point.len() as u32)?;
+    if xs.len() > padded { return None; }
+    let mut vals = vec![Goldilocks::ZERO; padded];
+    for (i, &v) in xs.iter().enumerate() { vals[i] = Goldilocks::from_u64(v as u64); }
+    Some(mle::eval(&vals, point))
 }
 
 /// Zero-extension factor Π_{b >= k}(1 - z_b) (padding coordinates absent).
@@ -1924,6 +1944,52 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 }
                 ReverseReduction::GatherMatMul { proof }
             }
+            Op::CombineIdx { a, b, scale, .. } => {
+                // S5 (reverse): out = scale*a + b at the claim point; both
+                // input values are carried and authenticated upstream.
+                let av = idx_eval(store, *a, &point)?;
+                let bv = idx_eval(store, *b, &point)?;
+                if Goldilocks::from_u64(*scale as u64) * av + bv != value { return None; }
+                for (id, val) in [(*a, av), (*b, bv)] {
+                    let key = TensorKey::Index(id).encoded()?;
+                    absorb_reverse_claim(transcript, key, &point, val);
+                    claims.entry(key).or_default().push((point.clone(), val));
+                }
+                ReverseReduction::CombineIdx { a: av, b: bv }
+            }
+            Op::IdxBroadcast { base, b, .. } => {
+                // S5 (reverse): out[i*b + j] = b*base[i] + j; the low bits of
+                // the claim point are the closed-form j index.
+                if !b.is_power_of_two() { return None; }
+                let b_log = b.trailing_zeros() as usize;
+                if point.len() < b_log { return None; }
+                let (r_low, r_hi) = point.split_at(b_log);
+                let jval = mle_integer(r_low);
+                let bv = idx_eval(store, *base, r_hi)?;
+                if value != Goldilocks::from_u64(*b as u64) * bv + jval { return None; }
+                let key = TensorKey::Index(*base).encoded()?;
+                absorb_reverse_claim(transcript, key, r_hi, bv);
+                claims.entry(key).or_default().push((r_hi.to_vec(), bv));
+                ReverseReduction::IdxBroadcast { base: bv }
+            }
+            Op::PadIdx { base, len, base_len, .. } => {
+                // S5/S7 (reverse): out is base zero-padded to len. The
+                // zero-extension identity maps the claim point to the base
+                // domain: out~(r) = f * base~(r[..lb]).
+                if *base_len == 0 || *base_len > *len { return None; }
+                if *len != 1usize.checked_shl(point.len() as u32)? { return None; }
+                let lb = base_len.checked_next_power_of_two()?.trailing_zeros() as usize;
+                if point.len() < lb { return None; }
+                let f = zero_ext_factor(&point, lb);
+                if f == Goldilocks::ZERO { return None; }
+                let r_trunc = &point[..lb];
+                let bv = idx_eval(store, *base, r_trunc)?;
+                if value != f * bv { return None; }
+                let key = TensorKey::Index(*base).encoded()?;
+                absorb_reverse_claim(transcript, key, r_trunc, bv);
+                claims.entry(key).or_default().push((r_trunc.to_vec(), bv));
+                ReverseReduction::PadIdx { base: bv }
+            }
             Op::Relu { x, .. } => {
                 let (proof, incoming) = prove_reverse_relu(store.get(*x), &point, value, transcript)?;
                 for (p, v) in incoming {
@@ -2048,6 +2114,37 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
+            }
+            (Op::CombineIdx { a, b, scale, .. }, ReverseReduction::CombineIdx { a: av, b: bv }) => {
+                if Goldilocks::from_u64(*scale as u64) * *av + *bv != value { return None; }
+                for (id, val) in [(*a, *av), (*b, *bv)] {
+                    let key = TensorKey::Index(id).encoded()?;
+                    absorb_reverse_claim(transcript, key, &point, val);
+                    claims.entry(key).or_default().push((point.clone(), val));
+                }
+            }
+            (Op::IdxBroadcast { base, b, .. }, ReverseReduction::IdxBroadcast { base: bv }) => {
+                if !b.is_power_of_two() { return None; }
+                let b_log = b.trailing_zeros() as usize;
+                if point.len() < b_log { return None; }
+                let (r_low, r_hi) = point.split_at(b_log);
+                let jval = mle_integer(r_low);
+                if value != Goldilocks::from_u64(*b as u64) * *bv + jval { return None; }
+                let key = TensorKey::Index(*base).encoded()?;
+                absorb_reverse_claim(transcript, key, r_hi, *bv);
+                claims.entry(key).or_default().push((r_hi.to_vec(), *bv));
+            }
+            (Op::PadIdx { base, len, base_len, .. }, ReverseReduction::PadIdx { base: bv }) => {
+                if *base_len == 0 || *base_len > *len { return None; }
+                if *len != 1usize.checked_shl(point.len() as u32)? { return None; }
+                let lb = base_len.checked_next_power_of_two()?.trailing_zeros() as usize;
+                if point.len() < lb { return None; }
+                let f = zero_ext_factor(&point, lb);
+                if f == Goldilocks::ZERO { return None; }
+                if value != f * *bv { return None; }
+                let key = TensorKey::Index(*base).encoded()?;
+                absorb_reverse_claim(transcript, key, &point[..lb], *bv);
+                claims.entry(key).or_default().push((point[..lb].to_vec(), *bv));
             }
             (Op::Relu { x, .. }, ReverseReduction::Relu { proof }) => {
                 for (p, v) in verify_reverse_relu(proof, &point, value, transcript)? {
@@ -12657,6 +12754,63 @@ mod tests {
         };
         assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).is_none(),
             "gate-weighted Gather must stay fail-closed until its reverse reduction lands");
+    }
+
+    /// S7b: linear index-op chain in the bound path: CombineIdx ->
+    /// IdxBroadcast -> PadIdx. The reductions evaluate the S5 relations at
+    /// the claim points and propagate index claims to the public inputs.
+    #[test]
+    fn s7b_index_chain_bound_roundtrip() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let a = store.push_idx(vec![1u32, 2, 3, 4]);
+        let b = store.push_idx(vec![5u32, 6, 7, 8]);
+        let c = store.push_idx(vec![]);
+        let d = store.push_idx(vec![]);
+        let out = store.push_idx(vec![]);
+        let ops = vec![
+            Op::CombineIdx { a, b, out: c, scale: 10 },
+            Op::IdxBroadcast { base: c, out: d, b: 2 },
+            Op::PadIdx { base: d, out, len: 16, base_len: 8 },
+        ];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7b-index");
+        forward_ops(&mut store, &ops);
+        assert_eq!(store.idx[c], vec![15u32, 26, 37, 48]);
+        assert_eq!(store.idx[d], vec![30u32, 31, 52, 53, 74, 75, 96, 97]);
+        assert_eq!(store.idx[out], vec![30u32, 31, 52, 53, 74, 75, 96, 97, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(a, 4usize), (b, 4), (out, 16)].into());
+        let a_key = TensorKey::Index(a).encoded().unwrap();
+        let b_key = TensorKey::Index(b).encoded().unwrap();
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let to_g = |v: &[u32]| v.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect::<Vec<_>>();
+        let execution = TrustedExecution {
+            inputs: [(a_key, to_g(&store.idx[a])), (b_key, to_g(&store.idx[b]))].into(),
+            outputs: [(out_key, to_g(&store.idx[out]))].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // Forged CombineIdx relation (scale*a + b != out at the claim point).
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::CombineIdx { a: av, .. } = &mut step.reduction { *av += Goldilocks::ONE; hit = true; }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        // Forged PadIdx zero-extension value.
+        let mut forged2: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for step in &mut forged2.reverse.steps {
+            if let ReverseReduction::PadIdx { base } = &mut step.reduction { *base += Goldilocks::ONE; }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged2, &PublicStatement::Generic, &model, &execution));
+        // Wrong public input must reject.
+        let mut bad = execution.clone();
+        bad.inputs.get_mut(&a_key).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad));
     }
 
     /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and

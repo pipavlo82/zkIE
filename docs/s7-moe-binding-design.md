@@ -1,8 +1,9 @@
 # S7 · MoE expert binding in the bound reverse path — protocol design
 
-Status: **STAGED / PARTIAL — S7 is NOT complete.** Only the GatherMatMul
-expert-FFN core is implemented in the bound path, tested on an isolated small
-MoE graph. Scatter/Gather and the gate-weighted tail remain fail-closed. The
+Status: **STAGED / PARTIAL — S7 is NOT complete.** The GatherMatMul
+expert-FFN core is implemented and tested on an isolated small MoE graph;
+the linear index ops (CombineIdx/IdxBroadcast/PadIdx) are implemented and
+tested as the first S7b batch. Scatter/Gather and the gate-weighted tail remain fail-closed. The
 green zkie-ops suite proves no regressions; it is not S7 acceptance, and no
 real DeepSeek layer has been proven. Remaining work: S7b (see the dependency
 table and the tracker entry).
