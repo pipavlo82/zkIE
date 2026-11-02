@@ -2,13 +2,17 @@
 
 This document describes the intended committed verifier schedule. It is not a
 claim that all operators or the complete protocol have been migrated or audited.
-The current bound proof supports Add, MatMul, Projection and bounded ReLU.
-Lookup and index-producing ops are not yet connected. GPT-2 still requires
-GeluIndex, Lookup, LayerNormCentered, Scale, Softmax, StableSoftmaxIndex,
-Transpose and Argmax, plus language-model public token binding. These operators
-and the language-model statement currently fail closed. The legacy committed
-verifier also rejects. Model support must not be reported complete until the
-real graph has been migrated and tested.
+The current bound proof supports Add, MatMul, Projection, Scale, Transpose,
+bounded ReLU, GeluIndex, Lookup, Argmax and the GatherMatMul expert-FFN core
+(staged part of S7; S7 itself remains incomplete). The bound entry also
+supports the LanguageModel public statement (S6). Still fail closed:
+Scatter, Gather, BatchedMatMul, CombineIdx, IdxBroadcast, PadIdx,
+BroadcastScale, Softmax, TopKSelect, SoftmaxIndex, StableSoftmaxIndex,
+LayerNorm/RmsNorm/RoPE. GPT-2 support therefore still requires the norm,
+softmax and index operators; DeepSeek requires Scatter/Gather/CombineIdx/
+IdxBroadcast/PadIdx/BroadcastScale (S7b). The legacy committed verifier
+permanently rejects. Model support must not be reported complete until the real
+graph has been migrated and tested.
 
 1. The caller supplies an independently trusted model manifest (op graph, tensor
    layout, fixed weight and lookup commitments) and authenticated public input

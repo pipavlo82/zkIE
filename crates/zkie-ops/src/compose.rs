@@ -169,6 +169,11 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
         Op::Lookup { idx, out, .. } => Some((vec![i(*idx)?], vec![f(*out)?])),
         Op::GeluIndex { x, out, .. } => Some((vec![f(*x)?], vec![i(*out)?])),
         Op::Scale { x, out, .. } => Some((vec![f(*x)?], vec![f(*out)?])),
+        // S7: the routing column is an INDEX tensor, the expert weights a
+        // field tensor; both are inputs of the reduction.
+        Op::GatherMatMul { a, expert_of, w, c, .. } => {
+            Some((vec![f(*a)?, i(*expert_of)?, f(*w)?], vec![f(*c)?]))
+        }
         Op::Argmax { x, out, sel, thr, gate, d1, d2, .. } => Some((
             vec![f(*x)?],
             vec![i(*out)?, f(*sel)?, f(*thr)?, f(*gate)?, f(*d1)?, f(*d2)?],
@@ -206,6 +211,7 @@ enum ReverseReduction {
     GeluIndex { proof: ReverseGeluIndexProof },
     Scale { proof: ReverseScaleProof },
     Argmax { proof: ReverseArgmaxProof },
+    GatherMatMul { proof: ReverseGatherMatmulProof },
     Transpose,
 }
 
@@ -832,8 +838,269 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     ])
 }
 
+/// S7 (GatherMatMul): eq-weighted routing relation. MLE indices: 0 = eq
+/// column, 1..=E the one-hot expert selectors, 1+E the expert_of column,
+/// 2+E the validity mask. Claim 0 forces, at the random eq point:
+/// every selector Boolean, exactly one selector per valid position (mask),
+/// padding selects nothing, and expert_of(pos) = Σ_e e·sel_e(pos) — which
+/// rules out duplicated, dropped and out-of-range routes.
+fn expert_routing_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec<usize>)> {
+    let mut terms = Vec::with_capacity(3 * count + 3);
+    let mut gp = Goldilocks::ONE;
+    for e in 0..count {
+        terms.push((gp, vec![0usize, 1 + e, 1 + e])); // booleanity: eq·sel_e²
+        terms.push((-gp, vec![0usize, 1 + e])); //              − eq·sel_e
+        gp = gp * gamma;
+    }
+    let tie_w = gp;
+    for e in 0..count {
+        terms.push((tie_w * Goldilocks::from_u64(e as u64), vec![0usize, 1 + e]));
+    }
+    terms.push((-tie_w, vec![0usize, 1 + count])); // tie: − eq·expert_of
+    let onehot_w = tie_w * gamma;
+    for e in 0..count {
+        terms.push((onehot_w, vec![0usize, 1 + e])); // one-hot: eq·Σ sel_e
+    }
+    terms.push((-onehot_w, vec![0usize, 2 + count])); //        − eq·mask
+    terms
+}
+
+/// Zero-extension factor Π_{b >= k}(1 - z_b) (padding coordinates absent).
+/// Returns ONE when the point already has k or fewer coordinates.
+fn zero_ext_factor(z: &[Goldilocks], k: usize) -> Goldilocks {
+    let mut acc = Goldilocks::ONE;
+    for b in k..z.len() { acc = acc * (Goldilocks::ONE - z[b]); }
+    acc
+}
+
+/// MLE of the deterministic validity mask (1 for pos < len) at `z`.
+fn expert_mask_eval(z: &[Goldilocks], len: usize) -> Goldilocks {
+    let eq = mle::eq_evals(z);
+    let mut acc = Goldilocks::ZERO;
+    for pos in 0..len.min(eq.len()) { acc = acc + eq[pos]; }
+    acc
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseGatherMatmulProof {
+    matmul: BatchedMatmulProof,
+    routing: VirtualProof,
+    /// Weight-side terminals, one per expert: MLE of the expert's K×N block
+    /// at (ch_d, v). Authenticated by the manifest weight batch opening at the
+    /// verifier-derived points.
+    table: Vec<Goldilocks>,
+    /// Selector evaluations: E at ch_pos (the derived counts), then E at z.
+    aux_values: Vec<Goldilocks>,
+    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+}
+
+fn gather_matmul_dims(op: &Op) -> Option<(T, T, T, T, usize, usize, usize, usize)> {
+    match op {
+        Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
+            if !s.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two()
+                || !n_experts.is_power_of_two() || *n_experts < 2 { return None; }
+            Some((*a, *expert_of, *w, *c, *s, *k, *n, *n_experts))
+        }
+        _ => None,
+    }
+}
+
+fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseGatherMatmulProof, Vec<EvalClaim>)>
+{
+    let (a, expert_of, w, c, s, k, n, e_count) = gather_matmul_dims(op)?;
+    let lgk = k.trailing_zeros() as usize;
+    let lgs = s.trailing_zeros() as usize;
+    let lgn = n.trailing_zeros() as usize;
+    let lge = e_count.trailing_zeros() as usize;
+    let arity = aux.descriptor.arity;
+    if aux.descriptor.role != AuxRole::ExpertRouting || aux.descriptor.len != s
+        || aux.descriptor.columns != e_count { return None; }
+    let c_key = TensorKey::Field(c).encoded()?;
+    let (qp, vc) = argmax_claim(outs, c_key)?;
+    if qp.len() != lgn + lgs { return None; }
+
+    // The output claim point already fixes (v, u); the reduction evaluates the
+    // matmul there (same convention as the MatMul reverse arm).
+    let (v, u) = qp.split_at(lgn);
+    let (v, u) = (v.to_vec(), u.to_vec());
+
+    // Batched-matmul sumcheck: derive ch and the endpoints from the data.
+    let wv = store.materialize(w);
+    let (matmul, ch) = bmm::prove_streaming(
+        store.get(a), store.idx.get(expert_of)?, wv.as_ref(), store.get(c),
+        s, k, n, e_count, &u, &v, transcript,
+    );
+    if matmul.claimed != vc || ch.len() != lgk + lgs { return None; }
+    let ch_d = &ch[..lgk];
+    let ch_pos = &ch[lgk..];
+
+    // Routing relation (commit 0): booleanity + one-hot + expert_of tie.
+    let padded = 1usize.checked_shl(arity as u32)?;
+    let q_routing: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gamma = transcript.field();
+    let terms = expert_routing_terms(gamma, e_count);
+    let eq_routing = mle::eq_evals(&q_routing);
+    let mut xp = vec![Goldilocks::ZERO; padded];
+    {
+        let xv = store.idx.get(expert_of)?;
+        if xv.len() != s { return None; }
+        for pos in 0..s { xp[pos] = Goldilocks::from_u64(xv[pos] as u64); }
+    }
+    let mut mask = vec![Goldilocks::ZERO; padded];
+    for pos in 0..s { mask[pos] = Goldilocks::ONE; }
+    let mut mles: Vec<&[Goldilocks]> = vec![&eq_routing];
+    for e in 0..e_count { mles.push(&aux.columns[e]); }
+    mles.push(&xp);
+    mles.push(&mask);
+    let (routing, z) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+
+    // counts = sel_e(ch_pos) (derived by the verifier from the aux opening).
+    let chp = argmax_pad_point(ch_pos, arity);
+    let mut counts = Vec::with_capacity(e_count);
+    for e in 0..e_count { counts.push(mle::eval(&aux.columns[e], &chp)); }
+    // table_e = W_e(ch_d, v) (expert-major block).
+    if wv.len() < e_count * k * n { return None; }
+    let mut table = Vec::with_capacity(e_count);
+    let mut wp = v.clone();
+    wp.extend_from_slice(ch_d);
+    for e in 0..e_count {
+        let block = &wv[e * k * n..(e + 1) * k * n];
+        table.push(mle::eval(block, &wp));
+    }
+    let mut bound = Goldilocks::ZERO;
+    for e in 0..e_count { bound = bound + counts[e] * table[e]; }
+    if matmul.sumcheck.final_evals[1] != bound { return None; }
+
+    // One aux batch opening: E selectors at ch_pos, then E at z.
+    let zp = argmax_pad_point(&z, arity);
+    let mut idxs = Vec::with_capacity(2 * e_count);
+    let mut points = Vec::with_capacity(2 * e_count);
+    let mut values = Vec::with_capacity(2 * e_count);
+    for e in 0..e_count {
+        idxs.push(e); points.push(chp.clone()); values.push(counts[e]);
+    }
+    for e in 0..e_count {
+        idxs.push(e); points.push(zp.clone()); values.push(mle::eval(&aux.columns[e], &zp));
+    }
+    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&i| aux.columns[i].clone()).collect();
+    let ctx = zkie_core::pcs::committed::BatchCtx {
+        commitment: aux.descriptor.commitment.clone(),
+        prover_data: aux.prover_data,
+        protocol: aux.protocol,
+        whir: aux.whir,
+        num_tables: aux.descriptor.columns,
+    };
+    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+
+    let fe = &matmul.sumcheck.final_evals;
+    if fe.len() != 3 || routing.final_evals.len() != e_count + 3 { return None; }
+    let expert_of_key = TensorKey::Index(expert_of).encoded()?;
+    // The aux domain is padded to at least 2^5 bits; zero-extension gives
+    // expert_of~(z) = Π_{b>=lgs}(1 - z_b) · expert_of~(z[..lgs]), so the
+    // claim on the public index tensor uses the truncated point. The routing
+    // virtual's endpoint fe[1+E] is the expert_of column evaluation at z.
+    let pad = zero_ext_factor(&z, lgs);
+    if pad == Goldilocks::ZERO { return None; }
+    let expert_eval = routing.final_evals[1 + e_count] * pad.inverse();
+    let mut weight_claims = Vec::with_capacity(e_count);
+    for e in 0..e_count {
+        let mut p_e = v.clone();
+        p_e.extend_from_slice(ch_d);
+        for bit in 0..lge { p_e.push(Goldilocks::from_u64(((e >> bit) & 1) as u64)); }
+        weight_claims.push(EvalClaim { tensor_id: w, point: p_e, value: table[e] });
+    }
+    let mut claims = vec![
+        EvalClaim { tensor_id: a, point: ch.clone(), value: fe[0] },
+        EvalClaim { tensor_id: expert_of_key, point: z[..lgs].to_vec(), value: expert_eval },
+    ];
+    claims.extend(weight_claims);
+    Some((ReverseGatherMatmulProof { matmul, routing, table, aux_values: values, opening }, claims))
+}
+
+fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+    descriptor: &AuxDescriptor, proof: &ReverseGatherMatmulProof, transcript: &mut Transcript)
+    -> Option<Vec<EvalClaim>>
+{
+    let (a, expert_of, w, c, s, k, n, e_count) = gather_matmul_dims(op)?;
+    let lgk = k.trailing_zeros() as usize;
+    let lgs = s.trailing_zeros() as usize;
+    let lgn = n.trailing_zeros() as usize;
+    let lge = e_count.trailing_zeros() as usize;
+    let arity = descriptor.arity;
+    if descriptor.role != AuxRole::ExpertRouting || descriptor.len != s
+        || descriptor.columns != e_count { return None; }
+    if proof.table.len() != e_count || proof.aux_values.len() != 2 * e_count { return None; }
+    let c_key = TensorKey::Field(c).encoded()?;
+    let (qp, vc) = argmax_claim(outs, c_key)?;
+    if qp.len() != lgn + lgs { return None; }
+
+    let (v, u) = qp.split_at(lgn);
+    let (v, u) = (v.to_vec(), u.to_vec());
+    if proof.matmul.claimed != vc || proof.matmul.sumcheck.final_evals.len() != 3 { return None; }
+
+    let (ok, ch) = bmm::verify(&proof.matmul, s, k, &u, transcript);
+    if !ok || ch.len() != lgk + lgs { return None; }
+    let ch_d = &ch[..lgk];
+    let ch_pos = &ch[lgk..];
+
+    let q_routing: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gamma = transcript.field();
+    let terms = expert_routing_terms(gamma, e_count);
+    let (okr, z, fc) = verify_virtual(&proof.routing, &terms, Goldilocks::ZERO, arity, transcript);
+    if !okr { return None; }
+    let fe = &proof.routing.final_evals;
+    if fe.len() != e_count + 3 { return None; }
+
+    // Rebuild the exact aux opening list: E selectors at ch_pos, E at z.
+    let chp = argmax_pad_point(ch_pos, arity);
+    let zp = argmax_pad_point(&z, arity);
+    let mut idxs = Vec::with_capacity(2 * e_count);
+    let mut points = Vec::with_capacity(2 * e_count);
+    for e in 0..e_count { idxs.push(e); points.push(chp.clone()); }
+    for e in 0..e_count { idxs.push(e); points.push(zp.clone()); }
+    let (whir, protocol) = aux_batch_whir(descriptor)?;
+    if !zkie_core::pcs::batch_open::verify_batch_open_committed(
+        &whir, &descriptor.commitment, &protocol, descriptor.columns,
+        &idxs, &points, &proof.aux_values, &proof.opening,
+    ) { return None; }
+
+    // counts are the ch_pos openings; the weight terminal is locked by the
+    // sumcheck; the table values are the opened manifest weight blocks.
+    let mut bound = Goldilocks::ZERO;
+    for e in 0..e_count { bound = bound + proof.aux_values[e] * proof.table[e]; }
+    if proof.matmul.sumcheck.final_evals[1] != bound { return None; }
+
+    // Routing endpoints: eq closed-form, selectors from the aux opening at z,
+    // mask closed-form, expert_of carried by the virtual and re-issued as a
+    // claim below.
+    if fe[0] != mle::eq_poly(&q_routing, &z) { return None; }
+    for e in 0..e_count {
+        if fe[1 + e] != proof.aux_values[e_count + e] { return None; }
+    }
+    if fe[2 + e_count] != expert_mask_eval(&z, s) { return None; }
+    if fc != virtual_eval(&terms, fe) { return None; }
+
+    let expert_of_key = TensorKey::Index(expert_of).encoded()?;
+    let pad = zero_ext_factor(&z, lgs);
+    if pad == Goldilocks::ZERO { return None; }
+    let expert_eval = fe[1 + e_count] * pad.inverse();
+    let mut claims = vec![
+        EvalClaim { tensor_id: a, point: ch.clone(), value: proof.matmul.sumcheck.final_evals[0] },
+        EvalClaim { tensor_id: expert_of_key, point: z[..lgs].to_vec(), value: expert_eval },
+    ];
+    for e in 0..e_count {
+        let mut p_e = v.clone();
+        p_e.extend_from_slice(ch_d);
+        for bit in 0..lge { p_e.push(Goldilocks::from_u64(((e >> bit) & 1) as u64)); }
+        claims.push(EvalClaim { tensor_id: w, point: p_e, value: proof.table[e] });
+    }
+    Some(claims)
+}
+
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, LookupPairs, LookupMultiplicity }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, LookupPairs, LookupMultiplicity }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -1063,8 +1330,51 @@ fn prepare_argmax_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
     Some(prepared)
 }
 
-fn lookup_aux_specs(ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<(usize, AuxRole, usize, usize, usize)>> {
+/// S7: one-hot expert routing selectors for each `GatherMatMul`, one column
+/// per expert over the op's position domain. The verifier derives this list
+/// from the trusted graph (expert count and position count are statement
+/// dimensions); the columns are committed as an aux batch.
+fn expert_routing_aux_specs(ops: &[Op]) -> Option<Vec<(usize, usize, usize, usize)>> {
     let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::GatherMatMul { s, k, n, n_experts, .. } = op {
+            if !s.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two()
+                || !n_experts.is_power_of_two() || *n_experts < 2 { return None; }
+            specs.push((i, *s, s.trailing_zeros().max(5) as usize, *n_experts));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_expert_routing_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
+    let mut prepared = Vec::new();
+    for (op_index, len, arity, count) in expert_routing_aux_specs(ops)? {
+        let (expert_of, s) = match &ops[op_index] {
+            Op::GatherMatMul { expert_of, s, .. } => (*expert_of, *s),
+            _ => return None,
+        };
+        if s != len { return None; }
+        let xs = store.idx.get(expert_of)?;
+        if xs.len() != len { return None; }
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
+        for pos in 0..len {
+            let e = xs[pos] as usize;
+            if e >= count { return None; } // expert range (fail closed)
+            columns[e][pos] = Goldilocks::ONE;
+        }
+        let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        let descriptor = AuxDescriptor { op_index, role: AuxRole::ExpertRouting, len, arity, columns: count, commitment };
+        prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+    }
+    Some(prepared)
+}
+
+fn lookup_aux_specs(ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<(usize, AuxRole, usize, usize, usize)>> {    let mut specs = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         if let Op::Lookup { idx, table, .. } = op {
             let key = TensorKey::Index(*idx).encoded()?;
@@ -1122,7 +1432,11 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ArgmaxWitness, len, arity, cols))),
         None => return false,
     };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::LookupPairs => 3, AuxRole::LookupMultiplicity => 4 }));
+    match expert_routing_aux_specs(ops) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ExpertRouting, len, arity, cols))),
+        None => return false,
+    };
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::LookupPairs => 4, AuxRole::LookupMultiplicity => 5 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -1600,6 +1914,16 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 }
                 ReverseReduction::Argmax { proof }
             }
+            Op::GatherMatMul { .. } => {
+                let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
+                let prepared_aux = aux.remove(&(op_index, AuxRole::ExpertRouting))?;
+                let (proof, incoming) = prove_reverse_gather_matmul(store, op, &pairs, prepared_aux, transcript)?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::GatherMatMul { proof }
+            }
             Op::Relu { x, .. } => {
                 let (proof, incoming) = prove_reverse_relu(store.get(*x), &point, value, transcript)?;
                 for (p, v) in incoming {
@@ -1714,6 +2038,13 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
             (Op::Argmax { .. }, ReverseReduction::Argmax { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ArgmaxWitness)?;
                 for c in verify_reverse_argmax(op, &merged_out, descriptor, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+            }
+            (Op::GatherMatMul { .. }, ReverseReduction::GatherMatMul { proof }) => {
+                let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ExpertRouting)?;
+                for c in verify_reverse_gather_matmul(op, &merged_out, descriptor, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -7514,6 +7845,7 @@ pub fn prove_committed_shard_dag_bound(
     let mut prepared = prepare_projection_aux(store, ops)?;
     prepared.extend(prepare_scale_aux(store, ops, model)?);
     prepared.extend(prepare_argmax_aux(store, ops)?);
+    prepared.extend(prepare_expert_routing_aux(store, ops)?);
     prepared.extend(prepare_lookup_aux(store, ops, model)?);
     prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
@@ -7703,6 +8035,12 @@ pub fn verify_committed_shard_dag_bound_bytes(
     }
 }
 
+/// DEPRECATED, PERMANENTLY CLOSED. This legacy committed entry cannot
+/// authenticate public inputs and outputs (the proof carries no caller-owned
+/// execution statement) and always returns false. Its prover transcript also
+/// predates the public-statement binding; the internal machinery is kept only
+/// for byte-format compatibility with existing bench examples and MUST NOT be
+/// re-enabled as a verifier. Use `verify_committed_shard_dag_bound`.
 pub fn verify_committed_shard_dag(
     tables: &[&[Goldilocks]],
     ops: &[Op],
@@ -12107,6 +12445,218 @@ mod tests {
         };
         assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).is_none(),
             "Scatter/Gather graphs must be refused until the S7 MoE bindings land");
+    }
+
+    /// S7 fixture: a small expert-major gather-matmul graph. `expert_of` is a
+    /// public routing input (index tensor), `a` a public activation, `w` the
+    /// manifest-committed expert weights.
+    #[allow(clippy::type_complexity)]
+    fn s7_gather_matmul_fixture(seed: u64) -> (Store, Vec<Op>, zkie_core::pcs::whir::Whir, Vec<CachedWeightBatch>, TrustedModelManifest, TrustedExecution, T, T, T) {
+        use zkie_core::pcs::whir::Whir;
+        let _ = seed;
+        let (s, k, n, e_count) = (8usize, 4usize, 2usize, 4usize);
+        let mut store = Store::new();
+        let a = store.push((0..s * k).map(|i| from_i64((i as i64 % 11) + 1)).collect());
+        let expert_of = store.push_idx(vec![0u32, 1, 2, 3, 0, 1, 2, 3]);
+        let w = store.push((0..e_count * k * n).map(|i| from_i64((i as i64 % 7) + 1)).collect());
+        let c = store.push(vec![]);
+        let ops = vec![Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts: e_count }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7-cache");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(expert_of, s)].into());
+        let expert_key = TensorKey::Index(expert_of).encoded().unwrap();
+        let expert_vals: Vec<Goldilocks> = store.idx[expert_of].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(a, store.get(a).to_vec()), (expert_key, expert_vals)].into(),
+            outputs: [(c, store.get(c).to_vec())].into(),
+        };
+        (store, ops, whir, cached, model, execution, a, expert_of, c)
+    }
+
+    /// S7: honest GatherMatMul bound roundtrip. The verifier derives counts
+    /// from the committed one-hot routing aux at ch_pos and authenticates the
+    /// per-expert weight terminals through the manifest batch opening at the
+    /// verifier-derived points.
+    #[test]
+    fn s7_gather_matmul_bound_roundtrip() {
+        let (mut store, ops, whir, cached, model, execution, _a, _expert_of, c) = s7_gather_matmul_fixture(0x5701);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        assert!(matches!(
+            proof.reverse.steps.iter().find_map(|s| match &s.reduction { ReverseReduction::GatherMatMul { .. } => Some(()), _ => None }),
+            Some(())
+        ));
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        let mut bad = execution.clone();
+        bad.outputs.get_mut(&c).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad));
+        let mut bad_in = execution.clone();
+        bad_in.inputs.get_mut(&_a).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_in));
+    }
+
+    /// S7 (gist counterexample): an equal-length fabricated counts/table pair
+    /// must be rejected. The proof no longer carries counts (derived from the
+    /// authenticated routing), and the weight-side terminals are locked by
+    /// the sumcheck + manifest openings.
+    #[test]
+    fn s7_equal_length_forged_counts_table_rejected() {
+        let (mut store, ops, whir, cached, model, execution, _a, _expert_of, _c) = s7_gather_matmul_fixture(0x5702);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+
+        // Fabricate an equal-length weight table (the old attack shape).
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::GatherMatMul { proof } = &mut step.reduction {
+                proof.table[0] += Goldilocks::ONE;
+                hit = true;
+            }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+
+        // Fabricate the counts side (the aux openings the verifier reads).
+        let mut forged2: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for step in &mut forged2.reverse.steps {
+            if let ReverseReduction::GatherMatMul { proof } = &mut step.reduction {
+                proof.aux_values[0] += Goldilocks::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged2, &PublicStatement::Generic, &model, &execution));
+
+        // A prover that also rewrites the weight terminal to stay consistent
+        // breaks the matmul sumcheck replay.
+        let mut forged3: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for step in &mut forged3.reverse.steps {
+            if let ReverseReduction::GatherMatMul { proof } = &mut step.reduction {
+                proof.table = vec![Goldilocks::from_u64(1), Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO];
+                proof.matmul.sumcheck.final_evals[1] = proof.aux_values[0];
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged3, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// S7: swapping expert weights (roots/blocks) must be rejected — the
+    /// verifier derives each expert's point from the layout, so a swapped
+    /// terminal value fails the manifest batch opening.
+    #[test]
+    fn s7_swapped_expert_weights_rejected() {
+        let (mut store, ops, whir, cached, model, execution, _a, _expert_of, _c) = s7_gather_matmul_fixture(0x5703);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // Swap two expert values inside the weight opening.
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for opening in &mut forged.weight_openings {
+            if opening.claimed.len() >= 2 {
+                opening.claimed.swap(0, 1);
+                hit = true;
+            }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        // Swap two expert points inside the weight opening.
+        let mut forged2: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for opening in &mut forged2.weight_openings {
+            if opening.points.len() >= 2 {
+                opening.points.swap(0, 1);
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged2, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// S7: the routing relation rejects duplicated routes (two selectors at
+    /// one position), dropped routes (no selector at a valid position) and
+    /// out-of-range experts. Uses the PRODUCTION terms constructor shared with
+    /// prove/verify_reverse_gather_matmul.
+    #[test]
+    fn s7_routing_relation_rejects_duplicate_dropped_and_out_of_range() {
+        let (s_pos, arity, e_count) = (8usize, 5usize, 4usize);
+        let len = 1usize << arity;
+        let honest_expert: Vec<u32> = (0..s_pos).map(|i| (i % e_count) as u32).collect();
+        let build = |routing: &[u32], expert_vals: &[u32], dup: Option<usize>, drop_pos: Option<usize>| {
+            let mut cols = vec![vec![Goldilocks::ZERO; len]; e_count];
+            for pos in 0..s_pos {
+                if Some(pos) == drop_pos { continue; }
+                cols[routing[pos] as usize][pos] = Goldilocks::ONE;
+            }
+            if let Some(pos) = dup {
+                // Duplicate: a second selector set at the same position.
+                let e = (routing[pos] as usize + 1) % e_count;
+                cols[e][pos] = Goldilocks::ONE;
+            }
+            let mut expert_col = vec![Goldilocks::ZERO; len];
+            for pos in 0..s_pos { expert_col[pos] = Goldilocks::from_u64(expert_vals[pos] as u64); }
+            let mut mask = vec![Goldilocks::ZERO; len];
+            for pos in 0..s_pos { mask[pos] = Goldilocks::ONE; }
+            let mut tp = Transcript::new(b"zkie-s7-routing-relation");
+            let q: Vec<Goldilocks> = tp.field_vec(arity);
+            let eq = mle::eq_evals(&q);
+            let gamma = tp.field();
+            let terms = expert_routing_terms(gamma, e_count);
+            let mut mles: Vec<&[Goldilocks]> = vec![&eq];
+            for c in &cols { mles.push(c); }
+            mles.push(&expert_col);
+            mles.push(&mask);
+            let (proof, z) = prove_virtual(&mles, &terms, Goldilocks::ZERO, &mut tp);
+            let mut tv = Transcript::new(b"zkie-s7-routing-relation");
+            let _q: Vec<Goldilocks> = tv.field_vec(arity);
+            let _g: Goldilocks = tv.field();
+            let (ok, zv, fc) = verify_virtual(&proof, &terms, Goldilocks::ZERO, arity, &mut tv);
+            let clean = ok && {
+                let mut ev = vec![mle::eq_poly(&q, &zv)];
+                for c in &cols { ev.push(mle::eval(c, &zv)); }
+                ev.push(mle::eval(&expert_col, &zv));
+                ev.push(mle::eval(&mask, &zv));
+                fc == virtual_eval(&terms, &ev)
+            };
+            (clean, z)
+        };
+        // Honest routing certifies the zero claim.
+        assert!(build(&honest_expert, &honest_expert, None, None).0);
+        // Duplicated route at a position.
+        assert!(!build(&honest_expert, &honest_expert, Some(0), None).0);
+        // Dropped route at a valid position.
+        assert!(!build(&honest_expert, &honest_expert, None, Some(3)).0);
+        // Out-of-range expert value in the routing column.
+        let mut oor = honest_expert.clone();
+        oor[2] = 5; // >= e_count
+        assert!(!build(&honest_expert, &oor, None, None).0);
+    }
+
+    /// S7: the gate-weighted MoE tail (BroadcastScale / Gather / Scatter /
+    /// CombineIdx) has no reverse reduction yet — the bound path must refuse
+    /// such graphs, so a tampered router gate cannot yield an accepted proof.
+    #[test]
+    fn s7_gate_weighted_chain_fail_closed() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, h, p) = (4usize, 2usize, 2usize);
+        let mut store = Store::new();
+        let weighted = store.push((0..m * p).map(|i| from_i64(i as i64 + 1)).collect());
+        let token_id = store.push_idx(vec![0u32, 1, 2, 3]);
+        let gate = store.push(vec![Goldilocks::ONE; m]);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Gather { weighted, token_id, gate, out, m, h: p }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7-gate");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(token_id, m)].into());
+        let tok_key = TensorKey::Index(token_id).encoded().unwrap();
+        let tok_vals: Vec<Goldilocks> = store.idx[token_id].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(weighted, store.get(weighted).to_vec()), (gate, store.get(gate).to_vec()), (tok_key, tok_vals)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).is_none(),
+            "gate-weighted Gather must stay fail-closed until its reverse reduction lands");
     }
 
     /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and

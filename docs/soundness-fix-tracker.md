@@ -44,7 +44,11 @@
   - **tokens 绑定**：`TokenBinding` = embedding lookup 的 idx witness 列在**新随机点 r** 的一个 batch opening，claimed = 验证器从公开 tokens 重算的 `x̂(r)`（`x̂[i·D+d] = d·base + tokens[i]`，base = 表长/D == Argmax.n，结构从 statement 推导）；(batch, table) 必须是 statement 推导的 witness 列位置（`embedding_lookup_column` 重放 lookup push 顺序，prove/verify 同一函数），r 在 `b"zkie-committed-public-v1"` 上重放派生。攻击：错误 prompt / 任意位置 response 篡改 / 长度不一致 / 错 embedding token 全部经 x̂ 或序列检查拒绝。
   - **argmax/selector 绑定**：`SelOpening` 增加 r 点 binding（同一 committed sel 列在 Argmax 关系 claim 点 `topk.r` 的 opening == `gate_rel.fe[2]`），per-position 点由**公开 argmax 推导**（行 i、列 argmax[i]，proof 不能随意选 1 位置也不能换列——换根/换点都被 r-binding + 推导点拒绝）；committed 模式 `verify_argmax` 不再信任 proof 携带的 `sel_evals`（`check_out=false`，out 绑定全部交给 openings），plain 模式保持直查。
   - 回归（11 个 `s6_*`）：诚实 LM roundtrip（bytes 入口）、错误 prompt、中间位置 response 篡改、长度不一致、词表越界、正确 selector 上的错误位置（prompt 行伪造 argmax）、claimed 伪造 + witness 列换指、selector 根互换、并列规则（第二最大拒绝/首个最大通过）、空 prompt 全链、Generic 跳过序列检查。全量回归：ops 85 绿（11 s6 新增）、core 64、engine 3、models 全绿。
-- [ ] **S7 · MoE 专家绑定（P0）** — 路由 counts 归约到已认证路由，专家权重通过正确根 batch opening。
+- [ ] **S7 · MoE 专家绑定（P0）— 未完成（阶段性提交，禁止表述为完整 S7）** — 设计见 `docs/s7-moe-binding-design.md`。
+  - **已落地（阶段性，仅 GatherMatMul 孤立核心）**：bound 反向路径新增 GatherMatMul 归约——输出 claim 点拆 (v,u) 重放批 matmul sumcheck 得 ch=(ch_d,ch_pos) 与已认证端点；新增 `ExpertRouting` aux（每专家一列 one-hot，descriptor 由可信图推导并绑定承诺）；eq 加权 routing virtual（claim 0）约束布尔性、每有效位置恰一专家（mask = 1[pos<s]）、padding 无路由、`expert_of = Σ e·sel_e`（端点经截断零延拓系数绑定到公开/上游 expert_of claim）；counts 由 verifier 在 ch_pos 的 aux opening 导出（proof 不再携带）；table_e 经 `p_e = v‖ch_d‖bits(e)` 的 manifest 权重批量 opening 认证；校验 `fe_w == Σ counts_e·table_e`；malformed proof 防护。回归（5 个 `s7_*`，**小 MoE 孤立图**，不等于真实 DeepSeek 链）：诚实 bytes 入口、等长伪造 counts/table、交换专家权重值/点、重复/漏/越界路由 relation、gate 加权链 fail-closed。zkie-ops 全量 117 绿仅说明无回归，**不**表示 S7 验收通过。
+  - **未覆盖的 S7 验收项**：① top-k 恰 k 条与 `(token,expert)` 活跃对唯一性（需 Scatter/TopKSelect 反向绑定）；② `token_id ↔ expert_of` 与已认证 Sel 的一致性；③ router gate 一致性（Sel → Scatter → CombineIdx → Lookup → BroadcastScale → Gather）；④ Gather 的 weighted=g·gate_pos、d·gate 乘积关系；⑤ 共享专家 dense 分支与路由分支的联合端到端；⑥ **真实 DeepSeek 单层未运行**（测试机无 `models/deepseek-v2-lite/weights/` 提取张量，且该层含大量未归约 op）。
+  - **S7b 依赖（按序）**：ⓐ 将旧 committed 路径的 perm/histogram witness 列（commit + 叶点 opening）迁移到 bound 路径——Scatter/Gather 是整列 multiset/直方图论证，不能只靠点 claim；ⓑ Softmax + TopKSelect 反向归约（router 分数与 sel/thr/gate）；ⓒ Scatter 反向归约（sel 编码 ↔ token_id/expert_of 排列，绑定 top-k 与唯一性）；ⓓ CombineIdx / IdxBroadcast / PadIdx / BroadcastScale 反向归约（S5 型直接公式关系）；ⓔ Gather 反向归约（直方图 scatter-add + weighted/gate 乘积 eq 加权）；ⓕ gate 一致性链接（gate_pos 的 idx 路径与 Scatter 路由共用同一 sel）；ⓖ 真实 DeepSeek 单层：需上述全部 + 归一化/RoPE 等 op + 提取张量。ⓗ 旧 plain shard 路径（演示器）仍接受 gist 的伪造 counts/table 反例——不作为验收对象，但在 S7b 收尾时明确封闭。
+  - 旧 `verify_committed_shard_dag*` 永久 fail-closed 并已加注明确封闭。
 
 ### 阶段 D · 安全论证（依赖 C 闭合）
 - [ ] **S9 · 安全预算分析** — 建立端到端 ≥90-bit 参数依据，评估外层挑战迁扩域。
@@ -77,4 +81,4 @@
 | 同点 claim 1 和 2 | 拒绝 | S4 ✅ `s4_contradictory_same_point_rejected` |
 | 真实 WHIR opening + 伪造外层 sumcheck | 拒绝 | S1 |
 | 缺 op proof 序列化合法 | 返回 false 不 panic | S8 |
-| GatherMatMul fake counts/table | 拒绝 | S7 |
+| GatherMatMul fake counts/table（bound 路径） | 拒绝 | S7 阶段性（S7 未完成）：`s7_equal_length_forged_counts_table_rejected` / `s7_swapped_expert_weights_rejected` 绿；plain shard 路径仍接受该反例，待 S7b 封闭 |
