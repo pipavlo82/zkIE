@@ -174,10 +174,6 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
         Op::GatherMatMul { a, expert_of, w, c, .. } => {
             Some((vec![f(*a)?, i(*expert_of)?, f(*w)?], vec![f(*c)?]))
         }
-        Op::TopKSelect { x, sel, thr, gate, d1, d2, .. } => Some((
-            vec![f(*x)?],
-            vec![f(*sel)?, f(*thr)?, f(*gate)?, f(*d1)?, f(*d2)?],
-        )),
         Op::CombineIdx { a, b, out, .. } => Some((vec![i(*a)?, i(*b)?], vec![i(*out)?])),
         Op::Gather { weighted, token_id, gate, out, .. } => {
             Some((vec![f(*weighted)?, i(*token_id)?, f(*gate)?], vec![f(*out)?]))
@@ -399,9 +395,15 @@ fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     ])
 }
 
+// S7c TopKSelect reduction: NOT WIRED — pending TL review fixes (thr_b
+// broadcast authenticity, deterministic tie rule, threshold-attainment proof,
+// pre-committed witness root bound before output points). The operator stays
+// fail-closed until those land.
+#[allow(dead_code)]
 const TK_RANGE_BITS: usize = 16;
 const TK_COLS: usize = 3 + 2 * TK_RANGE_BITS;
 
+#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseTopKSelectProof {
     arity: usize,
@@ -419,13 +421,16 @@ struct ReverseTopKSelectProof {
 
 /// Witness layout: 0 = sel, 1 = gate, 2 = thr_b (row broadcast),
 /// 3..3+R = d1 bits, 3+R..3+2R = d2 bits; all over the padded m*n domain.
+#[allow(dead_code)]
 fn topk_sel_bool_terms() -> Vec<(Goldilocks, Vec<usize>)> {
     vec![(Goldilocks::ONE, vec![0, 1, 1]), (-Goldilocks::ONE, vec![0, 1])]
 }
+#[allow(dead_code)]
 fn topk_gate_terms() -> Vec<(Goldilocks, Vec<usize>)> {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     vec![(Goldilocks::ONE, vec![0, 1, 2]), (neg, vec![0, 3])]
 }
+#[allow(dead_code)]
 fn topk_d1_terms() -> Vec<(Goldilocks, Vec<usize>)> {
     // One identity: eq*(sel*x - sel*thr_b - sum_b 2^b*bit1_b) == 0. No gamma
     // mixing here (each bit term is part of the same equation).
@@ -436,6 +441,7 @@ fn topk_d1_terms() -> Vec<(Goldilocks, Vec<usize>)> {
     }
     terms
 }
+#[allow(dead_code)]
 fn topk_d2_terms() -> Vec<(Goldilocks, Vec<usize>)> {
     // One identity: eq*(thr_b - x - sel*thr_b + sel*x - d2) == 0.
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
@@ -450,6 +456,7 @@ fn topk_d2_terms() -> Vec<(Goldilocks, Vec<usize>)> {
     }
     terms
 }
+#[allow(dead_code)]
 fn topk_bit_terms(gamma: Goldilocks, bits: usize) -> Vec<(Goldilocks, Vec<usize>)> {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let mut terms = Vec::with_capacity(2 * bits);
@@ -462,6 +469,7 @@ fn topk_bit_terms(gamma: Goldilocks, bits: usize) -> Vec<(Goldilocks, Vec<usize>
     terms
 }
 
+#[allow(dead_code)]
 fn topk_dims(op: &Op) -> Option<(T, T, T, T, T, T, usize, usize, usize)> {
     match op {
         Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k } => {
@@ -472,6 +480,7 @@ fn topk_dims(op: &Op) -> Option<(T, T, T, T, T, T, usize, usize, usize)> {
     }
 }
 
+#[allow(dead_code)]
 fn topk_witness_columns(store: &Store, op: &Op, arity: usize) -> Option<Vec<Vec<Goldilocks>>> {
     let (_x, sel_t, thr_t, gate_t, d1_t, d2_t, m, n, k) = topk_dims(op)?;
     let len = m.checked_mul(n)?;
@@ -509,6 +518,7 @@ fn topk_witness_columns(store: &Store, op: &Op, arity: usize) -> Option<Vec<Vec<
 }
 
 #[allow(clippy::type_complexity)]
+#[allow(dead_code)]
 fn topk_opening_layout(z1: &[Goldilocks], z2: &[Goldilocks], z3: &[Goldilocks],
     z4: &[Goldilocks], z5: &[Goldilocks], z6: &[Goldilocks],
     qs: &[Goldilocks], qt: &[Goldilocks], qg: &[Goldilocks], qd: &[Goldilocks], q2: &[Goldilocks],
@@ -538,6 +548,7 @@ fn topk_opening_layout(z1: &[Goldilocks], z2: &[Goldilocks], z3: &[Goldilocks],
     e
 }
 
+#[allow(dead_code)]
 fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     transcript: &mut Transcript) -> Option<(ReverseTopKSelectProof, Vec<EvalClaim>)>
 {
@@ -626,6 +637,7 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldi
         gate_rel, d1_rel, d2_rel, bit_bool, aux_values: values, opening }, claims))
 }
 
+#[allow(dead_code)]
 fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     proof: &ReverseTopKSelectProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
 {
@@ -798,8 +810,6 @@ enum ReverseReduction {
     GatherMatMul { proof: ReverseGatherMatmulProof },
     /// S7b: scatter-add with a replayed routing column.
     Gather { proof: ReverseGatherProof },
-    /// S7c: top-k router authentication (sel/thr/gate, 16-bit gap ranges).
-    TopKSelect { proof: ReverseTopKSelectProof },
     /// S7b: linear index relations (`out = scale*a + b`).
     CombineIdx { a: Goldilocks, b: Goldilocks },
     /// S7b: `out[i*b + j] = b*base[i] + j`.
@@ -2514,7 +2524,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
             out_claims.push(ReverseOutputClaim { tensor_id: id, merge, point, value });
         }
         if out_claims.is_empty() { continue; }
-        if !matches!(op, Op::Argmax { .. } | Op::TopKSelect { .. }) && out_claims.len() != 1 { return None; }
+        if !matches!(op, Op::Argmax { .. }) && out_claims.len() != 1 { return None; }
         let point = out_claims[0].point.clone();
         let value = out_claims[0].value;
         let reduction = match op {
@@ -2571,15 +2581,6 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
                 ReverseReduction::Argmax { proof }
-            }
-            Op::TopKSelect { .. } => {
-                let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
-                let (proof, incoming) = prove_reverse_topk(store, op, &pairs, transcript)?;
-                for c in incoming {
-                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
-                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
-                }
-                ReverseReduction::TopKSelect { proof }
             }
             Op::GatherMatMul { .. } => {
                 let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
@@ -2730,7 +2731,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
             if let Some(cs) = claims.remove(&id) { local.push((id, cs)); }
         }
         if local.is_empty() { continue; }
-        if !matches!(op, Op::Argmax { .. } | Op::TopKSelect { .. }) && local.len() != 1 { return None; }
+        if !matches!(op, Op::Argmax { .. }) && local.len() != 1 { return None; }
         let step = steps.next()?;
         if step.outputs.len() != local.len() { return None; }
         let mut point = Vec::new();
@@ -2789,12 +2790,6 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
             (Op::Argmax { .. }, ReverseReduction::Argmax { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ArgmaxWitness)?;
                 for c in verify_reverse_argmax(op, &merged_out, descriptor, proof, transcript)? {
-                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
-                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
-                }
-            }
-            (Op::TopKSelect { .. }, ReverseReduction::TopKSelect { proof }) => {
-                for c in verify_reverse_topk(op, &merged_out, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -8718,14 +8713,6 @@ fn graph_exact_shapes(ops: &[Op])
                 put(TensorKey::Field(*thr).encoded()?, *m, (0, *m, 0, 0), &mut out)?;
                 put(TensorKey::Index(*ao).encoded()?, *m, (0, *m, 0, 0), &mut out)?;
             }
-            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, .. } => {
-                if !m.is_power_of_two() || !n.is_power_of_two() { return None; }
-                let len = m.checked_mul(*n)?;
-                for id in [*x, *sel, *gate, *d1, *d2] {
-                    put(TensorKey::Field(id).encoded()?, len, (0, len, 0, 0), &mut out)?;
-                }
-                put(TensorKey::Field(*thr).encoded()?, *m, (0, *m, 0, 0), &mut out)?;
-            }
             Op::Transpose { x, out: to, m, k } => {
                 if !m.is_power_of_two() || !k.is_power_of_two() { return None; }
                 let l = m.checked_mul(*k)?;
@@ -14532,15 +14519,13 @@ mod tests {
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad3));
     }
 
-    /// S7c: TopKSelect reverse reduction — the router selector is
-    /// authenticated by proof relations (Boolean + exactly k per row,
-    /// gate = x*sel, d1/d2 threshold gaps with 16-bit range witnesses); the
-    /// witness columns are committed and only opened at derived points.
+    /// S7c boundary: TopKSelect stays fail-closed until the review fixes land
+    /// (thr_b broadcast authenticity, deterministic tie rule, k-th threshold
+    /// attainment, pre-committed witness root). A TopKSelect graph must be
+    /// refused by the bound prover.
     #[test]
-    fn s7c_topk_select_bound_roundtrip() {
+    fn s7c_topk_still_fail_closed() {
         use zkie_core::pcs::whir::Whir;
-        use zkie_core::common::fixed_point::from_i64;
-        use zkie_core::common::field::PrimeCharacteristicRing;
         let (m, n, k) = (4usize, 4usize, 2usize);
         let mut store = Store::new();
         let xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
@@ -14558,44 +14543,17 @@ mod tests {
         store.v[d2] = TensorData::Owned(d2_v.clone());
         let ops = vec![Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k }];
         let whir = Whir::new_testing(5);
-        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-topk");
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-topk-closed");
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
         let execution = TrustedExecution {
             inputs: [(x, xv)].into(),
-            outputs: [
-                (sel, sel_v), (thr, thr_v), (gate, gate_v), (d1, d1_v), (d2, d2_v),
-            ].into(),
+            outputs: [(sel, sel_v), (thr, thr_v), (gate, gate_v), (d1, d1_v), (d2, d2_v)].into(),
         };
-        let mut store2 = Store::new();
-        let _ = &mut store2;
-        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
-        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
-        let bytes = bincode::serialize(&proof).unwrap();
-        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
-        // Tampering any public output must reject.
-        for id in [sel, thr, gate, d1, d2] {
-            let mut bad = execution.clone();
-            bad.outputs.get_mut(&id).unwrap()[0] += Goldilocks::ONE;
-            assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad));
-        }
-        // Tampering the score input must reject.
-        let mut bad_in = execution.clone();
-        bad_in.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
-        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_in));
-        // Forged witness opening (selector endpoint) must reject.
-        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
-        let mut hit = false;
-        for step in &mut forged.reverse.steps {
-            if let ReverseReduction::TopKSelect { proof: p } = &mut step.reduction {
-                p.aux_values[0] += Goldilocks::ONE;
-                hit = true;
-            }
-        }
-        assert!(hit);
-        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).is_none(),
+            "TopKSelect must stay fail-closed until the review fixes land");
     }
 
-    /// S7c boundary: Scatter has no authenticated-routing reverse reduction yet
+    /// S7c boundary: Scatter has no authenticated-routing reverse reduction yet    /// S7c boundary: Scatter has no authenticated-routing reverse reduction yet
     /// (the routing must be reduced to the router's authenticated selector,
     /// not replayed by the verifier), so any graph containing it fails closed.
     /// Top-k, active-pair uniqueness and the router-gate chain are NOT yet

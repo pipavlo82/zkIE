@@ -38,6 +38,20 @@ This makes `sel` a *claimed, authenticated* column — the anchor Scatter needs.
 No verifier read of the selector table: only virtual endpoints and aux
 openings at derived points.
 
+REQUIRED before re-wiring TopKSelect (security review of 978f3f8):
+1. Prove thr_b is the row broadcast of the authenticated thr column for the
+   WHOLE column (eq-weighted broadcast sumcheck anchored at the thr column's
+   endpoints), or reduce the d1/d2 relation endpoints directly to the
+   authenticated row thr. The current all-zero column check is insufficient.
+2. Deterministic tie rule identical to `argmax_forward`/forward topk (first
+   index on ties), with a malicious-witness regression (x = [5,5], k = 1).
+3. Prove the threshold is ATTAINED by a selected position (thr is the k-th
+   largest), e.g. an aux `att` column with att·(1−sel)=0, att·(x−thr)=0 and
+   Σ att = 1, plus the x=[10,0], k=1 counterexample.
+4. Pre-commit the TopK witness root as an aux descriptor bound in
+   `execution_seeds` BEFORE any output point is derived (no adaptive column
+   collisions).
+
 ### 2. Scatter routing ↔ selector reduction
 
 `Op::Scatter { sel, token_id, expert_of, m, n }`, with `sel` carried as the
