@@ -105,6 +105,20 @@ Consequences for the DeepSeek MoE layer:
   committed entry is the sound one. The old committed API remains
   permanently fail-closed (verifier returns false) and is not re-enabled.
 
+## Integer/index domain contract (S7b)
+
+Index tensors hold u32 values. Every index relation is checked exactly over
+the Goldilocks field (exact for values < p), so the field relation coincides
+with exact u32 arithmetic only under the contract: all index values are u32,
+`scale`/`b` < 2^32, and the result fits u32 (no wraparound). The forward path
+enforces the contract with checked arithmetic (fail closed), the reverse
+reductions reject out-of-domain constants, and the bound verifier
+range-checks every public index tensor. Intermediate index tensors are
+covered by their producers' relations; a dedicated per-column range binding
+for intermediates remains S7b work. PadIdx pins the base tensor's exact
+length to `base_len`, so the zero-extension identity is exact (no unverified
+padding entries).
+
 ## Tests
 
 - `s7_gather_matmul_bound_roundtrip` — honest small MoE core via bytes entry.

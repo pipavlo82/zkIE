@@ -854,7 +854,7 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
 /// padding selects nothing, and expert_of(pos) = Σ_e e·sel_e(pos) — which
 /// rules out duplicated, dropped and out-of-range routes.
 fn expert_routing_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec<usize>)> {
-    let mut terms = Vec::with_capacity(3 * count + 3);
+    let mut terms = Vec::with_capacity(4 * count + 2);
     let mut gp = Goldilocks::ONE;
     for e in 0..count {
         terms.push((gp, vec![0usize, 1 + e, 1 + e])); // booleanity: eq·sel_e²
@@ -946,7 +946,12 @@ fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Goldilock
     let (v, u) = (v.to_vec(), u.to_vec());
 
     // Batched-matmul sumcheck: derive ch and the endpoints from the data.
+    // Exact graph-derived shapes are required (fail closed instead of the
+    // bmm prover's assert on a store/graph mismatch).
+    if store.get(a).len() != s * k || store.get(c).len() != s * n
+        || store.idx.get(expert_of)?.len() != s { return None; }
     let wv = store.materialize(w);
+    if wv.len() != e_count * k * n { return None; }
     let (matmul, ch) = bmm::prove_streaming(
         store.get(a), store.idx.get(expert_of)?, wv.as_ref(), store.get(c),
         s, k, n, e_count, &u, &v, transcript,
@@ -980,7 +985,6 @@ fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Goldilock
     let mut counts = Vec::with_capacity(e_count);
     for e in 0..e_count { counts.push(mle::eval(&aux.columns[e], &chp)); }
     // table_e = W_e(ch_d, v) (expert-major block).
-    if wv.len() < e_count * k * n { return None; }
     let mut table = Vec::with_capacity(e_count);
     let mut wp = v.clone();
     wp.extend_from_slice(ch_d);
@@ -1946,7 +1950,10 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
             }
             Op::CombineIdx { a, b, scale, .. } => {
                 // S5 (reverse): out = scale*a + b at the claim point; both
-                // input values are carried and authenticated upstream.
+                // input values are carried and authenticated upstream. The
+                // index-domain contract (u32, no overflow) is enforced by the
+                // exact field relation plus the public-index range check.
+                if *scale >= (1usize << 32) { return None; }
                 let av = idx_eval(store, *a, &point)?;
                 let bv = idx_eval(store, *b, &point)?;
                 if Goldilocks::from_u64(*scale as u64) * av + bv != value { return None; }
@@ -1960,7 +1967,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
             Op::IdxBroadcast { base, b, .. } => {
                 // S5 (reverse): out[i*b + j] = b*base[i] + j; the low bits of
                 // the claim point are the closed-form j index.
-                if !b.is_power_of_two() { return None; }
+                if !b.is_power_of_two() || *b >= (1usize << 32) { return None; }
                 let b_log = b.trailing_zeros() as usize;
                 if point.len() < b_log { return None; }
                 let (r_low, r_hi) = point.split_at(b_log);
@@ -1975,8 +1982,11 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
             Op::PadIdx { base, len, base_len, .. } => {
                 // S5/S7 (reverse): out is base zero-padded to len. The
                 // zero-extension identity maps the claim point to the base
-                // domain: out~(r) = f * base~(r[..lb]).
+                // domain: out~(r) = f * base~(r[..lb]). The base tensor must
+                // have EXACTLY base_len entries (the manifest shape check also
+                // pins this), so the zero-extension convention is sound.
                 if *base_len == 0 || *base_len > *len { return None; }
+                if store.idx.get(*base)?.len() != *base_len { return None; }
                 if *len != 1usize.checked_shl(point.len() as u32)? { return None; }
                 let lb = base_len.checked_next_power_of_two()?.trailing_zeros() as usize;
                 if point.len() < lb { return None; }
@@ -2116,6 +2126,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 }
             }
             (Op::CombineIdx { a, b, scale, .. }, ReverseReduction::CombineIdx { a: av, b: bv }) => {
+                if *scale >= (1usize << 32) { return None; }
                 if Goldilocks::from_u64(*scale as u64) * *av + *bv != value { return None; }
                 for (id, val) in [(*a, *av), (*b, *bv)] {
                     let key = TensorKey::Index(id).encoded()?;
@@ -2124,7 +2135,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 }
             }
             (Op::IdxBroadcast { base, b, .. }, ReverseReduction::IdxBroadcast { base: bv }) => {
-                if !b.is_power_of_two() { return None; }
+                if !b.is_power_of_two() || *b >= (1usize << 32) { return None; }
                 let b_log = b.trailing_zeros() as usize;
                 if point.len() < b_log { return None; }
                 let (r_low, r_hi) = point.split_at(b_log);
@@ -3519,27 +3530,39 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[c] = TensorData::Owned(o);
             }
             Op::IdxBroadcast { base, out, b } => {
+                // Index-domain contract: b and every value are u32 and the
+                // exact integer result fits u32 (no wraparound).
+                assert!(b < (1usize << 32), "IdxBroadcast multiplier exceeds u32");
                 let src = store.idx[base].clone();
                 let mut o = Vec::with_capacity(src.len() * b);
                 for &v in &src {
                     for j in 0..b {
-                        o.push(v * b as u32 + j as u32);
+                        o.push(v.checked_mul(b as u32).and_then(|v| v.checked_add(j as u32))
+                            .expect("IdxBroadcast integer overflow (u32 domain violated)"));
                     }
                 }
                 store.idx[out] = o;
             }
             Op::CombineIdx { a, b, out, scale } => {
+                // Index-domain contract: scale and every value are u32, and
+                // the exact integer result must fit u32 (no wraparound).
+                assert!(scale < (1usize << 32), "CombineIdx scale exceeds u32");
                 let av = store.idx[a].clone();
                 let bv = store.idx[b].clone();
                 assert_eq!(av.len(), bv.len());
+                let scale32 = scale as u32;
                 let o: Vec<u32> = av
                     .iter()
                     .zip(bv.iter())
-                    .map(|(&x, &y)| x * scale as u32 + y)
+                    .map(|(&x, &y)| x.checked_mul(scale32).and_then(|v| v.checked_add(y))
+                        .expect("CombineIdx integer overflow (u32 domain violated)"))
                     .collect();
                 store.idx[out] = o;
             }
-            Op::PadIdx { base, out, len, .. } => {
+            Op::PadIdx { base, out, len, base_len } => {
+                // Exact-shape contract: the base tensor must have exactly
+                // base_len entries; the padded tail is zeros.
+                assert_eq!(store.idx[base].len(), base_len, "PadIdx base length != base_len");
                 let mut o = store.idx[base].clone();
                 o.resize(len, 0);
                 store.idx[out] = o;
@@ -6138,6 +6161,7 @@ impl TrustedModelManifest {
                     lookup_roots.insert(id, zkie_core::pcs::committed::commit(&whir, &padded).commitment);
             }
         }
+        fill_index_shapes(ops, &mut tensor_lengths);
         Self { batches: cached.iter().map(|b| TrustedWeightBatch {
             commitment: b.commitment.clone(), arity: b.arity,
             num_tables: b.num_tables, num_vars: b.num_vars,
@@ -6162,6 +6186,7 @@ impl TrustedModelManifest {
                 if let Some(old) = self.tensor_lengths.insert(*out, len) { assert_eq!(old, len, "inconsistent lookup shape"); }
             }
         }
+        fill_index_shapes(&ops, &mut self.tensor_lengths);
         self
     }
 
@@ -7735,8 +7760,130 @@ pub struct BoundTokenBinding {
     pub opening: zkie_core::pcs::batch_open::BatchOpeningProof,
 }
 
+/// S7b: propagate missing index/tensor shapes along the trusted graph
+/// (fill-only — an existing entry is never overwritten, so conflicts surface
+/// in `trusted_weight_locations` instead of being silently repaired).
+fn fill_index_shapes(ops: &[Op], lengths: &mut std::collections::BTreeMap<T, usize>) {
+    for _ in 0..=ops.len() {
+        let mut changed = false;
+        for op in ops {
+            let mut ins = |id: Option<T>, len: usize, lengths: &mut std::collections::BTreeMap<T, usize>, changed: &mut bool| {
+                if let Some(k) = id {
+                    if !lengths.contains_key(&k) { lengths.insert(k, len); *changed = true; }
+                }
+            };
+            match op {
+                Op::PadIdx { base, out, len, base_len } => {
+                    ins(TensorKey::Index(*base).encoded(), *base_len, lengths, &mut changed);
+                    ins(TensorKey::Index(*out).encoded(), *len, lengths, &mut changed);
+                }
+                Op::IdxBroadcast { base, out, b } => {
+                    let kb = TensorKey::Index(*base).encoded();
+                    let ko = TensorKey::Index(*out).encoded();
+                    if let (Some(k), Some(len)) = (ko, kb.and_then(|k| lengths.get(&k).copied()).and_then(|l| l.checked_mul(*b))) {
+                        ins(Some(k), len, lengths, &mut changed);
+                    }
+                    if let (Some(k), Some(len)) = (kb, ko.and_then(|k| lengths.get(&k).copied()).and_then(|l| (l % *b == 0).then(|| l / *b))) {
+                        ins(Some(k), len, lengths, &mut changed);
+                    }
+                }
+                Op::CombineIdx { a, b, out, .. } => {
+                    let ka = TensorKey::Index(*a).encoded();
+                    let kb = TensorKey::Index(*b).encoded();
+                    let ko = TensorKey::Index(*out).encoded();
+                    let known = [ka, kb, ko].iter().filter_map(|k| k.and_then(|k| lengths.get(&k).copied())).next();
+                    if let Some(len) = known {
+                        ins(ka, len, lengths, &mut changed);
+                        ins(kb, len, lengths, &mut changed);
+                        ins(ko, len, lengths, &mut changed);
+                    }
+                }
+                Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
+                    let seg = s.checked_mul(*k);
+                    let col = s.checked_mul(*n);
+                    let weights = n_experts.checked_mul(*k).and_then(|v| v.checked_mul(*n));
+                    if let Some(l) = seg { ins(TensorKey::Field(*a).encoded(), l, lengths, &mut changed); }
+                    if let Some(l) = weights { ins(TensorKey::Field(*w).encoded(), l, lengths, &mut changed); }
+                    if let Some(l) = col { ins(TensorKey::Field(*c).encoded(), l, lengths, &mut changed); }
+                    ins(TensorKey::Index(*expert_of).encoded(), *s, lengths, &mut changed);
+                }
+                _ => {}
+            }
+        }
+        if !changed { break; }
+    }
+}
+
+/// S7: exact tensor lengths and layouts derived from the trusted ops with
+/// checked arithmetic, keyed by wire tensor id (index tensors tagged). The
+/// same id claimed with two different lengths or layouts is rejected. This
+/// pins the GatherMatMul tensors (activation, routing index, expert weights,
+/// output) so a short weight that pads into the same WHIR bucket can never
+/// masquerade as the full zero-padded expert matrix.
+fn graph_exact_shapes(ops: &[Op])
+    -> Option<std::collections::BTreeMap<T, (usize, (u8, usize, usize, usize))>>
+{
+    let mut out: std::collections::BTreeMap<T, (usize, (u8, usize, usize, usize))> =
+        std::collections::BTreeMap::new();
+    fn put(id: T, len: usize, layout: (u8, usize, usize, usize),
+           out: &mut std::collections::BTreeMap<T, (usize, (u8, usize, usize, usize))>) -> Option<()> {
+        if let Some(&(old_len, old_layout)) = out.get(&id) {
+            if old_len != len || old_layout != layout { return None; }
+        } else {
+            out.insert(id, (len, layout));
+        }
+        Some(())
+    }
+    for op in ops {
+        if let Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } = op {
+            if !s.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two()
+                || !n_experts.is_power_of_two() || *n_experts < 2 { return None; }
+            let fa = TensorKey::Field(*a).encoded()?;
+            let fw = TensorKey::Field(*w).encoded()?;
+            let fc = TensorKey::Field(*c).encoded()?;
+            let ie = TensorKey::Index(*expert_of).encoded()?;
+            put(fa, s.checked_mul(*k)?, (0, *s, *k, 0), &mut out)?;
+            put(fw, n_experts.checked_mul(*k)?.checked_mul(*n)?,
+                (1, *n_experts, *k, *n), &mut out)?;
+            put(fc, s.checked_mul(*n)?, (2, *s, *n, 0), &mut out)?;
+            put(ie, *s, (3, *s, 0, 0), &mut out)?;
+        }
+        if let Op::PadIdx { base, out: out_t, len, base_len } = op {
+            if *base_len == 0 || *base_len > *len || !len.is_power_of_two() { return None; }
+            put(TensorKey::Index(*base).encoded()?, *base_len, (4, *base_len, 0, 0), &mut out)?;
+            put(TensorKey::Index(*out_t).encoded()?, *len, (5, *len, 0, 0), &mut out)?;
+        }
+    }
+    Some(out)
+}
+
 fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<std::collections::BTreeMap<T, (usize, usize)>> {
     if model.graph != bincode::serialize(ops).ok()? { return None; }
+    // S7: every graph-derived exact length must match the manifest exactly
+    // (the padding bucket alone is not sufficient), and same-id layout or
+    // length conflicts are rejected outright.
+    for (id, (len, _)) in graph_exact_shapes(ops)? {
+        if model.tensor_lengths.get(&id) != Some(&len) { return None; }
+    }
+    // Index relations: exact lengths must be present and consistent.
+    for op in ops {
+        match op {
+            Op::CombineIdx { a, b, out, .. } => {
+                let ka = TensorKey::Index(*a).encoded()?;
+                let kb = TensorKey::Index(*b).encoded()?;
+                let ko = TensorKey::Index(*out).encoded()?;
+                let la = *model.tensor_lengths.get(&ka)?;
+                if *model.tensor_lengths.get(&kb)? != la || *model.tensor_lengths.get(&ko)? != la { return None; }
+            }
+            Op::IdxBroadcast { base, out, b } => {
+                let kb = TensorKey::Index(*base).encoded()?;
+                let ko = TensorKey::Index(*out).encoded()?;
+                let lb = *model.tensor_lengths.get(&kb)?;
+                if *model.tensor_lengths.get(&ko)? != lb.checked_mul(*b)? { return None; }
+            }
+            _ => {}
+        }
+    }
     let expected: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
     let mut locations = std::collections::BTreeMap::new();
     for (bi, batch) in model.batches.iter().enumerate() {
@@ -7992,6 +8139,18 @@ pub fn verify_committed_shard_dag_bound(
 ) -> bool {
     let _ = (ops_per_shard, whir);
     if trusted_weight_locations(model, ops).is_none() { return false; }
+    // S7b index-domain contract: every caller-authenticated index tensor holds
+    // u32 values. The reverse relations for CombineIdx/IdxBroadcast are exact
+    // over the Goldilocks field, so rejecting out-of-u32 public values keeps
+    // the field relation and the u32 forward semantics in agreement.
+    if usize::BITS != 64 { return false; }
+    let index_tag = 1usize << (usize::BITS - 1);
+    for (id, tensor) in execution.inputs.iter().chain(execution.outputs.iter()) {
+        if id & index_tag != 0
+            && tensor.iter().any(|&v| { let n = to_i64(v); n < 0 || (n as u64) >= (1u64 << 32) }) {
+            return false;
+        }
+    }
     let (mut transcript, seeds) = match execution_seeds(ops, model, execution, &proof.aux) { Some(v) => v, None => return false };
     let leaves = match verify_reverse_dag_inner(ops, &seeds, &proof.reverse, &mut transcript, &proof.aux, Some(model)) {
         Some(v) => v, None => return false,
@@ -12754,6 +12913,216 @@ mod tests {
         };
         assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).is_none(),
             "gate-weighted Gather must stay fail-closed until its reverse reduction lands");
+    }
+
+    /// S7 (TL review): a short expert weight that pads into the SAME WHIR
+    /// bucket (16 -> 2^5 like the honest 32) must be rejected — the exact
+    /// graph-derived length n_experts*k*n is required, not just the padding
+    /// arity. Also checked through the bound bytes entry.
+    #[test]
+    fn s7_gather_matmul_short_weight_same_padding_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let (s, k, n, e_count) = (8usize, 4usize, 2usize, 4usize);
+        let mut store = Store::new();
+        let a = store.push(vec![from_i64(1); s * k]);
+        let expert_of = store.push_idx(vec![0u32, 1, 2, 3, 0, 1, 2, 3]);
+        // 16 entries instead of n_experts*k*n = 32: same padded bucket (2^5).
+        let w = store.push((0..16).map(|i| from_i64(i as i64 + 1)).collect());
+        let c = store.push(vec![]);
+        let ops = vec![Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts: e_count }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7-short-w");
+        assert_eq!(cached[0].arity, 5, "the short weight must land in the same bucket");
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(expert_of, s)].into());
+        assert!(trusted_weight_locations(&model, &ops).is_none(),
+            "a short expert weight in the same padding bucket must be rejected");
+
+        // Bytes entry: the honest proof under the honest model must reject
+        // when the verifier is given the short-weight model.
+        let (mut honest_store, honest_ops, honest_whir, honest_cached, honest_model, honest_execution, _a, _eo, _c) =
+            s7_gather_matmul_fixture(0x5710);
+        let proof = prove_committed_shard_dag_bound(&mut honest_store, &honest_ops, 1, &honest_whir, &honest_cached, 0, 0, &PublicStatement::Generic, &honest_model, &honest_execution).unwrap();
+        let bytes = bincode::serialize(&proof).unwrap();
+        let _ = whir;
+        assert!(!verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &honest_whir, &PublicStatement::Generic, &model, &honest_execution
+        ));
+    }
+
+    /// S7 (TL review): the same weight tensor used with two different expert
+    /// layouts (same total length) must be rejected as a same-id conflict.
+    #[test]
+    fn s7_gather_matmul_layout_conflict_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let (s, k) = (8usize, 4usize);
+        let mut store = Store::new();
+        let w = store.push((0..32).map(|i| from_i64(i as i64 + 1)).collect());
+        let a1 = store.push(vec![from_i64(1); s * k]);
+        let c1 = store.push(vec![]);
+        let eo1 = store.push_idx(vec![0u32; s]);
+        let a2 = store.push(vec![from_i64(2); s * k]);
+        let c2 = store.push(vec![]);
+        let eo2 = store.push_idx(vec![0u32; s]);
+        let ops = vec![
+            // 4 experts x 4 x 2 = 32
+            Op::GatherMatMul { a: a1, expert_of: eo1, w, c: c1, s, k, n: 2, n_experts: 4 },
+            // 2 experts x 4 x 4 = 32 (same total, different layout)
+            Op::GatherMatMul { a: a2, expert_of: eo2, w, c: c2, s, k, n: 4, n_experts: 2 },
+        ];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7-layout");
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(eo1, s), (eo2, s)].into());
+        let _ = whir;
+        assert!(trusted_weight_locations(&model, &ops).is_none(),
+            "the same weight tensor used with two expert layouts must be rejected");
+    }
+
+    /// S7 (review gap): tampering the public routing input must reject — the
+    /// routing tie/leaf path pins expert_of, including out-of-range values.
+    #[test]
+    fn s7_gather_matmul_expert_of_input_tampered_rejected() {
+        let (mut store, ops, whir, cached, model, execution, _a, expert_of, _c) = s7_gather_matmul_fixture(0x5711);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        let key = TensorKey::Index(expert_of).encoded().unwrap();
+        let mut bad = execution.clone();
+        bad.inputs.get_mut(&key).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad));
+        // Out-of-range expert (>= n_experts) at a position.
+        let mut bad2 = execution.clone();
+        bad2.inputs.get_mut(&key).unwrap()[7] = Goldilocks::from_u64(4);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad2));
+    }
+
+    /// S7 (review gap): dropping an entry from the weight-opening multiset
+    /// must reject (the verifier re-derives the exact expected entries).
+    #[test]
+    fn s7_gather_matmul_dropped_weight_opening_entry_rejected() {
+        let (mut store, ops, whir, cached, model, execution, _a, _eo, _c) = s7_gather_matmul_fixture(0x5712);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for opening in &mut forged.weight_openings {
+            if !opening.claimed.is_empty() {
+                opening.claimed.pop();
+                opening.points.pop();
+                opening.table_idxs.pop();
+                hit = true;
+            }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// S7b (TL review): PadIdx padding semantics. (a) The public output's
+    /// padded tail must be zero — a nonzero padding entry is rejected through
+    /// the bound bytes entry. (b) A base tensor whose actual length differs
+    /// from the op's `base_len` (e.g. base_len=3 with 4 stored entries, the
+    /// last nonzero) is rejected by the exact shape check.
+    #[test]
+    fn s7b_pad_idx_padding_and_shape_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let base = store.push_idx(vec![1u32, 2, 3, 4]);
+        let out = store.push_idx(vec![]);
+        let ops = vec![Op::PadIdx { base, out, len: 8, base_len: 4 }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7b-pad");
+        forward_ops(&mut store, &ops);
+        assert_eq!(store.idx[out], vec![1u32, 2, 3, 4, 0, 0, 0, 0]);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(base, 4usize), (out, 8)].into());
+        let base_key = TensorKey::Index(base).encoded().unwrap();
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let to_g = |v: &[u32]| v.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect::<Vec<_>>();
+        let execution = TrustedExecution {
+            inputs: [(base_key, to_g(&store.idx[base]))].into(),
+            outputs: [(out_key, to_g(&store.idx[out]))].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // (a) nonzero padding tail in the public output.
+        let mut bad = execution.clone();
+        bad.outputs.get_mut(&out_key).unwrap()[5] = Goldilocks::from_u64(9);
+        assert!(!verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &bad));
+        // (b) base_len=3 while the base tensor stores 4 entries: the exact
+        // shape check must reject the manifest outright.
+        let ops_bad = vec![Op::PadIdx { base, out, len: 8, base_len: 3 }];
+        let model_bad = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops_bad)
+            .with_index_shapes(&[(base, 4usize), (out, 8)].into());
+        assert!(trusted_weight_locations(&model_bad, &ops_bad).is_none(),
+            "base_len must match the base tensor's exact length");
+    }
+
+    /// S7b (TL review): the u32 index-domain contract. Public index values
+    /// outside [0, 2^32) are rejected by the bound verifier, and the forward
+    /// path fails closed (panic) on scale >= 2^32 or integer overflow instead
+    /// of silently wrapping.
+    #[test]
+    fn s7b_index_u32_domain_boundaries_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let a = store.push_idx(vec![1u32, 2, 3, 4]);
+        let b = store.push_idx(vec![5u32, 6, 7, 8]);
+        let c = store.push_idx(vec![]);
+        let out = store.push_idx(vec![]);
+        let ops = vec![
+            Op::CombineIdx { a, b, out: c, scale: 10 },
+            Op::PadIdx { base: c, out, len: 8, base_len: 4 },
+        ];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7b-domain");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(a, 4usize), (b, 4), (out, 8)].into());
+        let a_key = TensorKey::Index(a).encoded().unwrap();
+        let b_key = TensorKey::Index(b).encoded().unwrap();
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let to_g = |v: &[u32]| v.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect::<Vec<_>>();
+        let execution = TrustedExecution {
+            inputs: [(a_key, to_g(&store.idx[a])), (b_key, to_g(&store.idx[b]))].into(),
+            outputs: [(out_key, to_g(&store.idx[out]))].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // (a) a public index value of 2^32 is outside the u32 domain.
+        let mut bad = execution.clone();
+        bad.inputs.get_mut(&a_key).unwrap()[0] = Goldilocks::from_u64(1u64 << 32);
+        assert!(!verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &bad));
+        // (b) the forward contract fails closed on out-of-domain constants
+        // and overflow instead of wrapping.
+        let mut s1 = Store::new();
+        let x1 = s1.push_idx(vec![1u32]);
+        let y1 = s1.push_idx(vec![0u32]);
+        let z1 = s1.push_idx(vec![]);
+        let ops1 = vec![Op::CombineIdx { a: x1, b: y1, out: z1, scale: 1usize << 33 }];
+        let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| forward_ops(&mut s1, &ops1)));
+        assert!(r1.is_err(), "scale >= 2^32 must fail closed");
+        let mut s2 = Store::new();
+        let x2 = s2.push_idx(vec![3u32]);
+        let y2 = s2.push_idx(vec![0u32]);
+        let z2 = s2.push_idx(vec![]);
+        let ops2 = vec![Op::CombineIdx { a: x2, b: y2, out: z2, scale: 1usize << 31 }];
+        let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| forward_ops(&mut s2, &ops2)));
+        assert!(r2.is_err(), "scale*a + b >= 2^32 must fail closed");
+        let mut s3 = Store::new();
+        let x3 = s3.push_idx(vec![3u32]);
+        let y3 = s3.push_idx(vec![0u32]);
+        let z3 = s3.push_idx(vec![]);
+        let ops3 = vec![Op::IdxBroadcast { base: x3, out: y3, b: 2 }];
+        let _ = (&mut s3, &ops3, &z3);
+        let mut s4 = Store::new();
+        let x4 = s4.push_idx(vec![1u32 << 31]);
+        let y4 = s4.push_idx(vec![]);
+        let ops4 = vec![Op::IdxBroadcast { base: x4, out: y4, b: 2 }];
+        let r4 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| forward_ops(&mut s4, &ops4)));
+        assert!(r4.is_err(), "IdxBroadcast value*b + j >= 2^32 must fail closed");
     }
 
     /// S7b: linear index-op chain in the bound path: CombineIdx ->
