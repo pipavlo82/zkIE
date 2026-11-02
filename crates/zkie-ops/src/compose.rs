@@ -8321,8 +8321,52 @@ fn graph_exact_shapes(ops: &[Op])
     Some(out)
 }
 
+/// S7b (TL review): forward semantics that depend on EXACT tensor-shape
+/// equality must be validated against the trusted manifest at the verifier,
+/// independently of the constructor's inference — a deserialized manifest
+/// never went through `from_offline_commitment`'s assertions. Add truncates
+/// via zip, so mismatched a/b/c lengths would make the zero-padded MLE
+/// relation differ from the forward; reject them (and the same for the other
+/// shape-copying ops).
+fn graph_equal_shapes(ops: &[Op], lengths: &std::collections::BTreeMap<T, usize>) -> Option<()> {
+    let f = |id: T| TensorKey::Field(id).encoded();
+    let i = |id: T| TensorKey::Index(id).encoded();
+    let len = |k: Option<T>| k.and_then(|k| lengths.get(&k).copied());
+    for op in ops {
+        match op {
+            Op::Add { a, b, c } => {
+                let (la, lb, lc) = (len(f(*a))?, len(f(*b))?, len(f(*c))?);
+                if la != lb || lb != lc { return None; }
+            }
+            Op::Relu { x, out } => {
+                if len(f(*x))? != len(f(*out))? { return None; }
+            }
+            Op::Scale { x, out, .. } => {
+                if len(f(*x))? != len(f(*out))? { return None; }
+            }
+            Op::Transpose { x, out, m, k } => {
+                let l = m.checked_mul(*k)?;
+                if len(f(*x))? != l || len(f(*out))? != l { return None; }
+            }
+            Op::Lookup { idx, out, .. } => {
+                if let (Some(li), Some(lo)) = (len(i(*idx)), len(f(*out))) {
+                    if li != lo { return None; }
+                }
+            }
+            Op::GeluIndex { x, out, .. } => {
+                if let (Some(lx), Some(lo)) = (len(f(*x)), len(i(*out))) {
+                    if lx != lo { return None; }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(())
+}
+
 fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<std::collections::BTreeMap<T, (usize, usize)>> {
     if model.graph != bincode::serialize(ops).ok()? { return None; }
+    graph_equal_shapes(ops, &model.tensor_lengths)?;
     // S7: every graph-derived exact length must match the manifest exactly
     // (the padding bucket alone is not sufficient), and same-id layout or
     // length conflicts are rejected outright.
@@ -13453,6 +13497,48 @@ mod tests {
         assert!(!verify_committed_shard_dag_bound_bytes(
             &bytes, &ops, 1, &honest_whir, &PublicStatement::Generic, &model, &honest_execution
         ));
+    }
+
+    /// S7b (TL review of cfceaa6): a caller-supplied manifest with inconsistent
+    /// Add shapes must fail closed. The forward zips to the shorter input, so a
+    /// length-3 `a` with length-4 `b/c` would make the zero-padded MLE relation
+    /// differ from the forward computation. The verifier validates exact shape
+    /// equality independently of the manifest constructor.
+    #[test]
+    fn s7b_add_shape_mismatch_manifest_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let a = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let b = store.push(vec![from_i64(5), from_i64(6), from_i64(7), from_i64(8)]);
+        let c = store.push(vec![]);
+        let ops = vec![Op::Add { a, b, c }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7b-addshape");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(a, store.get(a).to_vec()), (b, store.get(b).to_vec())].into(),
+            outputs: [(c, store.get(c).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        // Malicious manifest: a is declared shorter (same padding bucket).
+        let mut bad_model = model.clone();
+        bad_model.tensor_lengths.insert(a, 3);
+        assert!(trusted_weight_locations(&bad_model, &ops).is_none(),
+            "Add with mismatched a/b/c lengths must be rejected");
+        // Through the bound bytes entry, with an execution matching the bad
+        // manifest, verification must still fail closed.
+        let mut bad_exec = execution.clone();
+        bad_exec.inputs.get_mut(&a).unwrap().truncate(3);
+        assert!(!verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &bad_model, &bad_exec));
+        // Truncated public output must also reject under the honest manifest.
+        let mut bad_out = execution.clone();
+        bad_out.outputs.get_mut(&c).unwrap().truncate(3);
+        assert!(!verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &bad_out));
     }
 
     /// S7 (TL review): the same weight tensor used with two different expert
