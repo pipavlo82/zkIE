@@ -160,8 +160,44 @@ merge then opening) remains green (`zkie-ops` 157/0). The legacy committed
 path's cross_binds are retired (the committed verifier permanently rejects)
 and are not part of the bound O2 scope.
 
-Status: route A is next, as an isolated feature/function path; Q3 is done and
-committed. O2 is not complete; S7 is not accepted.
+## Route A measurement (isolated, env-gated)
+
+The route-A experiment is isolated: the example only calls S4 `prove_same_poly`
+on the real weight-opening claims when `ZKIE_O2_ROUTE_A_MEASURE=1`; the main
+proof path, proof bytes, transcript and verifier are unchanged. A read-only
+`BoundExecutionProof::weight_openings()` accessor was added for tooling. This
+measures the merge cost only (not a complete route-A protocol; a complete A
+path would still need the single opening and all negatives, and is not
+implemented because the measurement rejects the route).
+
+Real 8-expert case (table 2^25, 8 real claims from the B proof):
+
+```
+O2-routeA-merge claims=8 table_len=33554432 merged_point_len=25 ms=1673 rss_kb=6185444
+```
+
+- S4 merge alone: 1,673 ms and +~2.7 GB RSS over the B run's 3.5 GB.
+- Current route B for the same claims: one O5 `W_t` batch opening, open_ms
+  ≈ 3.1 s, which already contains the combined-equality merge math and the
+  single WHIR opening at the sumcheck point.
+- Route A would add the 1,673 ms merge on top of a one-point opening (still a
+  full-table sum-of-products + WHIR), so A is strictly more work than B for
+  the same table.
+- Full64 scaling: `prove_same_poly` materializes one `eq_evals` vector per
+  claim; 64 claims × 2^28 × 8 B = 128 GiB, plus the table and a 2 GiB W
+  buffer. This cannot satisfy the full64 admission condition without a new
+  memory-efficient merge design (which would be a separate TL-approved item).
+
+Conclusion: route B (current O5 `W_t` multi-point batch opening, no same_poly
+on weights) is selected. Route A is rejected by measurement/scaling, not
+chosen, so its full proof-integration and negative suite are not built. The
+C gate/index S4 merges stay as-is (Q2: no reduction change; cost is
+negligible: len 64/8 tensors).
+
+Status: Q3 committed (`ce6dc60`); route B selected; the route-A measurement
+hook is isolated and env-gated. O2 is not complete pending TL acceptance; S7
+is not accepted. No transcript/authentication/security change was made by
+this comparison step.
 
 S7 is not accepted; O2 is not complete. No security parameter or
 authentication relation is changed by this baseline step.

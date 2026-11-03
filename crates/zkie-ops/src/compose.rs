@@ -10413,6 +10413,14 @@ pub struct BoundExecutionProof {
     token_binding: Option<BoundTokenBinding>,
 }
 
+impl BoundExecutionProof {
+    /// Read-only access for measurement/tooling (O2 route-A experiment).
+    /// Does not change serialization, transcripts, or verification.
+    pub fn weight_openings(&self) -> &[WeightBatchOpening] {
+        &self.weight_openings
+    }
+}
+
 /// S6 (bound path): per-Argmax individual selector openings. The selector
 /// column is the ArgmaxWitness aux column 0 — the SAME committed column the
 /// Argmax reverse reduction binds via its relation virtuals — and one opening
