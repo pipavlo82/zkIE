@@ -3317,11 +3317,17 @@ fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Goldilock
     // bmm prover's assert on a store/graph mismatch).
     if store.get(a).len() != s * k || store.get(c).len() != s * n
         || store.idx.get(expert_of)?.len() != s { return None; }
-    let wv = store.materialize(w);
-    if wv.len() != e_count * k * n { return None; }
-    let (matmul, ch) = bmm::prove_streaming(
-        store.get(a), store.idx.get(expert_of)?, wv.as_ref(), store.get(c),
-        s, k, n, e_count, &u, &v, transcript,
+    // O5 streaming: fold one K x N expert block at a time from the (possibly
+    // mmap-backed) weight source; w_v and the per-expert row folds are all we
+    // need, so the full expert-major weight is never materialized.
+    let eof = store.idx.get(expert_of)?;
+    if eof.iter().any(|&e| (e as usize) >= e_count) { return None; }
+    let blocks = store.weight_blocks(w);
+    if blocks.len() != e_count * k * n { return None; }
+    let streamed = bmm::stream_weights(eof, &blocks, s, e_count, k, n, &v, true);
+    let (matmul, ch) = bmm::prove_with_w_v(
+        store.get(a), &streamed.w_v, store.get(c),
+        s, k, n, &u, &v, transcript,
     );
     if matmul.claimed != vc || ch.len() != lgk + lgs { return None; }
     let ch_d = &ch[..lgk];
@@ -3351,14 +3357,9 @@ fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Goldilock
     let chp = argmax_pad_point(ch_pos, arity);
     let mut counts = Vec::with_capacity(e_count);
     for e in 0..e_count { counts.push(mle::eval(&aux.columns[e], &chp)); }
-    // table_e = W_e(ch_d, v) (expert-major block).
-    let mut table = Vec::with_capacity(e_count);
-    let mut wp = v.clone();
-    wp.extend_from_slice(ch_d);
-    for e in 0..e_count {
-        let block = &wv[e * k * n..(e + 1) * k * n];
-        table.push(mle::eval(block, &wp));
-    }
+    // table_e = W_e(ch_d, v) (expert-major block), recovered from the row
+    // folds stored by the streaming pass: no second read of the weights.
+    let table = match streamed.table_evals(ch_d) { Some(t) => t, None => return None };
     let mut bound = Goldilocks::ZERO;
     for e in 0..e_count { bound = bound + counts[e] * table[e]; }
     if matmul.sumcheck.final_evals[1] != bound { return None; }
@@ -5374,6 +5375,27 @@ impl Store {
             TensorData::Mmap { mmap, start, len } => Cow::Owned(mmap.read_goldilocks(*start, *len)),
         }
     }
+    /// Streaming handle for an expert-major weight: borrowed for owned data,
+    /// block-at-a-time conversion for mmap data. Lets GatherMatMul read one
+    /// `K x N` expert block without materializing the whole weight (O5).
+    pub fn weight_blocks(&self, id: T) -> zkie_core::common::batched_matmul::WeightBlocks<'_> {
+        use zkie_core::common::batched_matmul::WeightBlocks;
+        match &self.v[id] {
+            TensorData::Owned(v) => WeightBlocks::Slice(v.as_slice()),
+            TensorData::Mmap { mmap, start, len } => WeightBlocks::Mmap {
+                mmap: mmap.as_ref(),
+                start: *start,
+                len: *len,
+            },
+        }
+    }
+    /// Element count without materializing mmap-backed data.
+    pub fn tensor_len(&self, id: T) -> usize {
+        match &self.v[id] {
+            TensorData::Owned(v) => v.len(),
+            TensorData::Mmap { len, .. } => *len,
+        }
+    }
     pub fn get_mut(&mut self, id: T) -> &mut [Goldilocks] {
         match &mut self.v[id] {
             TensorData::Owned(v) => v,
@@ -6130,11 +6152,13 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[c] = TensorData::Owned(o);
             }
             Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
-                let wv = store.materialize(w);
-                let o = bmm::gather_matmul_forward(
+                // O5 streaming: one K x N expert block at a time; the full
+                // expert-major weight (possibly mmap-backed) stays unmaterialized.
+                let blocks = store.weight_blocks(w);
+                let o = bmm::gather_matmul_forward_streaming(
                     store.get(a),
                     &store.idx[expert_of],
-                    wv.as_ref(),
+                    &blocks,
                     s,
                     k,
                     n,
@@ -6673,11 +6697,11 @@ pub fn prove_shard_precomputed(
             Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
                 let u: Vec<Goldilocks> = transcript.field_vec(s.trailing_zeros() as usize);
                 let v: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
-                let wv = store.materialize(w);
-                let (p, ch) = bmm::prove_gather_matmul(
+                let blocks = store.weight_blocks(w);
+                let (p, ch) = bmm::prove_gather_matmul_streaming(
                     store.get(a),
                     &store.idx[expert_of],
-                    wv.as_ref(),
+                    &blocks,
                     store.get(c),
                     s,
                     k,
@@ -11102,24 +11126,25 @@ pub fn prove_committed_shard_dag_bound(
         let rss_res = current_rss_kb();
         let protocol = batch_whir.batch_opening_protocol(cw.num_tables, cw.arity);
         let ctx = zkie_core::pcs::committed::BatchCtx { commitment, prover_data, protocol, whir: batch_whir, num_tables: cw.num_tables };
-        // O5: one owned copy per UNIQUE polynomial. When every claim targets
-        // a distinct table we move the padded buffer instead of cloning it;
-        // duplicate-table claims still clone until the combined-equality
-        // W_t(X)=Sum gamma^i eq(r_i,X) grouping lands.
-        let mut seen = std::collections::BTreeSet::new();
-        let unique = table_idxs.iter().all(|&i| seen.insert(i));
-        let mut cloned_bytes = 0usize;
-        let opened: Vec<Vec<Goldilocks>> = table_idxs.iter().map(|&i| {
-            if unique { std::mem::take(&mut tensors[i]) } else {
-                cloned_bytes += tensors[i].len() * std::mem::size_of::<Goldilocks>();
-                tensors[i].clone()
-            }
-        }).collect();
+        // O5: combined equality grouping. Duplicate-table claims share one
+        // W_t(X) = Sum_i gamma^i eq(r_i,X), so the opening takes exactly one
+        // owned buffer per UNIQUE table (first-appearance order) and the
+        // padded buffers are MOVED, never cloned per claim.
+        let (unique_tables, _) = zkie_core::pcs::batch_open::claim_groups(&table_idxs);
+        let moved_bytes: usize = unique_tables
+            .iter()
+            .map(|&t| tensors[t].len() * std::mem::size_of::<Goldilocks>())
+            .sum();
+        drop(refs);
+        let opened: Vec<Vec<Goldilocks>> =
+            unique_tables.iter().map(|&t| std::mem::take(&mut tensors[t])).collect();
+        // Tables outside the claim set are not needed by the opening proof.
+        drop(tensors);
         let rss_clone = current_rss_kb();
-        eprintln!("O5-metrics batch={} claims={} unique={} cloned_bytes={} tables={}",
-            bi, table_idxs.len(), unique, cloned_bytes, cw.num_tables);
+        eprintln!("O5-metrics batch={} claims={} unique={} moved_bytes={} cloned_bytes=0 tables={}",
+            bi, table_idxs.len(), unique_tables.len(), moved_bytes, cw.num_tables);
         let t_open = std::time::Instant::now();
-        let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &table_idxs, &opened, &points, &claimed).ok()?;
+        let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_unique_owned(ctx, &table_idxs, opened, &points, &claimed).ok()?;
         let open_ms = t_open.elapsed().as_secs_f64() * 1e3;
         let rss_open = current_rss_kb();
         eprintln!("O5-phases mat_ms={:.1} restore_ms={:.1} open_ms={:.1} rss_now_mat={} rss_now_restore={} rss_now_clone={} rss_now_open={} hwm={}",
@@ -15746,6 +15771,84 @@ mod tests {
             outputs: [(c, store.get(c).to_vec())].into(),
         };
         (store, ops, whir, cached, model, execution, a, expert_of, c)
+    }
+
+    /// S7/O5: the bound GatherMatMul roundtrip with an MMAP-BACKED expert
+    /// weight exercises the streaming weight-block path end to end. Forward
+    /// and reverse read one K x N expert block at a time (the full W_all is
+    /// never materialized for evaluation), and the committed weight batch is
+    /// opened with the combined-equality grouping. The same malicious
+    /// terminal tamper as the owned fixture must still be rejected.
+    #[test]
+    fn s7_gather_matmul_mmap_weight_bound_roundtrip() {
+        use std::io::Write;
+        let (s, k, n, e_count) = (8usize, 4usize, 2usize, 4usize);
+        let mut store = Store::new();
+        let a = store.push((0..s * k).map(|i| from_i64((i as i64 % 11) + 1)).collect());
+        let expert_of = store.push_idx(vec![0u32, 1, 2, 3, 0, 1, 2, 3]);
+        let raw: Vec<i32> = (0..e_count * k * n).map(|i| (i as i32 % 7) + 1).collect();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zkie-s7-mmap-{}-{stamp}.bin",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for x in &raw {
+                f.write_all(&x.to_le_bytes()).unwrap();
+            }
+        }
+        let mmap = std::sync::Arc::new(
+            zkie_core::common::weights_io::WeightMmap::open(&path).unwrap(),
+        );
+        std::fs::remove_file(&path).unwrap();
+        let w = store.push_mmap(mmap, 0, e_count * k * n);
+        let c = store.push(vec![]);
+        let ops = vec![Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts: e_count }];
+        let whir = zkie_core::pcs::whir::Whir::new_testing(5);
+        let cache = format!("/tmp/zkie-s7-mmap-cache-{}-{stamp}", std::process::id());
+        let cached = commit_model_weights(&store, &ops, &cache);
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(expert_of, s)].into());
+        let expert_key = TensorKey::Index(expert_of).encoded().unwrap();
+        let expert_vals: Vec<Goldilocks> = store.idx[expert_of]
+            .iter()
+            .map(|&v| Goldilocks::from_u64(v as u64))
+            .collect();
+        let execution = TrustedExecution {
+            inputs: [(a, store.get(a).to_vec()), (expert_key, expert_vals)].into(),
+            outputs: [(c, store.get(c).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(
+            &mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution,
+        )
+        .expect("mmap-backed gather proof");
+        assert!(verify_committed_shard_dag_bound(
+            &ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution
+        ));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution
+        ));
+
+        // Fabricated weight terminal -> reject.
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::GatherMatMul { proof } = &mut step.reduction {
+                proof.table[0] += Goldilocks::ONE;
+                hit = true;
+            }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(
+            &ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution
+        ));
     }
 
     /// S7: honest GatherMatMul bound roundtrip. The verifier derives counts

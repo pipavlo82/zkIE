@@ -84,6 +84,30 @@ pub fn batch_open(
     rounds_ok && challenges_v == challenges && evals_ok && proof.b_eval == expected
 }
 
+/// Claim grouping shared by the prover and the verifier (O5): unique table
+/// indices in order of first appearance in `table_idxs`, plus each claim's
+/// group position. Duplicate-table claims are combined into one equality
+/// polynomial `W_t(X) = sum_{i: table_i=t} gamma^i eq(r_i, X)` so the
+/// sum-of-products sumcheck runs over unique polynomials only.
+pub fn claim_groups(table_idxs: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let mut unique: Vec<usize> = Vec::new();
+    let mut position: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut group_of: Vec<usize> = Vec::with_capacity(table_idxs.len());
+    for &t in table_idxs {
+        let g = match position.get(&t) {
+            Some(&g) => g,
+            None => {
+                let g = unique.len();
+                unique.push(t);
+                position.insert(t, g);
+                g
+            }
+        };
+        group_of.push(g);
+    }
+    (unique, group_of)
+}
+
 /// General multi-point reduction on an *already committed* batch. `table_idxs[i]`
 /// maps the i-th tensor to its table index in the batch (duplicates allowed, so
 /// the same table can be opened at several points). Pays one FRI proof.
@@ -304,10 +328,87 @@ fn prove_batch_open_committed_with_data(
     if table_idxs.len() != n || points.len() != n || claimed.len() != n {
         return Err("batch-open length mismatch".to_owned());
     }
+    // `tensors` is one entry per claim (the historical contract). Duplicate
+    // table claims point at the same committed polynomial, so keep exactly one
+    // owned copy per unique table, in first-appearance order.
+    let (unique, group_of) = claim_groups(table_idxs);
+    let mut first = vec![usize::MAX; unique.len()];
+    for i in 0..n {
+        if first[group_of[i]] == usize::MAX {
+            first[group_of[i]] = i;
+        }
+    }
+    let values: Vec<Vec<Goldilocks>> = first.iter().map(|&i| tensors[i].clone()).collect();
+    prove_batch_open_with_data(
+        whir, commitment, protocol, num_tables, prover_data,
+        table_idxs, values, points, claimed,
+    )
+}
+
+/// Prove a multi-point batch opening where `values` holds exactly one tensor
+/// per unique table (first-appearance order of `table_idxs`). This is the
+/// O5 memory contract: no per-claim copies of a duplicated table are made.
+pub fn prove_batch_open_committed_unique_owned(
+    batch: crate::pcs::committed::BatchCtx,
+    table_idxs: &[usize],
+    values: Vec<Vec<Goldilocks>>,
+    points: &[Vec<Goldilocks>],
+    claimed: &[Goldilocks],
+) -> Result<BatchOpeningProof, String> {
+    let crate::pcs::committed::BatchCtx {
+        commitment,
+        prover_data,
+        protocol,
+        whir,
+        num_tables,
+    } = batch;
+    prove_batch_open_with_data(
+        &whir, &commitment, &protocol, num_tables, prover_data,
+        table_idxs, values, points, claimed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_batch_open_with_data(
+    whir: &Whir,
+    commitment: &crate::pcs::whir::Commitment,
+    protocol: &crate::pcs::whir::OpeningProtocol,
+    num_tables: usize,
+    prover_data: crate::pcs::whir::ProverData,
+    table_idxs: &[usize],
+    values: Vec<Vec<Goldilocks>>,
+    points: &[Vec<Goldilocks>],
+    claimed: &[Goldilocks],
+) -> Result<BatchOpeningProof, String> {
+    let n = points.len();
+    if table_idxs.len() != n || claimed.len() != n || n == 0 {
+        return Err("batch-open length mismatch".to_owned());
+    }
+    let (unique, group_of) = claim_groups(table_idxs);
+    if values.len() != unique.len() {
+        return Err(format!(
+            "batch-open: {} unique tables but {} tensors",
+            unique.len(), values.len()
+        ));
+    }
+    let d = points[0].len();
+    if points.iter().any(|p| p.len() != d) {
+        return Err("batch-open point arity mismatch".to_owned());
+    }
+    let table_len = 1usize
+        .checked_shl(d as u32)
+        .ok_or_else(|| "batch-open arity overflow".to_owned())?;
+    if values.iter().any(|v| v.len() != table_len) {
+        return Err("batch-open tensor/point arity mismatch".to_owned());
+    }
+    if table_idxs.iter().any(|&t| t >= num_tables) {
+        return Err("batch-open table index out of range".to_owned());
+    }
 
     // Fiat-Shamir (S1): absorb the statement, squeeze gamma, then run the
     // sumcheck transcript-driven — the fresh point r is assembled from the
-    // per-round challenges derived from the round messages.
+    // per-round challenges derived from the round messages. The absorption
+    // order and the global gamma powers are unchanged by grouping.
     let mut t = Transcript::new(b"zkie-batch-open");
     t.absorb(&bincode::serialize(commitment).map_err(|e| e.to_string())?);
     for (pt, c) in points.iter().zip(claimed.iter()) {
@@ -316,19 +417,25 @@ fn prove_batch_open_committed_with_data(
     }
     let gamma = t.field();
 
-    let mut weights: Vec<Vec<Goldilocks>> = Vec::with_capacity(n);
+    // O5: one combined equality weight per unique table:
+    //   W_t(X) = sum_{i: table_i = t} gamma^i * eq(r_i, X)
+    // built by adding scaled eq vectors into a single buffer per table.
+    let mut weights: Vec<Vec<Goldilocks>> =
+        (0..unique.len()).map(|_| vec![Goldilocks::ZERO; table_len]).collect();
     let mut gamma_pow = Goldilocks::ONE;
     let mut claimed_sum = Goldilocks::ZERO;
     for i in 0..n {
         let eq = mle::eq_evals(&points[i]);
-        let w: Vec<Goldilocks> = eq.iter().map(|&x| gamma_pow * x).collect();
-        weights.push(w);
+        let w = &mut weights[group_of[i]];
+        for (acc, &e) in w.iter_mut().zip(eq.iter()) {
+            *acc = *acc + gamma_pow * e;
+        }
         claimed_sum = claimed_sum + gamma_pow * claimed[i];
         gamma_pow = gamma_pow * gamma;
     }
 
     let (sumcheck, challenges) =
-        sumcheck::prove_sum_of_products(&weights, tensors, claimed_sum, &mut t);
+        sumcheck::prove_sum_of_products_owned(weights, values, claimed_sum, &mut t);
     let (open, evals) = whir.open_batch_multi(prover_data, protocol, num_tables, &challenges);
     Ok(BatchOpeningProof {
         sumcheck,
@@ -356,6 +463,14 @@ pub fn verify_batch_open_committed(
         return false;
     }
     let d = points[0].len();
+    if points.iter().any(|p| p.len() != d) {
+        return false;
+    }
+    if table_idxs.iter().any(|&t| t >= num_tables) {
+        return false;
+    }
+    // Same grouping as the prover: unique tables in first-appearance order.
+    let (unique, group_of) = claim_groups(table_idxs);
 
     // Fiat-Shamir (S1): absorb the statement, squeeze gamma, then replay the
     // sumcheck transcript against the proof's round messages — the fresh point
@@ -393,12 +508,19 @@ pub fn verify_batch_open_committed(
         return false;
     }
 
-    let mut expected = Goldilocks::ZERO;
+    // B(r) = sum_g W_g(r) * table_g(r), with the same gamma powers as the
+    // per-claim relation: sum_i gamma^i eq(r_i, r) * f_{t_i}(r). This is the
+    // identical authentication relation, only evaluated group-wise.
+    let mut w_at_r = vec![Goldilocks::ZERO; unique.len()];
     let mut gamma_pow = Goldilocks::ONE;
     for i in 0..n {
         let eq = mle::eq_poly(&points[i], &challenges);
-        expected = expected + gamma_pow * eq * evals[table_idxs[i]];
+        w_at_r[group_of[i]] = w_at_r[group_of[i]] + gamma_pow * eq;
         gamma_pow = gamma_pow * gamma;
+    }
+    let mut expected = Goldilocks::ZERO;
+    for g in 0..unique.len() {
+        expected = expected + w_at_r[g] * evals[unique[g]];
     }
 
     proof.sumcheck.b_eval == expected
@@ -511,6 +633,108 @@ mod tests {
             &points,
             &bad,
             &proof
+        ));
+    }
+
+    /// O5: claims that share a table are combined into one equality weight
+    /// `W_t(X) = sum_i gamma^i eq(r_i, X)`; the authentication relation (the
+    /// gamma-combination of the same claims against the same committed table)
+    /// must be unchanged. The grouped and per-claim prover paths must produce
+    /// the identical transcript/proof, and the verifier must reject a tampered
+    /// claim or a tampered public table index.
+    #[test]
+    fn same_table_multi_claim_grouping() {
+        use crate::pcs::committed::BatchCtx;
+        let mut rng = XorShift64::new(0x05_51);
+        let d = 8usize;
+        let tables: Vec<Vec<Goldilocks>> = (0..2)
+            .map(|_| (0..(1usize << d)).map(|_| rng.field()).collect())
+            .collect();
+        // Five claims over two tables, with repeated tables in a non-trivial
+        // order (the grouping order is first appearance: [0, 1]).
+        let table_idxs: Vec<usize> = vec![0, 1, 0, 0, 1];
+        let points: Vec<Vec<Goldilocks>> = (0..5)
+            .map(|_| (0..d).map(|_| rng.field()).collect())
+            .collect();
+        let claimed: Vec<Goldilocks> = table_idxs
+            .iter()
+            .zip(&points)
+            .map(|(&t, p)| mle::eval(&tables[t], p))
+            .collect();
+
+        let whir = Whir::new_testing(d);
+        let refs: Vec<&[Goldilocks]> = tables.iter().map(|t| t.as_slice()).collect();
+        let (commitment, prover_data, protocol, _batch_whir) = whir.commit_batch(&refs);
+        // The batch whir is sized for `num_tables * 2^d` slots.
+        let verify_whir = Whir::with_params(d + 1, 32, 10);
+        let ctx = |pd| BatchCtx {
+            commitment: commitment.clone(),
+            prover_data: pd,
+            protocol: protocol.clone(),
+            whir: Whir::with_params(d + 1, 32, 10),
+            num_tables: 2,
+        };
+
+        // Grouped (unique-tensor) prover: one owned tensor per unique table.
+        let grouped = prove_batch_open_committed_unique_owned(
+            ctx(prover_data.clone()), &table_idxs, tables.clone(), &points, &claimed,
+        )
+        .expect("grouped prove");
+        assert!(verify_batch_open_committed(
+            &verify_whir, &commitment, &protocol, 2,
+            &table_idxs, &points, &claimed, &grouped,
+        ));
+
+        // Legacy per-claim prover path must derive the same W_t and therefore
+        // produce a byte-identical proof.
+        let per_claim: Vec<Vec<Goldilocks>> =
+            table_idxs.iter().map(|&t| tables[t].clone()).collect();
+        let legacy = prove_batch_open_committed(
+            &ctx(prover_data), &table_idxs, &per_claim, &points, &claimed,
+        )
+        .expect("legacy prove");
+        assert_eq!(
+            bincode::serialize(&grouped.sumcheck).unwrap(),
+            bincode::serialize(&legacy.sumcheck).unwrap(),
+            "grouped and per-claim provers must agree on the sumcheck"
+        );
+        assert_eq!(grouped.evals, legacy.evals, "opened evaluations must agree");
+        assert!(verify_batch_open_committed(
+            &verify_whir, &commitment, &protocol, 2,
+            &table_idxs, &points, &claimed, &legacy,
+        ));
+
+        // Tampered claimed value: rejected.
+        let mut bad_claim = claimed.clone();
+        bad_claim[0] = bad_claim[0] + Goldilocks::ONE;
+        assert!(!verify_batch_open_committed(
+            &verify_whir, &commitment, &protocol, 2,
+            &table_idxs, &points, &bad_claim, &grouped,
+        ));
+
+        // Tampered public table index: the gamma-combination now points at the
+        // wrong committed table, so it must be rejected.
+        let mut bad_idxs = table_idxs.clone();
+        bad_idxs[0] = 1;
+        assert!(!verify_batch_open_committed(
+            &verify_whir, &commitment, &protocol, 2,
+            &bad_idxs, &points, &claimed, &grouped,
+        ));
+
+        // Out-of-range table index must fail closed (no panic).
+        let mut oob = table_idxs.clone();
+        oob[0] = 7;
+        assert!(!verify_batch_open_committed(
+            &verify_whir, &commitment, &protocol, 2,
+            &oob, &points, &claimed, &grouped,
+        ));
+
+        // Tampered final evaluation: rejected.
+        let mut bad_proof = grouped.clone();
+        bad_proof.sumcheck.b_eval = bad_proof.sumcheck.b_eval + Goldilocks::ONE;
+        assert!(!verify_batch_open_committed(
+            &verify_whir, &commitment, &protocol, 2,
+            &table_idxs, &points, &claimed, &bad_proof,
         ));
     }
 

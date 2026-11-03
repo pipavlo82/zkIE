@@ -366,14 +366,26 @@ pub fn prove_sum_of_products(
     claimed_sum: Goldilocks,
     transcript: &mut Transcript,
 ) -> (SumcheckProofBatch, Vec<Goldilocks>) {
+    prove_sum_of_products_owned(weights.to_vec(), values.to_vec(), claimed_sum, transcript)
+}
+
+/// Owned-buffer variant of [`prove_sum_of_products`]. The caller hands over the
+/// polynomial buffers, so the folding pass does not clone them; this matters
+/// for the weight batch opening, where each buffer can be gigabytes.
+pub fn prove_sum_of_products_owned(
+    weights: Vec<Vec<Goldilocks>>,
+    values: Vec<Vec<Goldilocks>>,
+    claimed_sum: Goldilocks,
+    transcript: &mut Transcript,
+) -> (SumcheckProofBatch, Vec<Goldilocks>) {
     let n = weights.len();
     assert!(n > 0, "empty batch");
     assert_eq!(values.len(), n);
     let t = weights[0].len().trailing_zeros() as usize;
 
     transcript.absorb_field(claimed_sum);
-    let mut w_bufs = weights.to_vec();
-    let mut v_bufs = values.to_vec();
+    let mut w_bufs = weights;
+    let mut v_bufs = values;
     let mut rounds = Vec::with_capacity(t);
     let mut challenges = Vec::with_capacity(t);
     for _ in 0..t {
