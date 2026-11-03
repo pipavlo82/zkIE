@@ -896,17 +896,24 @@ fn tie_zero_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
 }
 
 /// Shared by prove/verify: mles are [eq, P, t_b, P bits..., t_b bits...].
-/// Linear decompositions plus gamma-weighted bit Booleanity (claim 0).
+/// The two decompositions are gamma-SEPARATED so each is pinned pointwise,
+/// not just their sum:
+///   g^0: eq*(P  - sum_b 2^b P_b) = 0
+///   g^1: eq*(t_b - sum_b 2^b C_b) = 0
+/// followed by gamma^2-weighted bit Booleanity (claim 0). Sharing one gamma
+/// power would only pin P + t_b, letting a prover submit Boolean bit columns
+/// whose weighted sums are not bits(P)/bits(t_b); the less gadget consumes
+/// those columns directly, so that would let an arbitrary tied subset pass.
 fn tie_bits_terms(b_bits: usize, gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
-    let mut t = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (Goldilocks::ONE, vec![0usize, 2usize]),
-    ];
+    let mut t = vec![(Goldilocks::ONE, vec![0usize, 1usize])];
     for b in 0..b_bits {
         t.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 3 + b]));
-        t.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 3 + b_bits + b]));
     }
-    let mut g = gamma;
+    t.push((gamma, vec![0usize, 2usize]));
+    for b in 0..b_bits {
+        t.push((-gamma * Goldilocks::from_u64(1u64 << b), vec![0usize, 3 + b_bits + b]));
+    }
+    let mut g = gamma * gamma;
     for b in 0..b_bits {
         t.push((g, vec![0usize, 3 + b]));
         t.push((-g, vec![0usize, 3 + b, 3 + b]));
@@ -17239,6 +17246,106 @@ mod tests {
             var_tb[tie_tb_prev_col(b_bits)][pos] = tb_col[(pos + padded - 1) % padded];
         }
         assert!(run_case(var_tb), "per-position t_b forgery must be rejected by the row-constancy identity");
+    }
+
+    /// TL P0 (99fcc6b): tie_bits_terms combined the two decomposition
+    /// equations under one gamma^0, so the virtual only pinned P + t_b, not
+    /// each of them; the less virtual then consumed the forged bit columns
+    /// directly. This adversarial witness keeps the committed P/T/t_b
+    /// columns honest (rank recurrence and permutations pass) and commits
+    /// sum-preserving but non-decomposing Boolean bit columns for row 0:
+    /// Psum = [2,0,0,5,5,5,5,5], Csum = [0,3,4,0,0,0,0,0], so
+    /// Psum + Csum = P + t_b pointwise, while less(Psum, Csum) equals the
+    /// malicious selection [0,1,1,...]. The verifier must reject it once the
+    /// decompositions are gamma-separated (red before the fix).
+    #[test]
+    fn s7c_topk_tie_forged_bits_rejected() {
+        let (m, n, k) = (4usize, 8usize, 2usize);
+        let arity = (m * n).trailing_zeros() as usize;
+        let lgm = m.trailing_zeros() as usize;
+        let thr_arity = lgm.max(5);
+        let lgn = n.trailing_zeros() as usize;
+        let b_bits = tie_b_bits(lgn);
+        let padded = 1usize << arity;
+        let mut xv = vec![Goldilocks::ZERO; m * n];
+        let row0 = [5i64, 5, 5, 4, 0, 1, 2, 3];
+        for e in 0..n { xv[e] = from_i64(row0[e]); }
+        for r in 1..m { for e in 0..n { xv[r * n + e] = from_i64((r * 20 + e) as i64); } }
+        let (thr_v, fwd_sel, _g, _d1, _d2) = topk_forward(&xv, m, n, k);
+        assert_eq!(thr_v[0], from_i64(5));
+        assert_eq!(fwd_sel[0], Goldilocks::ONE);
+        // Malicious selection: row 0 picks tied positions 1,2 (not 0,1).
+        let mut sel_v = fwd_sel.clone();
+        for e in 0..n { sel_v[e] = if e == 1 || e == 2 { Goldilocks::ONE } else { Goldilocks::ZERO }; }
+        let mut gate_v = vec![Goldilocks::ZERO; m * n];
+        let mut d1_v = vec![Goldilocks::ZERO; m * n];
+        let mut d2_v = vec![Goldilocks::ZERO; m * n];
+        for r in 0..m {
+            for e in 0..n {
+                let at = r * n + e;
+                let sv = sel_v[at];
+                gate_v[at] = sv * xv[at];
+                d1_v[at] = if sv == Goldilocks::ONE { xv[at] - thr_v[r] } else { Goldilocks::ZERO };
+                d2_v[at] = if sv == Goldilocks::ZERO { thr_v[r] - xv[at] } else { Goldilocks::ZERO };
+            }
+        }
+        let mut thr_b = vec![Goldilocks::ZERO; m * n];
+        for r in 0..m { for e in 0..n { thr_b[r * n + e] = thr_v[r]; } }
+        let mut att = vec![Goldilocks::ZERO; m * n];
+        for r in 0..m {
+            for e in 0..n {
+                let at = r * n + e;
+                if sel_v[at] == Goldilocks::ONE && xv[at] == thr_v[r] { att[at] = Goldilocks::ONE; break; }
+            }
+        }
+        let wcols = topk_test_witness_columns(&sel_v, &thr_b, &att, &gate_v, &d1_v, &d2_v, m, n, arity);
+        let mut tcols = vec![vec![Goldilocks::ZERO; 1usize << thr_arity]];
+        for r in 0..m { tcols[0][r] = thr_v[r]; }
+        let mut store = Store::new();
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let op = Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k };
+        let outs = topk_test_outs(&op, &wcols, &tcols, arity, lgm, thr_arity);
+        // Honest tie columns for the malicious selection, then forge only
+        // row 0's decomposition bit columns (sum-preserving) and rebuild E.
+        let mut tie_cols = topk_test_tie_columns(&sel_v, &d1_v, &d2_v, m, n, arity);
+        let psum = [2u64, 0, 0, 5, 5, 5, 5, 5];
+        let csum = [0u64, 3, 4, 0, 0, 0, 0, 0];
+        for e in 0..n {
+            for b in 0..b_bits {
+                tie_cols[tie_p_bits_col(b)][e] = Goldilocks::from_u64((psum[e] >> b) & 1);
+                tie_cols[tie_tb_bits_col(b_bits, b)][e] = Goldilocks::from_u64((csum[e] >> b) & 1);
+            }
+        }
+        for at in 0..padded {
+            let mut eq = Goldilocks::ONE;
+            for b in (0..b_bits).rev() {
+                tie_cols[tie_eq_col(b_bits, b)][at] = eq;
+                if tie_cols[tie_p_bits_col(b)][at] != tie_cols[tie_tb_bits_col(b_bits, b)][at] {
+                    eq = Goldilocks::ZERO;
+                }
+            }
+        }
+        let witness = topk_test_commit(0, AuxRole::TopKSelectWitness, m * n, arity, wcols);
+        let thr_aux = topk_test_commit(0, AuxRole::TopKSelectThr, m, thr_arity, tcols);
+        let range = topk_test_range_commit(&xv, m, n, arity, 0);
+        let thr_range = topk_test_thr_range_commit(&thr_v, m, n, arity, 0);
+        let tie = topk_test_commit(0, AuxRole::TopKSelectTie, m * n, arity, tie_cols);
+        let wdesc = witness.descriptor.clone();
+        let tdesc = thr_aux.descriptor.clone();
+        let rdesc = range.descriptor.clone();
+        let trdesc = thr_range.descriptor.clone();
+        let tiedesc = tie.descriptor.clone();
+        let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-forged-bits");
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp)
+            .expect("malicious tie witness is producible");
+        let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-forged-bits");
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad.0, &mut tv).is_none(),
+            "sum-preserving forged bit decompositions must be rejected");
     }
 
     /// P0 (TL): the 16-bit field gap only shows the field difference is small,
