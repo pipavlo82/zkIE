@@ -19,8 +19,15 @@ closed: BatchedMatMul, Softmax,
 SoftmaxIndex, StableSoftmaxIndex, LayerNorm/RmsNorm/RoPE, ScaleVec with rounding
 shifts, plus every op whose index inputs are not authenticated. TopKSelect's final acceptance still requires the gist/forward
 deterministic smaller-index tie-break on real tied inputs (the current path
-refuses boundary ties); Scatter routing, the gate-consistency chain and the real
-DeepSeek single layer are not done. GPT-2 support therefore still requires the
+refuses boundary ties); Scatter routing and the real DeepSeek single layer are
+not done. Gate consistency (TL hardening, 2026-11-04): a static (non-op-written)
+Lookup table anywhere in the Gather.gate producer closure, or in the
+BroadcastScale scale slot reached from Gather.weighted through Scale/ScaleVec,
+now fails closed; this covers the real MoE graph pattern (the router gate enters
+via BroadcastScale.scale). Limitation: only the weighted-side Scale/ScaleVec
+chain is traversed; other ops (e.g. Add) mixed into that chain are outside this
+fix. The real silu GeluIndex (table_len 2^24 > RELU_BOUND 2^22) remains
+fail-closed and is a separate reduction item. GPT-2 support therefore still requires the
 norm and softmax operators. The legacy committed verifier permanently rejects.
 Model support must not be reported complete until the real graph has been
 migrated and tested.

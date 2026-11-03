@@ -10761,6 +10761,64 @@ fn graph_equal_shapes(ops: &[Op], lengths: &std::collections::BTreeMap<T, usize>
     Some(())
 }
 
+/// S7 gate consistency (TL correction 1/2): reject any STATIC Lookup table in
+/// the provenance of a gate/scale slot. `slot` is a field tensor carrying gate
+/// content; walk the producer closure through every input of every producer,
+/// so a gate routed through Scale/ScaleVec/BroadcastScale (or any other op)
+/// cannot be sourced from an unproven static table. Any static table content
+/// in the slot is not tied to the router output, so the graph fails closed.
+/// Unknown op IO falls back to the raw read set.
+fn reject_static_lookup_ancestors(
+    ops: &[Op], slot: T, field_written: &std::collections::BTreeSet<T>,
+) -> Option<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![slot];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) { continue; }
+        for producer in ops {
+            let (reads, writes) = match reverse_op_io(producer) {
+                Some((rs, ws)) => (rs, ws),
+                None => (producer.reads(), producer.writes()),
+            };
+            if !writes.contains(&id) { continue; }
+            if let Op::Lookup { table, .. } = producer {
+                if !field_written.contains(table) { return None; }
+            }
+            stack.extend(reads);
+        }
+    }
+    Some(())
+}
+
+/// S7 gate consistency for the real MoE graph pattern: the router gate enters
+/// through the BroadcastScale that weights the expert output, followed by a
+/// linear Scale/ScaleVec chain into `Gather.weighted`. Walk ONLY the weighted
+/// side through Scale/ScaleVec (never the BroadcastScale x/data side, which
+/// may legitimately be caller data such as the down projection), and apply
+/// the full-closure static-Lookup rule to the BroadcastScale scale slot.
+fn reject_static_gate_on_weighted(
+    ops: &[Op], weighted: T, field_written: &std::collections::BTreeSet<T>,
+) -> Option<()> {
+    let mut cur = weighted;
+    let mut seen = std::collections::BTreeSet::new();
+    while seen.insert(cur) {
+        let producer = ops.iter().find(|op| {
+            let writes = match reverse_op_io(op) { Some((_, ws)) => ws, None => op.writes() };
+            writes.contains(&cur)
+        });
+        match producer {
+            None => return Some(()),
+            Some(Op::Scale { x, .. }) => cur = *x,
+            Some(Op::ScaleVec { x, .. }) => cur = *x,
+            Some(Op::BroadcastScale { scale, .. }) => {
+                return reject_static_lookup_ancestors(ops, *scale, field_written);
+            }
+            Some(_) => return Some(()),
+        }
+    }
+    Some(())
+}
+
 fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<std::collections::BTreeMap<T, (usize, usize)>> {
     if model.graph != bincode::serialize(ops).ok()? { return None; }
     graph_equal_shapes(ops, &model.tensor_lengths)?;
@@ -10821,24 +10879,19 @@ fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<
             _ => {}
         }
     }
-    // S7 gate consistency: a Gather gate produced by a Lookup whose table is
-    // a STATIC model table cannot be tied to the router output. Such graphs
-    // fail closed; the table must be an op-produced (dynamic) tensor, e.g.
-    // the TopKSelect gate, authenticated by the returned table claim.
+    // S7 gate consistency (TL hardening): static (non-op-written) Lookup
+    // tables in the gate or gate-scale provenance are unproven table content
+    // and fail closed. Two checks: the Gather.gate slot itself (the original
+    // direct rule, generalized to a closure), and the BroadcastScale.scale
+    // slot reached from Gather.weighted through the real-graph linear chain.
+    // The weighted-side walk covers only Scale/ScaleVec; other ops mixed into
+    // that chain (e.g. Add) are outside this fix and documented in the
+    // tracker.
     let field_written = op_field_writes(ops);
     for op in ops {
-        if let Op::Gather { gate, .. } = op {
-            for producer in ops {
-                let writes = match reverse_op_io(producer) {
-                    Some((_, ws)) => ws,
-                    None => producer.writes(),
-                };
-                if writes.contains(gate) {
-                    if let Op::Lookup { table, .. } = producer {
-                        if !field_written.contains(table) { return None; }
-                    }
-                }
-            }
+        if let Op::Gather { weighted, gate, .. } = op {
+            reject_static_lookup_ancestors(ops, *gate, &field_written)?;
+            reject_static_gate_on_weighted(ops, *weighted, &field_written)?;
         }
     }
     let expected: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
@@ -18424,6 +18477,134 @@ mod tests {
         assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
             &PublicStatement::Generic, &model, &execution).is_none(),
             "a static gate table feeding a Gather gate must fail closed (cannot be tied to the router output)");
+    }
+
+    /// TL correction 2 (transitivity): the real graph applies the router gate
+    /// via BroadcastScale.scale, not Gather.gate. A static Lookup routed
+    /// through Scale(shift=0) into the BroadcastScale scale slot must be
+    /// rejected; this bypasses a check that only looks for a direct Lookup
+    /// producer of the scale.
+    #[test]
+    fn s7c_gate_chain_static_table_via_scale_slot_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, n, k, h) = (4usize, 8usize, 2usize, 4usize);
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
+        let dv: Vec<Goldilocks> = (0..m * k * h).map(|i| from_i64(((i * 5) % 11) as i64 - 5)).collect();
+        let (thr_v, _sel_v, gate_v, d1_v, d2_v) = topk_forward(&xv, m, n, k);
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let token_id = store.push_idx(vec![]);
+        let expert_of = store.push_idx(vec![]);
+        let idx = store.push_idx(vec![]);
+        let gate_pos_raw = store.push(vec![]);
+        let gate_pos_scaled = store.push(vec![]);
+        let d = store.push(dv.clone());
+        let weighted = store.push(vec![]);
+        let ones = store.push(vec![Goldilocks::ONE; m * k]);
+        let out = store.push(vec![]);
+        let mut bad_table = gate_v.clone();
+        bad_table[0] = bad_table[0] + Goldilocks::ONE;
+        let gate_table = store.push(bad_table);
+        let ops = vec![
+            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k },
+            Op::Scatter { sel, token_id, expert_of, m, n },
+            Op::CombineIdx { a: token_id, b: expert_of, scale: n, out: idx },
+            Op::Lookup { idx, out: gate_pos_raw, table: gate_table },
+            Op::Scale { x: gate_pos_raw, out: gate_pos_scaled, factor: 1, shift: 0 },
+            Op::BroadcastScale { x: d, scale: gate_pos_scaled, out: weighted, h },
+            Op::Gather { weighted, token_id, gate: ones, out, m, h },
+        ];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-gate-scale-static");
+        forward_ops(&mut store, &ops);
+        let s = store.idx[token_id].len();
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(token_id, s), (expert_of, s), (idx, s)].into());
+        let execution = TrustedExecution {
+            inputs: [(x, xv.clone()), (d, dv.clone()), (ones, vec![Goldilocks::ONE; s])].into(),
+            outputs: [
+                (thr, thr_v.clone()), (gate, gate_v.clone()),
+                (d1, d1_v.clone()), (d2, d2_v.clone()),
+                (out, store.get(out).to_vec()),
+            ].into(),
+        };
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).is_none(),
+            "a static Lookup through the BroadcastScale scale slot must fail closed");
+    }
+
+    /// TL correction 1 (symmetry): the Gather.gate slot must get the same
+    /// closure. Here the gate is Scale(BroadcastScale(ones, static Lookup-out,
+    /// h=1)); an implementation that only checks a direct Lookup producer of
+    /// Gather.gate would accept it.
+    #[test]
+    fn s7c_gather_gate_static_via_broadcast_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, n, k, h) = (4usize, 8usize, 2usize, 4usize);
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
+        let dv: Vec<Goldilocks> = (0..m * k * h).map(|i| from_i64(((i * 5) % 11) as i64 - 5)).collect();
+        let (thr_v, _sel_v, gate_v, d1_v, d2_v) = topk_forward(&xv, m, n, k);
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let token_id = store.push_idx(vec![]);
+        let expert_of = store.push_idx(vec![]);
+        let idx = store.push_idx(vec![]);
+        let gate_pos = store.push(vec![]);
+        let d = store.push(dv.clone());
+        let weighted = store.push(vec![]);
+        let idx_s = store.push_idx(vec![0u32; m * k]);
+        let lookup_gate = store.push(vec![]);
+        let ones_s = store.push(vec![Goldilocks::ONE; m * k]);
+        let gate_bcast = store.push(vec![]);
+        let gate_scaled = store.push(vec![]);
+        let out = store.push(vec![]);
+        let mut bad_small = vec![Goldilocks::ONE; m * k];
+        bad_small[0] = Goldilocks::from_u64(3);
+        let bad_table_s = store.push(bad_small);
+        let ops = vec![
+            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k },
+            Op::Scatter { sel, token_id, expert_of, m, n },
+            Op::CombineIdx { a: token_id, b: expert_of, scale: n, out: idx },
+            Op::Lookup { idx, out: gate_pos, table: gate },
+            Op::BroadcastScale { x: d, scale: gate_pos, out: weighted, h },
+            Op::Lookup { idx: idx_s, out: lookup_gate, table: bad_table_s },
+            Op::BroadcastScale { x: ones_s, scale: lookup_gate, out: gate_bcast, h: 1 },
+            Op::Scale { x: gate_bcast, out: gate_scaled, factor: 1, shift: 0 },
+            Op::Gather { weighted, token_id, gate: gate_scaled, out, m, h },
+        ];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-gate-bcast-static");
+        forward_ops(&mut store, &ops);
+        let s = store.idx[token_id].len();
+        let ik_s = TensorKey::Index(idx_s).encoded().unwrap();
+        let zeros_g: Vec<Goldilocks> = vec![Goldilocks::ZERO; s];
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(token_id, s), (expert_of, s), (idx, s), (idx_s, s)].into());
+        let execution = TrustedExecution {
+            inputs: [
+                (x, xv.clone()), (d, dv.clone()),
+                (ones_s, vec![Goldilocks::ONE; s]),
+                (ik_s, zeros_g),
+            ].into(),
+            outputs: [
+                (thr, thr_v.clone()), (gate, gate_v.clone()),
+                (d1, d1_v.clone()), (d2, d2_v.clone()),
+                (out, store.get(out).to_vec()),
+            ].into(),
+        };
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).is_none(),
+            "a static Lookup through the Gather.gate BroadcastScale slot must fail closed");
     }
     #[test]
     fn s2_matmul32_empty_commitments_rejected() {

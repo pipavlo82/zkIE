@@ -1,7 +1,5 @@
-//! SEGMENTED real-data proofs through the expert GATE PROJECTION (bound/bytes
-//! entry), two-statement shape. This is NOT the complete S7 core chain: it
-//! stops at the gate-projection Scale and does not include the router gate
-//! consistency chain (CombineIdx/Lookup gate_pos/dynamic table) or Gather.
+//! SEGMENTED real-data proofs (bound/bytes entry), three-statement shape.
+//! This is NOT the complete S7 core chain and NOT S7 acceptance.
 //!
 //! The single-statement chain cannot certify its internal routing INDEX
 //! intermediates: IdxBroadcast requires the base to be verifier-replayable
@@ -16,10 +14,26 @@
 //!      -> Lookup(real post-attn activation table) -> BroadcastScale(mask)
 //!      -> GatherMatMul(real expert gate weights) -> Scale(shift 16)
 //!      public outputs: g
+//!   C: scores + caller-supplied real expert-FFN down projection d ->
+//!      TopKSelect -> Scatter -> PadIdx -> CombineIdx
+//!      -> Lookup(table = the DYNAMIC TopK gate) -> BroadcastScale(d, gate)
+//!      -> Scale(shift 16) -> Gather -> out
+//!      public outputs: thr, gate, d1, d2, out
 //!
 //! IdxBroadcast in B uses the existing verifier replay path, which checks
 //! the public index values are < 2^32 and uses checked u32 arithmetic for
 //! b*base+j. No reduction is added and no constraint is bypassed.
+//!
+//! C proves the router-gate consistency chain (the Lookup table is the same
+//! tensor as the TopKSelect gate, authenticated by the returned table claim)
+//! and the Gather scatter-add over the real router scores and real d.
+//! LIMITATION (GeluIndex, fail-closed): the expert FFN bound proof (gate/up/
+//! silu/down through d) is blocked because the real GeluIndex silu table has
+//! 2^24 entries while `prove_reverse_gelu_index` accepts only
+//! table_len <= RELU_BOUND = 2^22. d is therefore computed by the caller with
+//! the model's exact forward ops and supplied as a caller-trusted public
+//! input; C does not prove d's FFN provenance. The limit is a separate
+//! reduction item and stays fail-closed.
 //! TRUSTED-OFFLINE NOTE: the composition verifier authenticates the 8-expert
 //! slice TENSOR commitment and the public slice index mapping, but it does
 //! NOT prove that this slice equals the corresponding rows of the full
@@ -27,12 +41,12 @@
 //! manifest / external modeling (here: the explicit slice_experts list
 //! applied to the real L*_experts_gate_i32.bin file).
 //!
-//! BOUNDARY (not gist S7 acceptance): the verifier of B ingests the full
-//! routing arrays as public data, which the gist forbids for the final S7
-//! construction. The A/B link is a caller-trusted external statement (the
-//! SAME arrays populate A's public outputs and B's public inputs, bound
-//! item-by-item below); it is a segmented real-data experiment, not a
-//! single-statement S7 proof.
+//! BOUNDARY (not gist S7 acceptance): the verifiers of B and C ingest the
+//! full routing arrays as public data, which the gist forbids for the final
+//! S7 construction. The A/B/C links are caller-trusted external statement
+//! values (the SAME arrays/outputs populate A's outputs, B's inputs, and C's
+//! inputs, bound item-by-item below), and C's d is caller-computed; it is a
+//! segmented real-data experiment, not a single-statement S7 proof.
 //!
 //! Real inputs: scripts/ds_layer_core_inputs.py exports the layer-L post-attn
 //! activation and the Q16 router scores with the model's fixed-point recipe.
@@ -76,9 +90,8 @@ fn peak_rss_kb() -> u64 {
 /// from the 64-expert file. The full 2^28 matrix opening OOMs on the
 /// 495GB machine (reported separately); the slice keeps the SAME real
 /// weights for the routed experts.
-fn load_expert_slice(dir: &str, layer: usize, experts: &[usize]) -> Vec<Goldilocks> {
-    let bytes = std::fs::read(format!("{dir}/L{layer}_experts_gate_i32.bin"))
-        .expect("read expert gate weights");
+fn load_expert_slice_file(path: &str, experts: &[usize]) -> Vec<Goldilocks> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let block = H * MOE_PAD * 4;
     let mut out = Vec::with_capacity(experts.len() * H * MOE_PAD);
     for &e in experts {
@@ -87,6 +100,10 @@ fn load_expert_slice(dir: &str, layer: usize, experts: &[usize]) -> Vec<Goldiloc
             .map(|c| from_i32(i32::from_le_bytes([c[0], c[1], c[2], c[3]]))));
     }
     out
+}
+
+fn load_expert_slice(dir: &str, layer: usize, experts: &[usize]) -> Vec<Goldilocks> {
+    load_expert_slice_file(&format!("{dir}/L{layer}_experts_gate_i32.bin"), experts)
 }
 
 fn ops_a_input(ops: &[Op]) -> Option<usize> {
@@ -119,6 +136,13 @@ struct CoreStatement {
     exp_routing: Vec<u32>,
     mask: Vec<Goldilocks>,
     g: Vec<Goldilocks>,
+    /// Caller-computed real expert-FFN down-projection output (C input).
+    /// NOT proven by any segment: the FFN bound proof is blocked at the real
+    /// GeluIndex table_len = 2^24 > RELU_BOUND = 2^22 (fail-closed), reported
+    /// to the TL. C consumes it as a caller-trusted public input.
+    d: Vec<Goldilocks>,
+    /// Router-gate chain + Gather output over `d` (C output).
+    out: Vec<Goldilocks>,
     /// Real expert ids for the 8 slice rows (6 routed + 2 real padding).
     slice_experts: Vec<usize>,
     /// Per padded position: slice row index for exp_routing[i].
@@ -164,15 +188,32 @@ fn reverse_keys(ops: &[Op]) -> Option<(usize, usize)> {
     Some((tok?, exp?))
 }
 
+fn ops_c_scores_input(ops: &[Op]) -> Option<usize> {
+    ops.iter().find_map(|op| if let Op::TopKSelect { x, .. } = op { Some(*x) } else { None })
+}
+fn ops_c_d_input(ops: &[Op]) -> Option<usize> {
+    ops.iter().find_map(|op| if let Op::BroadcastScale { x, .. } = op { Some(*x) } else { None })
+}
+fn ops_c_out(ops: &[Op]) -> Option<usize> {
+    ops.iter().find_map(|op| if let Op::Gather { out, .. } = op { Some(*out) } else { None })
+}
+fn ops_c_ones_input(ops: &[Op]) -> Option<usize> {
+    ops.iter().find_map(|op| if let Op::Gather { gate, .. } = op { Some(*gate) } else { None })
+}
+
 /// Independent composition verifier: consumes ONLY the caller-trusted
-/// statement, both proof byte strings, the two models and their op graphs.
+/// statement, the three proof byte strings, the models and their op graphs.
 /// It derives each segment's execution item-by-item, rejects an invalid
 /// slice identity (unknown expert, duplicate identity, wrong padding row) and
-/// both segment mismatches. No cryptographic reduction is added.
+/// segment mismatches. No cryptographic reduction is added. Segment C proves
+/// the router-gate consistency chain + Gather over the caller-supplied real
+/// down-projection `d`; `d` itself is NOT proven (the FFN bound proof is
+/// blocked at GeluIndex table_len 2^24 > 2^22, fail-closed).
 fn verify_segmented(
     stmt: &CoreStatement,
     ops_a: &[Op], model_a: &TrustedModelManifest, bytes_a: &[u8],
     ops_b: &[Op], model_b: &TrustedModelManifest, bytes_b: &[u8],
+    ops_c: &[Op], model_c: &TrustedModelManifest, bytes_c: &[u8],
     whir: &Whir,
 ) -> bool {
     if stmt.tok_routing.len() != stmt.exp_routing.len() { return false; }
@@ -204,8 +245,30 @@ fn verify_segmented(
         ].into(),
         outputs: [(b_out, stmt.g.clone())].into(),
     };
+    let c_scores = match ops_c_scores_input(ops_c) { Some(v) => v, None => return false };
+    let c_d = match ops_c_d_input(ops_c) { Some(v) => v, None => return false };
+    let c_ones = match ops_c_ones_input(ops_c) { Some(v) => v, None => return false };
+    let c_out = match ops_c_out(ops_c) { Some(v) => v, None => return false };
+    let c_s_pad = stmt.s.next_power_of_two();
+    let c0 = match ops_a_output_field(ops_c, 0) { Some(v) => v, None => return false };
+    let c1 = match ops_a_output_field(ops_c, 1) { Some(v) => v, None => return false };
+    let c2 = match ops_a_output_field(ops_c, 2) { Some(v) => v, None => return false };
+    let c3 = match ops_a_output_field(ops_c, 3) { Some(v) => v, None => return false };
+    let exec_c = TrustedExecution {
+        inputs: [
+            (c_scores, stmt.scores.clone()),
+            (c_d, stmt.d.clone()),
+            (c_ones, vec![Goldilocks::ONE; c_s_pad]),
+        ].into(),
+        outputs: [
+            (c0, stmt.thr.clone()), (c1, stmt.gate.clone()),
+            (c2, stmt.d1.clone()), (c3, stmt.d2.clone()),
+            (c_out, stmt.out.clone()),
+        ].into(),
+    };
     verify_committed_shard_dag_bound_bytes(bytes_a, ops_a, 1, whir, &PublicStatement::Generic, model_a, &exec_a)
         && verify_committed_shard_dag_bound_bytes(bytes_b, ops_b, 1, whir, &PublicStatement::Generic, model_b, &exec_b)
+        && verify_committed_shard_dag_bound_bytes(bytes_c, ops_c, 1, whir, &PublicStatement::Generic, model_c, &exec_c)
 }
 
 fn to_g(v: &[u32]) -> Vec<Goldilocks> {
@@ -223,8 +286,10 @@ fn main() {
     let s_pad = s.next_power_of_two();
     let scores_v = load_i32(&format!("{dir}/L{layer}_core_scores_i32.bin"));
     let act_v = load_i32(&format!("{dir}/L{layer}_core_act_i32.bin"));
+    let silu_v = load_i32(&format!("{dir}/silu_table_i32.bin"));
     assert_eq!(scores_v.len(), m * N, "real router scores length");
     assert_eq!(act_v.len(), m * H, "real activation length");
+    assert_eq!(silu_v.len(), 1 << 24, "real silu table length");
     let max_abs = scores_v.iter().map(|v| { let x = to_i64(*v); if x < 0 { -x } else { x } }).max().unwrap();
     let max_v = scores_v.iter().map(|v| to_i64(*v)).max().unwrap();
     println!("layer={layer} seq=1 k={K} real scores: max|.|={max_abs} max={max_v}");
@@ -364,6 +429,125 @@ fn main() {
         ].into(),
         outputs: [(g, g_v.clone())].into(),
     };
+
+    // ---------------- Phase C input: real expert-FFN down projection ----------------
+    // Caller-computed real d using the model's exact ops (ScaleVec shift=16),
+    // forward only. The FFN BOUND proof is blocked at the real GeluIndex
+    // table_len = 2^24 > RELU_BOUND = 2^22 (fail-closed); reported to the TL.
+    // C consumes d as a caller-trusted public input.
+    let mut sd = Store::new();
+    let tok_d = sd.push_idx(tok_v.clone());
+    let exp_d = sd.push_idx(exp_slice.clone());
+    let mask_d = sd.push(mask_v.clone());
+    let act_d = sd.push(act_v.clone());
+    let idx_d = sd.push_idx(vec![]);
+    let seg_d = sd.push(vec![]);
+    let segz_d = sd.push(vec![]);
+    let graw_d = sd.push(vec![]);
+    let g_d = sd.push(vec![]);
+    let wg_d = sd.push(load_expert_slice(&dir, layer, &slice_experts));
+    let wu_d = sd.push(load_expert_slice_file(&format!("{dir}/L{layer}_experts_up_i32.bin"), &slice_experts));
+    let uraw_d = sd.push(vec![]);
+    let u_d = sd.push(vec![]);
+    let silu_t_d = sd.push(silu_v.clone());
+    let sidx_d = sd.push_idx(vec![]);
+    let silu_d = sd.push(vec![]);
+    let ffn_d = sd.push(vec![]);
+    let wd_d = sd.push(load_expert_slice_file(&format!("{dir}/L{layer}_experts_down_i32.bin"), &slice_experts));
+    let draw_d = sd.push(vec![]);
+    let d_t = sd.push(vec![]);
+    let ops_d = vec![
+        Op::IdxBroadcast { base: tok_d, out: idx_d, b: H },
+        Op::Lookup { idx: idx_d, out: seg_d, table: act_d },
+        Op::BroadcastScale { x: seg_d, scale: mask_d, out: segz_d, h: H },
+        Op::GatherMatMul { a: segz_d, expert_of: exp_d, w: wg_d, c: graw_d, s: s_pad, k: H, n: MOE_PAD, n_experts: 8 },
+        Op::Scale { x: graw_d, out: g_d, factor: 1, shift: 16 },
+        Op::GatherMatMul { a: segz_d, expert_of: exp_d, w: wu_d, c: uraw_d, s: s_pad, k: H, n: MOE_PAD, n_experts: 8 },
+        Op::Scale { x: uraw_d, out: u_d, factor: 1, shift: 16 },
+        Op::GeluIndex { x: g_d, out: sidx_d, offset: 1 << 23, table_len: 1 << 24 },
+        Op::Lookup { idx: sidx_d, out: silu_d, table: silu_t_d },
+        Op::ScaleVec { x: silu_d, scale: u_d, out: ffn_d, shift: 16 },
+        Op::GatherMatMul { a: ffn_d, expert_of: exp_d, w: wd_d, c: draw_d, s: s_pad, k: MOE_PAD, n: H, n_experts: 8 },
+        Op::Scale { x: draw_d, out: d_t, factor: 1, shift: 16 },
+    ];
+    let t_d = Instant::now();
+    evaluate_ops(&mut sd, &ops_d);
+    let d_v = sd.get(d_t).to_vec();
+    println!("D forward {:?} d_len={} (caller-computed; FFN proof blocked at GeluIndex 2^24 > 2^22)",
+        t_d.elapsed(), d_v.len());
+
+    // ---------------- Phase C: router-gate consistency chain + Gather ----------------
+    // TopKSelect re-derives the router gate from the same real scores; the
+    // Lookup table is the DYNAMIC TopK gate tensor (not a static table), so
+    // the reduction ties gate_pos to the router output. d is the real
+    // down-projection supplied as a caller-trusted public input.
+    let mut sc = Store::new();
+    let scores_c = sc.push(scores_v.clone());
+    let sel_c = sc.push(vec![]);
+    let thr_c = sc.push(vec![]);
+    let gate_c = sc.push(vec![]);
+    let d1_c = sc.push(vec![]);
+    let d2_c = sc.push(vec![]);
+    let tok_c = sc.push_idx(vec![]);
+    let exp_c = sc.push_idx(vec![]);
+    let tokp_c = sc.push_idx(vec![]);
+    let expp_c = sc.push_idx(vec![]);
+    let idxg_c = sc.push_idx(vec![]);
+    let gpos_c = sc.push(vec![]);
+    let d_c = sc.push(d_v.clone());
+    let wraw_c = sc.push(vec![]);
+    let w_c = sc.push(vec![]);
+    let ones_c = sc.push(vec![Goldilocks::ONE; s_pad]);
+    let out_c = sc.push(vec![]);
+    let ops_c = vec![
+        Op::TopKSelect { x: scores_c, sel: sel_c, thr: thr_c, gate: gate_c, d1: d1_c, d2: d2_c, m, n: N, k: K },
+        Op::Scatter { sel: sel_c, token_id: tok_c, expert_of: exp_c, m, n: N },
+        Op::PadIdx { base: tok_c, out: tokp_c, len: s_pad, base_len: s },
+        Op::PadIdx { base: exp_c, out: expp_c, len: s_pad, base_len: s },
+        Op::CombineIdx { a: tokp_c, b: expp_c, out: idxg_c, scale: N },
+        Op::Lookup { idx: idxg_c, out: gpos_c, table: gate_c },
+        Op::BroadcastScale { x: d_c, scale: gpos_c, out: wraw_c, h: H },
+        Op::Scale { x: wraw_c, out: w_c, factor: 1, shift: 16 },
+        Op::Gather { weighted: w_c, token_id: tokp_c, gate: ones_c, out: out_c, m, h: H },
+    ];
+    let t_c = Instant::now();
+    evaluate_ops(&mut sc, &ops_c);
+    let c_fwd_t = t_c.elapsed();
+    let out_v = sc.get(out_c).to_vec();
+    assert_eq!(sc.get(thr_c), thr_v.as_slice(), "C router threshold matches A");
+    assert_eq!(sc.get(gate_c), gate_v.as_slice(), "C router gate matches A");
+    assert_eq!(sc.get(d1_c), d1_v.as_slice(), "C d1 matches A");
+    assert_eq!(sc.get(d2_c), d2_v.as_slice(), "C d2 matches A");
+    let exec_c = TrustedExecution {
+        inputs: [
+            (scores_c, scores_v.clone()),
+            (d_c, d_v.clone()),
+            (ones_c, vec![Goldilocks::ONE; s_pad]),
+        ].into(),
+        outputs: [
+            (thr_c, thr_v.clone()), (gate_c, gate_v.clone()),
+            (d1_c, d1_v.clone()), (d2_c, d2_v.clone()),
+            (out_c, out_v.clone()),
+        ].into(),
+    };
+    let cache_c = format!("{cache}-c");
+    let cached_c = commit_model_weights(&sc, &ops_c, &cache_c);
+    let model_c = TrustedModelManifest::from_offline_commitment(&cached_c, &sc.owned_slices(), &ops_c)
+        .with_index_shapes(&[
+            (tok_c, s), (exp_c, s), (tokp_c, s_pad), (expp_c, s_pad), (idxg_c, s_pad),
+        ].into());
+    let t_cp = Instant::now();
+    let proof_c = prove_committed_shard_dag_bound(&mut sc, &ops_c, 1, &whir, &cached_c, 0, 0,
+        &PublicStatement::Generic, &model_c, &exec_c)
+        .expect("phase C router-gate + Gather proof");
+    let bytes_c = bincode::serialize(&proof_c).expect("serialize C");
+    let t_cv = Instant::now();
+    assert!(verify_committed_shard_dag_bound_bytes(&bytes_c, &ops_c, 1, &whir,
+        &PublicStatement::Generic, &model_c, &exec_c), "phase C must verify");
+    let c_verify_t = t_cv.elapsed();
+    println!("C forward {:?} commit+prove {:?} verify {:?} bytes {} out_len={}",
+        c_fwd_t, t_cp.elapsed(), c_verify_t, bytes_c.len(), out_v.len());
+
     // Same trusted statement on the B side: the prover recomputed these
     // arrays from its own forward, so also assert they equal the A outputs
     // used above (item by item), never comparing proof self-reported fields.
@@ -384,6 +568,7 @@ fn main() {
         d1: d1_v.clone(), d2: d2_v.clone(),
         tok_routing: tok_v.clone(), exp_routing: exp_v.clone(),
         mask: mask_v.clone(), g: g_v.clone(),
+        d: d_v.clone(), out: out_v.clone(),
         slice_experts: slice_experts.clone(), slice: exp_slice.clone(), s,
     };
     let cache_b = format!("{cache}-b");
@@ -404,16 +589,16 @@ fn main() {
     let b_verify_t = t4.elapsed();
     // Independent composition verification (caller statement + both proofs
     // + models + ops only).
-    assert!(verify_segmented(&stmt, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b, &whir),
+    assert!(verify_segmented(&stmt, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b, &ops_c, &model_c, &bytes_c, &whir),
         "segmented honest composition must verify");
     println!("composition honest verify ok");
     let mut bad_remap = stmt.clone();
     bad_remap.slice_experts[1] = bad_remap.slice_experts[0];
-    assert!(!verify_segmented(&bad_remap, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b, &whir),
+    assert!(!verify_segmented(&bad_remap, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b, &ops_c, &model_c, &bytes_c, &whir),
         "duplicate slice identity must be rejected");
     let mut bad_slice = stmt.clone();
     bad_slice.slice[0] = bad_slice.slice[1];
-    assert!(!verify_segmented(&bad_slice, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b, &whir),
+    assert!(!verify_segmented(&bad_slice, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b, &ops_c, &model_c, &bytes_c, &whir),
         "statement slice/routing mismatch must be rejected");
     println!("negative rejected: invalid slice identity / slice mismatch");
     // Cross-segment: B2 is INDIVIDUALLY valid for statement S2 (routing swap)
@@ -451,7 +636,7 @@ fn main() {
     let bytes_b2 = bincode::serialize(&proof_b2).expect("serialize B2");
     assert!(verify_committed_shard_dag_bound_bytes(&bytes_b2, &ops2, 1, &whir,
         &PublicStatement::Generic, &model_b, &exec_b2), "B2 must be individually valid");
-    assert!(!verify_segmented(&stmt, &ops_a, &model_a, &bytes_a, &ops2, &model_b, &bytes_b2, &whir),
+    assert!(!verify_segmented(&stmt, &ops_a, &model_a, &bytes_a, &ops2, &model_b, &bytes_b2, &ops_c, &model_c, &bytes_c, &whir),
         "cross-segment A1 + B2 mismatch must be rejected");
     println!("negative rejected: cross-segment individually-valid A1+B2 mismatch");
     println!("B commit+prove {:?} verify {:?} bytes {} peak_rss={}kB",
@@ -544,5 +729,92 @@ fn main() {
     assert!(!verify_committed_shard_dag_bound_bytes(&bytes_b, &ops_b, 1, &whir,
         &PublicStatement::Generic, &model2, &execution_b), "wrong activation table root must be rejected");
     println!("negative rejected: wrong activation table root");
-    println!("SEGMENT-OK layer={layer} (through expert gate projection) A_bytes={} B_bytes={}", bytes_a.len(), bytes_b.len());
+
+    // ---------------- Phase C negatives (real router scores + real d) ----------------
+    let mut bad_c_d = exec_c.clone();
+    bad_c_d.inputs.get_mut(&d_c).unwrap()[0] = bad_c_d.inputs[&d_c][0] + Goldilocks::ONE;
+    assert!(!verify_committed_shard_dag_bound_bytes(&bytes_c, &ops_c, 1, &whir,
+        &PublicStatement::Generic, &model_c, &bad_c_d), "C tampered d input must be rejected");
+    println!("negative rejected: C tampered d input");
+    let mut bad_c_scores = exec_c.clone();
+    bad_c_scores.inputs.get_mut(&scores_c).unwrap()[0] = bad_c_scores.inputs[&scores_c][0] + Goldilocks::ONE;
+    assert!(!verify_committed_shard_dag_bound_bytes(&bytes_c, &ops_c, 1, &whir,
+        &PublicStatement::Generic, &model_c, &bad_c_scores), "C tampered score input must be rejected");
+    println!("negative rejected: C tampered router score input");
+    let mut bad_c_out = exec_c.clone();
+    bad_c_out.outputs.get_mut(&out_c).unwrap()[0] = bad_c_out.outputs[&out_c][0] + Goldilocks::ONE;
+    assert!(!verify_committed_shard_dag_bound_bytes(&bytes_c, &ops_c, 1, &whir,
+        &PublicStatement::Generic, &model_c, &bad_c_out), "C tampered gather output must be rejected");
+    println!("negative rejected: C tampered gather output");
+    let mut bad_stmt_d = stmt.clone();
+    bad_stmt_d.d[0] = bad_stmt_d.d[0] + Goldilocks::ONE;
+    assert!(!verify_segmented(&bad_stmt_d, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b,
+        &ops_c, &model_c, &bytes_c, &whir), "statement d tamper must be rejected");
+    println!("negative rejected: cross-segment statement d tamper");
+    let mut bad_stmt_out = stmt.clone();
+    bad_stmt_out.out[0] = bad_stmt_out.out[0] + Goldilocks::ONE;
+    assert!(!verify_segmented(&bad_stmt_out, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b,
+        &ops_c, &model_c, &bytes_c, &whir), "statement out tamper must be rejected");
+    println!("negative rejected: cross-segment statement out tamper");
+
+    // Static gate table in the real-graph chain: the Lookup table is NOT the
+    // TopK gate tensor. The dynamic-table mode must fail closed; if this
+    // verifies, the router-gate consistency chain is NOT enforced for the
+    // BroadcastScale path and must be reported to the TL.
+    let mut bad_gate_v = gate_v.clone();
+    bad_gate_v[0] = bad_gate_v[0] + Goldilocks::ONE;
+    let mut sbad = Store::new();
+    let scores_bad = sbad.push(scores_v.clone());
+    let sel_bad = sbad.push(vec![]);
+    let thr_bad = sbad.push(vec![]);
+    let gate_bad = sbad.push(vec![]);
+    let d1_bad = sbad.push(vec![]);
+    let d2_bad = sbad.push(vec![]);
+    let tok_bad = sbad.push_idx(vec![]);
+    let exp_bad = sbad.push_idx(vec![]);
+    let tokp_bad = sbad.push_idx(vec![]);
+    let expp_bad = sbad.push_idx(vec![]);
+    let idxg_bad = sbad.push_idx(vec![]);
+    let gpos_bad = sbad.push(vec![]);
+    let d_bad = sbad.push(d_v.clone());
+    let wraw_bad = sbad.push(vec![]);
+    let w_bad = sbad.push(vec![]);
+    let ones_bad = sbad.push(vec![Goldilocks::ONE; s_pad]);
+    let out_bad = sbad.push(vec![]);
+    let bad_gate_t = sbad.push(bad_gate_v);
+    let ops_bad = vec![
+        Op::TopKSelect { x: scores_bad, sel: sel_bad, thr: thr_bad, gate: gate_bad, d1: d1_bad, d2: d2_bad, m, n: N, k: K },
+        Op::Scatter { sel: sel_bad, token_id: tok_bad, expert_of: exp_bad, m, n: N },
+        Op::PadIdx { base: tok_bad, out: tokp_bad, len: s_pad, base_len: s },
+        Op::PadIdx { base: exp_bad, out: expp_bad, len: s_pad, base_len: s },
+        Op::CombineIdx { a: tokp_bad, b: expp_bad, out: idxg_bad, scale: N },
+        Op::Lookup { idx: idxg_bad, out: gpos_bad, table: bad_gate_t },
+        Op::BroadcastScale { x: d_bad, scale: gpos_bad, out: wraw_bad, h: H },
+        Op::Scale { x: wraw_bad, out: w_bad, factor: 1, shift: 16 },
+        Op::Gather { weighted: w_bad, token_id: tokp_bad, gate: ones_bad, out: out_bad, m, h: H },
+    ];
+    evaluate_ops(&mut sbad, &ops_bad);
+    let out_bad_v = sbad.get(out_bad).to_vec();
+    let exec_bad = TrustedExecution {
+        inputs: [
+            (scores_bad, scores_v.clone()), (d_bad, d_v.clone()),
+            (ones_bad, vec![Goldilocks::ONE; s_pad]),
+        ].into(),
+        outputs: [
+            (thr_bad, thr_v.clone()), (gate_bad, gate_v.clone()),
+            (d1_bad, d1_v.clone()), (d2_bad, d2_v.clone()),
+            (out_bad, out_bad_v),
+        ].into(),
+    };
+    let cached_bad = commit_model_weights(&sbad, &ops_bad, &format!("{cache}-cbad"));
+    let model_bad = TrustedModelManifest::from_offline_commitment(&cached_bad, &sbad.owned_slices(), &ops_bad)
+        .with_index_shapes(&[
+            (tok_bad, s), (exp_bad, s), (tokp_bad, s_pad), (expp_bad, s_pad), (idxg_bad, s_pad),
+        ].into());
+    assert!(prove_committed_shard_dag_bound(&mut sbad, &ops_bad, 1, &whir, &cached_bad, 0, 0,
+        &PublicStatement::Generic, &model_bad, &exec_bad).is_none(),
+        "static gate table in the real-graph chain must fail closed");
+    println!("negative rejected: C static gate table fails closed (router-gate consistency)");
+    println!("SEGMENT-OK layer={layer} (A routing + B gate projection + C router-gate/Gather over caller-trusted real d) A_bytes={} B_bytes={} C_bytes={}",
+        bytes_a.len(), bytes_b.len(), bytes_c.len());
 }
