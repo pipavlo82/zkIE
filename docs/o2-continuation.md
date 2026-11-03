@@ -107,14 +107,61 @@ No-transcript-change optimization (in scope of the gist's self-verify note):
   bytes or transcript. Tests will check prover leaves == verifier leaves.
   Requesting approval to implement this as the first route-B-side commit.
 
-## Open questions for TL
+## TL decisions (2026-11-04)
 
-1. Approve the `WeightBatchOpening` + transcript change for route A, to be
-   measured (8-expert and full64) but not necessarily chosen?
-2. For route B at the C gate/index multi-claims, approve the reduction change
-   scope, or keep the small S4 merges (route A) there and limit route B to the
-   weight path?
-3. Approve the no-transcript self-verify removal as part of O2?
+- Q3 approved: remove the prover-side `verify_reverse_dag_inner` replay; keep
+  self-verify time separately accounted.
+- Q2: no reduction change for the C gate/index multi-claims (safety-critical,
+  small; keep the S4 merges). Route B is limited to the weight path; any
+  "redundant same_poly" removal there needs a written redundancy argument and
+  the S4 negatives must stay green.
+- Q1 conditionally approved: route A only as an isolated path (feature flag or
+  separate function); main path unaffected until chosen; strict FS order
+  (statement/roots/input claims before challenges; merged endpoint must be the
+  exact S4 output; one opening against the correct root); route A must pass
+  all existing negatives as an admission test; if chosen, full TL crypto
+  review + full regression + real segmented/full64 rerun.
+
+## Q3 implemented
+
+`prove_reverse_dag_inner` now returns `(ReverseDagProof, Vec<EvalClaim>)`; the
+bound prover uses its own residual claims as leaves and does not call
+`verify_reverse_dag_inner` by default. `ZKIE_O2_SELFVERIFY=1` enables the old
+replay only for measurement: it prints the separately-accounted self-verify
+time and checks the prover leaves and replay leaves as multisets (exact Debug
+strings; mismatch fails closed). No transcript or proof-byte structure change
+(the replay was read-only).
+
+Measured on the real A/B/C example (warm cache):
+
+| proof | before (replay) | default (no replay) | optional replay time |
+|---|---|---|---|
+| C (gate + Gather) | commit+prove 282.2 ms | 275.1 ms | 10.7 ms |
+| B (8-expert) | 5.34 s | 5.20 s | 2 × 10.8 ms (B and B2) |
+| A | ~0.16 s | unchanged structure | 10.0 ms |
+
+Verify times unchanged (C 15.7 ms, B 29.4 ms); the optional consistency check
+(prover leaves == replay leaves) passes; `zkie-ops` 157/0. Logs:
+`/data/zkie-soundness-fix/logs/o2-q3-default.log`,
+`/data/zkie-soundness-fix/logs/o2-q3-selfverify.log`.
+
+## Route B (weights): redundancy argument and status
+
+The bound path has **no same_poly on weight tensors**: weight claims are reads
+of a `GatherMatMul`/`MatMul` weight, never op outputs, so
+`prove_reverse_dag_inner` never merges them. `group_reverse_weights` groups all
+leaf claims of a weight tensor by table and opens them with one combined-
+equality `W_t` batch opening against the single committed root (O5). Each
+claim is therefore authenticated by the same committed root's opening, so the
+claims are evaluations of one polynomial by construction; a same_poly merge
+would be redundant. There is nothing to remove on this path; route B is the
+incumbent. The S4 negative suite (wrong boundary, cross-tensor merge, missed
+merge then opening) remains green (`zkie-ops` 157/0). The legacy committed
+path's cross_binds are retired (the committed verifier permanently rejects)
+and are not part of the bound O2 scope.
+
+Status: route A is next, as an isolated feature/function path; Q3 is done and
+committed. O2 is not complete; S7 is not accepted.
 
 S7 is not accepted; O2 is not complete. No security parameter or
 authentication relation is changed by this baseline step.

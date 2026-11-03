@@ -4310,10 +4310,11 @@ fn reverse_setup(ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript)
 
 pub fn prove_reverse_dag(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript) -> Option<ReverseDagProof> {
     prove_reverse_dag_inner(store, ops, seeds, transcript, &mut std::collections::BTreeMap::new(), None, None, None)
+        .map(|(proof, _leaves)| proof)
 }
 
 
-fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>) -> Option<ReverseDagProof> {
+fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>) -> Option<(ReverseDagProof, Vec<EvalClaim>)> {
     let replayed = execution.and_then(|e| replay_index_columns(ops, e));
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
@@ -4582,7 +4583,14 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
         };
         steps.push(ReverseStep { outputs: out_claims, reduction });
     }
-    Some(ReverseDagProof { steps })
+    // O2 (TL Q3): return the residual claims directly. The verifier derives
+    // the same leaves by replaying the proof; the honest prover no longer
+    // needs that replay just to collect them. No transcript or proof bytes
+    // change (the replay was read-only).
+    let leaves = claims.into_iter().flat_map(|(tensor_id, cs)| {
+        cs.into_iter().map(move |(point, value)| EvalClaim { tensor_id, point, value })
+    }).collect();
+    Some((ReverseDagProof { steps }, leaves))
 }
 
 pub fn verify_reverse_dag(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>> {
@@ -11154,9 +11162,24 @@ pub fn prove_committed_shard_dag_bound(
     let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux)?;
     let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
     let certified = certified_index_tensors(ops, execution);
-    let reverse = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution))?;
-    let (mut replay, replay_seeds) = execution_seeds(ops, model, execution, &aux)?;
-    let leaves = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model), Some(&certified), Some(execution))?;
+    let (reverse, prover_leaves) = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution))?;
+    // O2 (TL Q3): the prover uses its own residual claims; the verifier-side
+    // replay is optional, for separately-accounted self-verify measurements
+    // and a leaf consistency check. Default off: no prover self-verification.
+    let leaves = if std::env::var("ZKIE_O2_SELFVERIFY").ok().as_deref() == Some("1") {
+        let (mut replay, replay_seeds) = execution_seeds(ops, model, execution, &aux)?;
+        let t_sv = std::time::Instant::now();
+        let verified = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model), Some(&certified), Some(execution))?;
+        eprintln!("O2-selfverify ms={:.1} leaves={}", t_sv.elapsed().as_secs_f64() * 1e3, verified.len());
+        let mut a: Vec<String> = prover_leaves.iter().map(|c| format!("{:?}", c)).collect();
+        let mut b: Vec<String> = verified.iter().map(|c| format!("{:?}", c)).collect();
+        a.sort();
+        b.sort();
+        if a != b { return None; }
+        verified
+    } else {
+        prover_leaves
+    };
     let groups = group_reverse_weights(model, ops, &leaves)?;
     let mut weight_openings = Vec::with_capacity(groups.len());
     for (bi, entries) in groups.iter().enumerate() {
@@ -17935,7 +17958,7 @@ mod tests {
         prepared.insert((0, AuxRole::TopKSelectTie), tie_aux);
         let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux).unwrap();
         let certified = certified_index_tensors(&ops, &execution);
-        let reverse = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
+        let (reverse, _leaves) = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
             Some(&model), Some(&certified), Some(&execution)).expect("forged bound proof is producible");
         let proof = BoundExecutionProof {
             aux, reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None,
@@ -18243,7 +18266,7 @@ mod tests {
         };
         let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux).unwrap();
         let certified = certified_index_tensors(&ops, &execution);
-        let reverse = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
+        let (reverse, _leaves) = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
             Some(&model), Some(&certified), Some(&execution)).expect("forged proof producible");
         let proof = BoundExecutionProof { aux, reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None };
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
