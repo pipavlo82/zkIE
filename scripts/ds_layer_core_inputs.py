@@ -13,9 +13,11 @@ writes:
                             ev = exp_table[idx], scores = rd(ev*2^16, sum(ev))
   L{L}_core_logits16_i32.bin (diagnostic) Q16 router logits
 
-The ff reference itself does not use the fixed-point path; the activation is
-quantized once at the Q16 contract boundary, and the router scores are then
-computed exactly the way the model's Softmax op computes them. The extracted
+The trajectory is a FLOAT64 REFERENCE model over bf16 weights, quantized once
+at the Q16 contract boundary; it is NOT the fixed-point full-model trajectory
+(the fixed-point forward of the whole model is not computed here). The router
+scores from the quantized activation/weights are then computed exactly the
+way the model's Softmax op computes them. The extracted
 token is the first token of the existing tokens_i32.bin, so the input matches
 the extracted model artifacts.
 

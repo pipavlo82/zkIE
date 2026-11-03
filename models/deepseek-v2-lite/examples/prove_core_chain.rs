@@ -83,6 +83,125 @@ fn load_expert_slice(dir: &str, layer: usize, experts: &[usize]) -> Vec<Goldiloc
     out
 }
 
+fn ops_a_input(ops: &[Op]) -> Option<usize> {
+    ops.iter().find_map(|op| if let Op::TopKSelect { x, .. } = op { Some(*x) } else { None })
+}
+fn ops_a_output_field(ops: &[Op], i: usize) -> Option<usize> {
+    ops.iter().find_map(|op| if let Op::TopKSelect { thr, gate, d1, d2, .. } = op {
+        Some([*thr, *gate, *d1, *d2][i])
+    } else { None })
+}
+fn ops_b_mask_input(ops: &[Op]) -> Option<usize> {
+    ops.iter().find_map(|op| if let Op::BroadcastScale { scale, .. } = op { Some(*scale) } else { None })
+}
+fn ops_b_output(ops: &[Op]) -> Option<usize> {
+    ops.iter().rev().find_map(|op| if let Op::Scale { out, .. } = op { Some(*out) } else { None })
+}
+
+/// Caller-trusted external statement for the two segments. The verifier
+/// below derives BOTH executions from this value alone: A's public outputs
+/// (thr/gate/d1/d2 + original routing arrays) and B's public inputs (sliced
+/// routing + mask) and outputs (g). No prover-local value is consulted.
+#[derive(Clone)]
+struct CoreStatement {
+    scores: Vec<Goldilocks>,
+    thr: Vec<Goldilocks>,
+    gate: Vec<Goldilocks>,
+    d1: Vec<Goldilocks>,
+    d2: Vec<Goldilocks>,
+    tok_routing: Vec<u32>,
+    exp_routing: Vec<u32>,
+    mask: Vec<Goldilocks>,
+    g: Vec<Goldilocks>,
+    /// Real expert ids for the 8 slice rows (6 routed + 2 real padding).
+    slice_experts: Vec<usize>,
+    /// Per padded position: slice row index for exp_routing[i].
+    slice: Vec<u32>,
+    s: usize,
+}
+
+/// Derive the slice table from the statement's routing and slice identity.
+/// Returns None on unknown routed experts, duplicate slice identities, or a
+/// padding position that is not routed to slice row 6.
+fn derive_slice(exp_routing: &[u32], slice_experts: &[usize], s: usize) -> Option<Vec<u32>> {
+    if slice_experts.len() != 8 || exp_routing.len() < s { return None; }
+    let mut seen = std::collections::BTreeSet::new();
+    for &e in slice_experts { if !seen.insert(e) { return None; } }
+    let mut out = Vec::with_capacity(exp_routing.len());
+    for (i, &e) in exp_routing.iter().enumerate() {
+        if i < s {
+            let pos = slice_experts.iter().position(|&x| x == e as usize)?;
+            if pos >= s { return None; }
+            out.push(pos as u32);
+        } else {
+            if e != 0 { return None; }
+            out.push(6);
+        }
+    }
+    Some(out)
+}
+
+fn reverse_keys(ops: &[Op]) -> Option<(usize, usize)> {
+    let mut tok = None;
+    let mut exp = None;
+    for op in ops {
+        match op {
+            Op::PadIdx { out, .. } => {
+                let k = TensorKey::Index(*out).encoded()?;
+                if tok.is_none() { tok = Some(k); } else { exp = Some(k); }
+            }
+            Op::IdxBroadcast { base, .. } => tok = Some(TensorKey::Index(*base).encoded()?),
+            Op::GatherMatMul { expert_of, .. } => exp = Some(TensorKey::Index(*expert_of).encoded()?),
+            _ => {}
+        }
+    }
+    Some((tok?, exp?))
+}
+
+/// Independent composition verifier: consumes ONLY the caller-trusted
+/// statement, both proof byte strings, the two models and their op graphs.
+/// It derives each segment's execution item-by-item, rejects an invalid
+/// slice identity (unknown expert, duplicate identity, wrong padding row) and
+/// both segment mismatches. No cryptographic reduction is added.
+fn verify_segmented(
+    stmt: &CoreStatement,
+    ops_a: &[Op], model_a: &TrustedModelManifest, bytes_a: &[u8],
+    ops_b: &[Op], model_b: &TrustedModelManifest, bytes_b: &[u8],
+    whir: &Whir,
+) -> bool {
+    if stmt.tok_routing.len() != stmt.exp_routing.len() { return false; }
+    let slice = match derive_slice(&stmt.exp_routing, &stmt.slice_experts, stmt.s) { Some(v) => v, None => return false };
+    if slice != stmt.slice { return false; } // caller statement's slice identity must match its routing
+    let (tk_a, ek_a) = match reverse_keys(ops_a) { Some(k) => k, None => return false };
+    let (tk_b, ek_b) = match reverse_keys(ops_b) { Some(k) => k, None => return false };
+    let a_in = match ops_a_input(ops_a) { Some(v) => v, None => return false };
+    let a0 = match ops_a_output_field(ops_a, 0) { Some(v) => v, None => return false };
+    let a1 = match ops_a_output_field(ops_a, 1) { Some(v) => v, None => return false };
+    let a2 = match ops_a_output_field(ops_a, 2) { Some(v) => v, None => return false };
+    let a3 = match ops_a_output_field(ops_a, 3) { Some(v) => v, None => return false };
+    let b_mask = match ops_b_mask_input(ops_b) { Some(v) => v, None => return false };
+    let b_out = match ops_b_output(ops_b) { Some(v) => v, None => return false };
+    let exec_a = TrustedExecution {
+        inputs: [(a_in, stmt.scores.clone())].into(),
+        outputs: [
+            (a0, stmt.thr.clone()), (a1, stmt.gate.clone()),
+            (a2, stmt.d1.clone()), (a3, stmt.d2.clone()),
+            (tk_a, to_g(&stmt.tok_routing)),
+            (ek_a, to_g(&stmt.exp_routing)),
+        ].into(),
+    };
+    let exec_b = TrustedExecution {
+        inputs: [
+            (tk_b, to_g(&stmt.tok_routing)),
+            (ek_b, to_g(&slice)),
+            (b_mask, stmt.mask.clone()),
+        ].into(),
+        outputs: [(b_out, stmt.g.clone())].into(),
+    };
+    verify_committed_shard_dag_bound_bytes(bytes_a, ops_a, 1, whir, &PublicStatement::Generic, model_a, &exec_a)
+        && verify_committed_shard_dag_bound_bytes(bytes_b, ops_b, 1, whir, &PublicStatement::Generic, model_b, &exec_b)
+}
+
 fn to_g(v: &[u32]) -> Vec<Goldilocks> {
     v.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect()
 }
@@ -252,6 +371,15 @@ fn main() {
     assert_eq!(sb.idx[exp_b], bound);
     assert_eq!(execution_b.inputs.get(&kb_tok), Some(&to_g(&stmt_tok)));
     assert_eq!(execution_b.inputs.get(&kb_exp), Some(&to_g(&bound)));
+    // Caller-trusted external statement: the ONLY input to the composition
+    // verifier below (prover-local arrays are not consulted by it).
+    let stmt = CoreStatement {
+        scores: scores_v.clone(), thr: thr_v.clone(), gate: gate_v.clone(),
+        d1: d1_v.clone(), d2: d2_v.clone(),
+        tok_routing: tok_v.clone(), exp_routing: exp_v.clone(),
+        mask: mask_v.clone(), g: g_v.clone(),
+        slice_experts: slice_experts.clone(), slice: exp_slice.clone(), s,
+    };
     let cache_b = format!("{cache}-b");
     let t3 = Instant::now();
     let cached_b = commit_model_weights(&sb, &ops_b, &cache_b);
@@ -264,6 +392,58 @@ fn main() {
     let t4 = Instant::now();
     assert!(verify_committed_shard_dag_bound_bytes(&bytes_b, &ops_b, 1, &whir,
         &PublicStatement::Generic, &model_b, &execution_b), "phase B must verify");
+    // Independent composition verification (caller statement + both proofs
+    // + models + ops only).
+    assert!(verify_segmented(&stmt, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b, &whir),
+        "segmented honest composition must verify");
+    println!("composition honest verify ok");
+    let mut bad_remap = stmt.clone();
+    bad_remap.slice_experts[1] = bad_remap.slice_experts[0];
+    assert!(!verify_segmented(&bad_remap, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b, &whir),
+        "duplicate slice identity must be rejected");
+    let mut bad_slice = stmt.clone();
+    bad_slice.slice[0] = bad_slice.slice[1];
+    assert!(!verify_segmented(&bad_slice, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b, &whir),
+        "statement slice/routing mismatch must be rejected");
+    println!("negative rejected: invalid slice identity / slice mismatch");
+    // Cross-segment: B2 is INDIVIDUALLY valid for statement S2 (routing swap)
+    // but the composition with A1 (statement S1) must be rejected.
+    let mut stmt2 = stmt.clone();
+    stmt2.exp_routing.swap(0, 1);
+    stmt2.slice = derive_slice(&stmt2.exp_routing, &stmt2.slice_experts, s).expect("valid slice2");
+    let mut s2 = Store::new();
+    let t2 = s2.push_idx(stmt2.tok_routing.clone());
+    let e2 = s2.push_idx(stmt2.slice.clone());
+    let m2 = s2.push(stmt2.mask.clone());
+    let a2 = s2.push(act_v.clone());
+    let i2 = s2.push_idx(vec![]); let sg2 = s2.push(vec![]); let sz2 = s2.push(vec![]);
+    let gr2 = s2.push(vec![]); let g2t = s2.push(vec![]);
+    let w2s = s2.push(load_expert_slice(&dir, layer, &slice_experts));
+    let ops2 = vec![
+        Op::IdxBroadcast { base: t2, out: i2, b: H },
+        Op::Lookup { idx: i2, out: sg2, table: a2 },
+        Op::BroadcastScale { x: sg2, scale: m2, out: sz2, h: H },
+        Op::GatherMatMul { a: sz2, expert_of: e2, w: w2s, c: gr2, s: s_pad, k: H, n: MOE_PAD, n_experts: 8 },
+        Op::Scale { x: gr2, out: g2t, factor: 1, shift: 16 },
+    ];
+    evaluate_ops(&mut s2, &ops2);
+    stmt2.g = s2.get(g2t).to_vec();
+    let exec_b2 = TrustedExecution {
+        inputs: [
+            (TensorKey::Index(t2).encoded().unwrap(), to_g(&stmt2.tok_routing)),
+            (TensorKey::Index(e2).encoded().unwrap(), to_g(&stmt2.slice)),
+            (m2, stmt2.mask.clone()),
+        ].into(),
+        outputs: [(g2t, stmt2.g.clone())].into(),
+    };
+    let proof_b2 = prove_committed_shard_dag_bound(&mut s2, &ops2, 1, &whir, &cached_b, 0, 0,
+        &PublicStatement::Generic, &model_b, &exec_b2).expect("B2 individually valid proof");
+    let bytes_b2 = bincode::serialize(&proof_b2).expect("serialize B2");
+    assert!(verify_committed_shard_dag_bound_bytes(&bytes_b2, &ops2, 1, &whir,
+        &PublicStatement::Generic, &model_b, &exec_b2), "B2 must be individually valid");
+    assert!(!verify_segmented(&stmt, &ops_a, &model_a, &bytes_a, &ops2, &model_b, &bytes_b2, &whir),
+        "cross-segment A1 + B2 mismatch must be rejected");
+    println!("negative rejected: cross-segment individually-valid A1+B2 mismatch");
     println!("B commit+prove {:?} verify {:?} bytes {} peak_rss={}kB",
         t3.elapsed(), t4.elapsed(), bytes_b.len(), peak_rss_kb());
 

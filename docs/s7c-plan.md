@@ -333,7 +333,9 @@ statements; it is explicitly NOT gist S7 acceptance.
 - Real data: layer 10, seq=1, token 549 (first extracted token).
   `scripts/ds_layer_core_inputs.py` runs the FULL reference forward: every
   prior layer includes its FFN/MoE (dense layer 0, routed+shared experts for
-  1..LAYER-1); at LAYER it exports the post-attention RMSNorm MoE input. The
+  1..LAYER-1); at LAYER it exports the post-attention RMSNorm MoE input. This
+  trajectory is a FLOAT64 REFERENCE model over bf16 weights, quantized at the
+  Q16 boundary; it is NOT the fixed-point full-model trajectory. The
   file `L*_post_attn_norm_i32.bin` is the RMSNorm WEIGHT (all-positive
   ~0.09-0.91), not an activation. Measured (corrected): activation
   max|.|=835232, max score 28854, max|logits16| 272985 < 2^22; top-6 =
