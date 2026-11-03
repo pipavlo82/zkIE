@@ -10793,9 +10793,11 @@ fn reject_static_lookup_ancestors(
 /// S7 gate consistency for the real MoE graph pattern: the router gate enters
 /// through the BroadcastScale that weights the expert output, followed by a
 /// linear Scale/ScaleVec chain into `Gather.weighted`. Walk ONLY the weighted
-/// side through Scale/ScaleVec (never the BroadcastScale x/data side, which
-/// may legitimately be caller data such as the down projection), and apply
-/// the full-closure static-Lookup rule to the BroadcastScale scale slot.
+/// side through Scale/ScaleVec (checking a ScaleVec's own scale slot, since
+/// ScaleVec(shift=0) is a supported gate-weighting mode) and never the
+/// BroadcastScale x/data side, which may legitimately be caller data such as
+/// the down projection. Apply the full-closure static-Lookup rule to the
+/// BroadcastScale and ScaleVec scale slots.
 fn reject_static_gate_on_weighted(
     ops: &[Op], weighted: T, field_written: &std::collections::BTreeSet<T>,
 ) -> Option<()> {
@@ -10809,7 +10811,13 @@ fn reject_static_gate_on_weighted(
         match producer {
             None => return Some(()),
             Some(Op::Scale { x, .. }) => cur = *x,
-            Some(Op::ScaleVec { x, .. }) => cur = *x,
+            Some(Op::ScaleVec { x, scale, .. }) => {
+                // ScaleVec(shift=0) is a supported gate-weighting mode; its
+                // scale slot carries gate content, so check it before
+                // following the data side x.
+                reject_static_lookup_ancestors(ops, *scale, field_written)?;
+                cur = *x;
+            }
             Some(Op::BroadcastScale { scale, .. }) => {
                 return reject_static_lookup_ancestors(ops, *scale, field_written);
             }
@@ -18605,6 +18613,71 @@ mod tests {
         assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
             &PublicStatement::Generic, &model, &execution).is_none(),
             "a static Lookup through the Gather.gate BroadcastScale slot must fail closed");
+    }
+
+    /// TL review follow-up: ScaleVec(shift=0) is a supported gate-weighting
+    /// mode (38d1f2a). A static Lookup in the ScaleVec scale slot on the
+    /// Gather.weighted path must fail closed; following only x (the data side)
+    /// would accept it.
+    #[test]
+    fn s7c_gate_chain_static_table_via_scalevec_slot_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, n, k, h) = (4usize, 8usize, 2usize, 4usize);
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
+        let dv: Vec<Goldilocks> = (0..m * k * h).map(|i| from_i64(((i * 5) % 11) as i64 - 5)).collect();
+        let (thr_v, _sel_v, gate_v, d1_v, d2_v) = topk_forward(&xv, m, n, k);
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let token_id = store.push_idx(vec![]);
+        let expert_of = store.push_idx(vec![]);
+        let d = store.push(dv.clone());
+        let weighted = store.push(vec![]);
+        let ones = store.push(vec![Goldilocks::ONE; m * k]);
+        let out = store.push(vec![]);
+        let idx_s = store.push_idx(vec![0u32; m * k]);
+        let lookup_out = store.push(vec![]);
+        let mut bad_small = vec![Goldilocks::ONE; m * k];
+        bad_small[0] = Goldilocks::from_u64(3);
+        let bad_table_s = store.push(bad_small);
+        let ops = vec![
+            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k },
+            Op::Scatter { sel, token_id, expert_of, m, n },
+            Op::Lookup { idx: idx_s, out: lookup_out, table: bad_table_s },
+            Op::ScaleVec { x: d, scale: lookup_out, out: weighted, shift: 0 },
+            Op::Gather { weighted, token_id, gate: ones, out, m, h },
+        ];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-gate-scalevec-static");
+        forward_ops(&mut store, &ops);
+        let s = store.idx[token_id].len();
+        let ik_s = TensorKey::Index(idx_s).encoded().unwrap();
+        let ik_exp = TensorKey::Index(expert_of).encoded().unwrap();
+        let zeros_g: Vec<Goldilocks> = vec![Goldilocks::ZERO; s];
+        let exp_g: Vec<Goldilocks> = store.idx[expert_of]
+            .iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(token_id, s), (expert_of, s), (idx_s, s)].into());
+        let execution = TrustedExecution {
+            inputs: [
+                (x, xv.clone()), (d, dv.clone()),
+                (ones, vec![Goldilocks::ONE; s]),
+                (ik_s, zeros_g),
+            ].into(),
+            outputs: [
+                (thr, thr_v.clone()), (gate, gate_v.clone()),
+                (d1, d1_v.clone()), (d2, d2_v.clone()),
+                (ik_exp, exp_g),
+                (out, store.get(out).to_vec()),
+            ].into(),
+        };
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).is_none(),
+            "a static Lookup in the ScaleVec scale slot on the weighted path must fail closed");
     }
     #[test]
     fn s2_matmul32_empty_commitments_rejected() {
