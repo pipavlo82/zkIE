@@ -7,7 +7,8 @@ bounded ReLU, GeluIndex, Lookup, Argmax, the GatherMatMul expert-FFN core,
 the Gather scatter-add with authenticated one-hot routing, Scatter with the
 expert-major order proof (key column + masked strict-increase + LogUp shift
 permutation), the linear index ops
-CombineIdx/IdxBroadcast/PadIdx, the exact-product tail ops BroadcastScale and
+CombineIdx/IdxBroadcast/PadIdx (CombineIdx also accepts bound intermediate
+indices authenticated by their producer), the exact-product tail ops BroadcastScale and
 ScaleVec (shift 0), and TopKSelect with pre-committed witness aux,
 whole-column threshold broadcast, threshold attainment, verifier-authenticated
 signed range proofs for x and thr_b (contract [-2^22, 2^22), out-of-range

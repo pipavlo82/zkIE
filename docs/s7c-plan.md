@@ -81,13 +81,15 @@ TopKSelect claim (fail-closed if the producer is unsupported).
   - ties `token_id(pos) = Σ_t t·R[t,pos]`, `expert_of(pos) = Σ_e e·X[e,pos]`
     (endpoints become claims on the token/expert columns; the counts side is
     therefore virtual, never read by the verifier).
-- Counts/multiset identity: for random `q` over the (token, expert) domain and
-  `z` over positions,
-  `Σ_pos R'(pos)·X'(pos)·eq(z,pos) = (Σ_pos eq(z,pos)) · sel~(q)`, where
-  `R'(pos) = Σ_t eq(q_t,t)·R[t,pos]`, `X'` likewise. `R'`, `X'` are prover
-  witness vectors; endpoints are aux openings at the sumcheck point; the RHS
-  uses `sel~(q)` from the TopKSelect claim. This binds the routing multiset to
-  the authenticated selector exactly.
+- Counts/multiset identity (NO position weight): for random
+  `q = (q_e, q_t)` over the (token, expert) domain,
+  `Σ_pos R'(pos)·X'(pos) = sel~(q_e || q_t)`, where
+  `R'(pos) = Σ_t eq(q_t,t)·R[t,pos]`, `X'` likewise. The unweighted sum is
+  exactly the MLE of the routing count matrix at `(q_t, q_e)`, so equality
+  with the sel claim forces `count == sel` pointwise. Endpoints are aux
+  openings at the sumcheck point; the RHS is the returned sel claim, later
+  authenticated by the TopKSelect committed column. No `eq(z,pos)` factor and
+  no `mask~(z)` division appear.
 - Consequences: active-pair uniqueness follows from sel Boolean; `k` from the
   TopKSelect statement gives exactly-k routes; dropped routes fail the
   row-sum/counts identity; duplicates cannot occur in a Boolean selector.
@@ -122,12 +124,13 @@ Reduction (all eq-weighted, transcript order fixed):
    them, so the one-hot columns are pinned pointwise to the claimed public /
    downstream token and expert arrays (values in range by Boolean one-hot).
 4. Counts/multiset identity (claim `counts_total`, prover-supplied but
-   forced by the sumcheck): with `q_t`, `q_e` random and `z` random,
-   `sum_pos eq(z,pos) * R'(pos) * X'(pos) = mask~(z) * sel~(q_e || q_t)`,
-   where `R'(pos) = sum_t eq(q_t,t) R_t(pos)`, `X'` likewise, implemented as
-   the virtual `sum_{t,e} eq_t[t] eq_e[e] * eq * R_t * X_e` with claim
-   `counts_total`. The verifier returns `EvalClaim { sel, q_e || q_t,
-   counts_total / mask~(z) }`; no verifier table read. The claim is then
+   forced by the sumcheck): with `q_t`, `q_e` random and NO position weight,
+   `sum_pos R'(pos) * X'(pos) = sel~(q_e || q_t)`, where
+   `R'(pos) = sum_t eq(q_t,t) R_t(pos)`, `X'` likewise, implemented as the
+   virtual `sum_{t,e} eq_t[t] eq_e[e] * R_t * X_e` with claim
+   `counts_total` (the MLE of the count matrix at `(q_t, q_e)`). The verifier
+   returns `EvalClaim { sel, q_e || q_t, counts_total }`; no verifier table
+   read and no mask division. The claim is then
    authenticated by the producing TopKSelect reduction (its committed sel
    column opened at the same point), which is what rejects duplicated,
    dropped or non-active routes: by Schwartz-Zippel the routing pair multiset
@@ -189,7 +192,7 @@ order is rejected, Scatter remains fail-closed (commit 5df8e59). The formal
 pre-fix counterexample already reproduced: with m=n=2, sel all ones and the
 positions 0/2 swapped, the old bound verifier returned true.
 
-### 3. Gate consistency chain
+### 3. Gate consistency chain — IMPLEMENTED (bound paths; see tracker)
 
 `idx_gate = token_id·n + expert_of` via `CombineIdx` (linear; already
 supported), `gate_pos = gate_table[idx_gate]` via `Lookup` (already

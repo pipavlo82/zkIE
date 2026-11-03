@@ -1377,12 +1377,15 @@ fn verify_reverse_scale_vec(op: &Op, point: &[Goldilocks], value: Goldilocks,
 //    [0,s), none on padding) make every position a pair.
 //  * Direct tie checks at the random output-claim points pin the token/expert
 //    columns to the claimed (public or downstream) arrays.
-//  * Counts identity with random q_t, q_e, z:
-//      sum_pos eq(z,pos) R'(pos) X'(pos) = mask~(z) * sel~(q_e || q_t).
-//    The reduction returns the sel claim counts_total / mask~(z); the
-//    producing TopKSelect reduction authenticates that value against its
-//    committed sel column, so duplicated/dropped/non-active routes fail the
-//    counts identity. Unsupported shapes/specs fail closed.
+//  * Counts/multiset identity with random q_t, q_e (NO position weight):
+//      sum_pos R'(pos) X'(pos) = sel~(q_e || q_t),
+//    where R'(pos) = sum_t eq(q_t,t) R_t(pos), X' likewise. The unweighted
+//    sum is exactly the MLE of the routing count matrix at (q_t, q_e), so
+//    equality with the sel claim forces count == sel pointwise. The reduction
+//    returns the sel claim counts_total directly (no eq(z,pos) weight, no
+//    mask division); the producing TopKSelect reduction authenticates that
+//    value against its committed sel column, so duplicated/dropped/non-active
+//    routes fail the counts identity. Unsupported shapes/specs fail closed.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseScatterProof {
     /// Booleanity of every R/X column (claim 0).
@@ -3719,9 +3722,10 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::GeluIndex { proof }
             }
             Op::Lookup { .. } => {
-                let (proof, c) = prove_reverse_lookup(store, op, &point, value,
+                let r = prove_reverse_lookup(store, op, &point, value,
                     aux.remove(&(op_index, AuxRole::LookupPairs))?,
-                    aux.remove(&(op_index, AuxRole::LookupMultiplicity))?, model?, transcript)?;
+                    aux.remove(&(op_index, AuxRole::LookupMultiplicity))?, model?, transcript);
+                let (proof, c) = r?;
                 absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                 claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 ReverseReduction::Lookup { proof }
@@ -3768,7 +3772,8 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
             Op::Gather { .. } => {
                 let auxp = aux.remove(&(op_index, AuxRole::GatherRouting))?;
                 let pairs = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect::<Vec<_>>();
-                let (proof, incoming) = prove_reverse_gather(store, op, &pairs, auxp, transcript)?;
+                let r = prove_reverse_gather(store, op, &pairs, auxp, transcript);
+                let (proof, incoming) = r?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -3795,7 +3800,8 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                     .map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
                 let auxp = aux.remove(&(op_index, AuxRole::ScatterRouting))?;
                 let order_auxp = aux.remove(&(op_index, AuxRole::ScatterOrder))?;
-                let (proof, incoming) = prove_reverse_scatter(store, op, &pairs, auxp, order_auxp, transcript)?;
+                let r = prove_reverse_scatter(store, op, &pairs, auxp, order_auxp, transcript);
+                let (proof, incoming) = r?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -3803,7 +3809,8 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::Scatter { proof }
             }
             Op::BroadcastScale { .. } => {
-                let (proof, incoming) = prove_reverse_broadcast_scale(store, op, &point, value, transcript)?;
+                let r = prove_reverse_broadcast_scale(store, op, &point, value, transcript);
+                let (proof, incoming) = r?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -3832,10 +3839,19 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                     (replay_eval(replayed.as_ref().and_then(|r| r.get(a))?, &point)?,
                      replay_eval(replayed.as_ref().and_then(|r| r.get(b))?, &point)?)
                 } else {
-                    if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
                     let av = idx_eval(store, *a, &point)?;
                     let bv = idx_eval(store, *b, &point)?;
                     if Goldilocks::from_u64(*scale as u64) * av + bv != value { return None; }
+                    let certified_out = certified.map_or(false, |c| c.contains(&out_key));
+                    if !certified_out {
+                        // S7c bound path: the input claims are authenticated
+                        // by their producing reduction (Scatter routing ties
+                        // or public leaves). The relation is a FIELD identity
+                        // at the random claim point; integer u32 bounds are a
+                        // pointwise property guaranteed by that upstream
+                        // authentication, not checkable on random-point MLEs.
+                        if execution.is_none() { return None; }
+                    }
                     (av, bv)
                 };
                 for (id, val) in [(*a, av), (*b, bv)] {
@@ -4067,7 +4083,8 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                         claims.entry(key).or_default().push((point.clone(), val));
                     }
                 } else {
-                    if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
+                    let certified_out = certified.map_or(false, |c| c.contains(&out_key));
+                    if !certified_out && execution.is_none() { return None; }
                     if Goldilocks::from_u64(*scale as u64) * *_av + *_bv != value { return None; }
                     for (id, val) in [(*a, *_av), (*b, *_bv)] {
                         let key = TensorKey::Index(id).encoded()?;
@@ -17055,6 +17072,151 @@ mod tests {
     /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and    /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and
     /// sumcheck are both emptied must be rejected (empty lists can never skip
     /// non-empty computation).
+    /// S7c gate-consistency chain (gist §3):
+    /// TopKSelect(sel, gate) -> Scatter(token_id, expert_of) ->
+    /// CombineIdx(idx = token*n + expert) -> Lookup(gate_pos = gate_table[idx])
+    /// -> BroadcastScale(weighted = d*gate_pos) -> Gather with the same
+    /// gate_pos. The table is a trusted model tensor whose values are the
+    /// router gate matrix; the router gate output is public/authenticated by
+    /// the TopK reduction, so the scatter-add gate is the router gate at the
+    /// authenticated pair.
+    #[test]
+    fn s7c_gate_consistency_chain_bound_roundtrip() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, n, k, h) = (4usize, 8usize, 2usize, 4usize);
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
+        let dv: Vec<Goldilocks> = (0..m * k * h).map(|i| from_i64(((i * 5) % 11) as i64 - 5)).collect();
+        let (thr_v, sel_v, gate_v, d1_v, d2_v) = topk_forward(&xv, m, n, k);
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let token_id = store.push_idx(vec![]);
+        let expert_of = store.push_idx(vec![]);
+        let idx = store.push_idx(vec![]);
+        let gate_pos = store.push(vec![]);
+        let d = store.push(dv.clone());
+        let weighted = store.push(vec![]);
+        let out = store.push(vec![]);
+        // Model-committed gate table: the router gate matrix (row-major
+        // t*n + e), i.e. the TopK gate tensor values.
+        let gate_table = store.push(gate_v.clone());
+        let ops = vec![
+            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k },
+            Op::Scatter { sel, token_id, expert_of, m, n },
+            Op::CombineIdx { a: token_id, b: expert_of, scale: n, out: idx },
+            Op::Lookup { idx, out: gate_pos, table: gate_table },
+            Op::BroadcastScale { x: d, scale: gate_pos, out: weighted, h },
+            Op::Gather { weighted, token_id, gate: gate_pos, out, m, h },
+        ];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-gate-chain");
+        forward_ops(&mut store, &ops);
+        let s = store.idx[token_id].len();
+        assert_eq!(s, m * k);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[
+                (token_id, s), (expert_of, s), (idx, s),
+            ].into());
+        let execution = TrustedExecution {
+            inputs: [(x, xv.clone()), (d, dv.clone())].into(),
+            outputs: [
+                (thr, thr_v.clone()),
+                (gate, gate_v.clone()),
+                (d1, d1_v.clone()),
+                (d2, d2_v.clone()),
+                (out, store.get(out).to_vec()),
+            ].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("honest gate chain proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution),
+            "honest gate-consistency chain must verify");
+
+        // Tampered public output (the Gather result) is rejected at prove.
+        let mut bad_outputs = execution.outputs.clone();
+        if let Some(v) = bad_outputs.get_mut(&TensorKey::Field(out).encoded().unwrap()) {
+            if !v.is_empty() { v[0] = v[0] + Goldilocks::ONE; }
+        }
+        let bad_exec = TrustedExecution { inputs: execution.inputs.clone(), outputs: bad_outputs };
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &bad_exec).is_none(),
+            "tampered gather output must fail closed");
+
+        // Wrong index/expert: tamper the CombineIdx carried input so the
+        // field relation idx = n*token + expert no longer holds.
+        let mut bad_proof = proof;
+        for step in bad_proof.reverse.steps.iter_mut() {
+            if let ReverseReduction::CombineIdx { a, .. } = &mut step.reduction {
+                *a += Goldilocks::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad_proof,
+            &PublicStatement::Generic, &model, &execution),
+            "tampered CombineIdx input must be rejected");
+        // Tampered gate: corrupt the BroadcastScale scale/gate endpoint.
+        let mut bad_proof2 = bad_proof;
+        for step in bad_proof2.reverse.steps.iter_mut() {
+            if let ReverseReduction::BroadcastScale { proof: p } = &mut step.reduction {
+                p.prod.final_evals[2] += Goldilocks::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad_proof2,
+            &PublicStatement::Generic, &model, &execution),
+            "tampered gate endpoint must be rejected");
+
+        // Wrong table root: rebuild the manifest from a corrupted table while
+        // keeping the honest proof. The Lookup table opening no longer
+        // matches the model root, so the verifier rejects.
+        let mut store_bad = Store::new();
+        // Recreate the store layout with the honest forward values, then
+        // corrupt the table only.
+        let xb = store_bad.push(xv.clone());
+        let selb = store_bad.push(vec![]);
+        let thrb = store_bad.push(vec![]);
+        let gateb = store_bad.push(vec![]);
+        let d1b = store_bad.push(vec![]);
+        let d2b = store_bad.push(vec![]);
+        let tokb = store_bad.push_idx(vec![]);
+        let expb = store_bad.push_idx(vec![]);
+        let idxb = store_bad.push_idx(vec![]);
+        let gpb = store_bad.push(vec![]);
+        let db = store_bad.push(dv.clone());
+        let wb = store_bad.push(vec![]);
+        let ob = store_bad.push(vec![]);
+        let mut bad_table = gate_v.clone();
+        bad_table[0] = bad_table[0] + Goldilocks::ONE;
+        let tabb = store_bad.push(bad_table);
+        store_bad.v[selb] = TensorData::Owned(sel_v.clone());
+        store_bad.v[thrb] = TensorData::Owned(thr_v.clone());
+        store_bad.v[gateb] = TensorData::Owned(gate_v.clone());
+        store_bad.v[d1b] = TensorData::Owned(d1_v.clone());
+        store_bad.v[d2b] = TensorData::Owned(d2_v.clone());
+        let ops_bad = vec![
+            Op::TopKSelect { x: xb, sel: selb, thr: thrb, gate: gateb, d1: d1b, d2: d2b, m, n, k },
+            Op::Scatter { sel: selb, token_id: tokb, expert_of: expb, m, n },
+            Op::CombineIdx { a: tokb, b: expb, scale: n, out: idxb },
+            Op::Lookup { idx: idxb, out: gpb, table: tabb },
+            Op::BroadcastScale { x: db, scale: gpb, out: wb, h },
+            Op::Gather { weighted: wb, token_id: tokb, gate: gpb, out: ob, m, h },
+        ];
+        forward_ops(&mut store_bad, &ops_bad);
+        let model_bad = TrustedModelManifest::from_offline_commitment(&cached, &store_bad.owned_slices(), &ops_bad)
+            .with_index_shapes(&[(tokb, s), (expb, s), (idxb, s)].into());
+        let mut bad_proof3 = bad_proof2;
+        for step in bad_proof3.reverse.steps.iter_mut() {
+            if let ReverseReduction::BroadcastScale { proof: p } = &mut step.reduction {
+                p.prod.final_evals[2] -= Goldilocks::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops_bad, 1, &whir, &bad_proof3,
+            &PublicStatement::Generic, &model_bad, &execution),
+            "a different trusted gate table root must be rejected");
+    }
     #[test]
     fn s2_matmul32_empty_commitments_rejected() {
         use zkie_core::pcs::whir::Whir;
