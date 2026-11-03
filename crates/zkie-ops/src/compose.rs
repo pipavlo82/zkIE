@@ -188,6 +188,8 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
             vec![f(*x)?],
             vec![f(*sel)?, f(*thr)?, f(*gate)?, f(*d1)?, f(*d2)?],
         )),
+        Op::BroadcastScale { x, scale, out, .. } => Some((vec![f(*x)?, f(*scale)?], vec![f(*out)?])),
+        Op::ScaleVec { x, scale, out, .. } => Some((vec![f(*x)?, f(*scale)?], vec![f(*out)?])),
         _ => None,
     }
 }
@@ -1208,6 +1210,153 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     ])
 }
 
+// S7c multiplicative tail: exact product ops used by the router gate chain.
+// The relation out = x * scale_b is proven as an eq-weighted virtual (claim 0)
+// with the OUTPUT endpoint bound to the op's existing output claim via the S4
+// same_poly machinery; x and the (broadcast/periodic) scale endpoints are
+// returned as claims. Rounding variants stay fail-closed.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseBroadcastScaleProof {
+    prod: VirtualProof,
+    bind: SamePolyProof,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseScaleVecProof {
+    prod: VirtualProof,
+    bind: SamePolyProof,
+    /// log2 of the scale period, prover-supplied; the returned scale claim at
+    /// this arity is authenticated upstream, which pins it unless the scale
+    /// is constant.
+    scale_arity: usize,
+}
+
+fn broadcast_scale_dims(op: &Op) -> Option<(T, T, T, usize)> {
+    match op { Op::BroadcastScale { x, scale, out, h } => Some((*x, *scale, *out, *h)), _ => None }
+}
+fn scale_vec_dims(op: &Op) -> Option<(T, T, T, u32)> {
+    match op { Op::ScaleVec { x, scale, out, shift } => Some((*x, *scale, *out, *shift)), _ => None }
+}
+fn exact_product_terms() -> Vec<(Goldilocks, Vec<usize>)> {
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    vec![(Goldilocks::ONE, vec![0usize, 1usize, 2usize]), (neg, vec![0usize, 3usize])]
+}
+
+fn prove_reverse_broadcast_scale(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
+    transcript: &mut Transcript) -> Option<(ReverseBroadcastScaleProof, Vec<EvalClaim>)>
+{
+    let (x, scale, out, h) = broadcast_scale_dims(op)?;
+    let xv = store.get(x);
+    let sv = store.get(scale);
+    let ov = store.get(out);
+    let l = xv.len();
+    if l == 0 || ov.len() != l || !l.is_power_of_two() || !h.is_power_of_two() { return None; }
+    if sv.len().checked_mul(h)? != l { return None; }
+    let lgl = l.trailing_zeros() as usize;
+    let lgh = h.trailing_zeros() as usize;
+    if point.len() != lgl { return None; }
+    let scale_b: Vec<Goldilocks> = (0..l).map(|i| sv[i / h]).collect();
+    let q: Vec<Goldilocks> = transcript.field_vec(lgl);
+    let eq = mle::eq_evals(&q);
+    let terms = exact_product_terms();
+    let (prod, z) = prove_virtual(&[&eq, xv, &scale_b, ov], &terms, Goldilocks::ZERO, transcript);
+    if z.len() != lgl || prod.final_evals.len() != 4 { return None; }
+    let (bind, _) = prove_same_poly(ov, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
+    let x_val = prod.final_evals[1];
+    let s_val = prod.final_evals[2];
+    let xk = TensorKey::Field(x).encoded()?;
+    let sk = TensorKey::Field(scale).encoded()?;
+    let _ = &prod;
+    Some((ReverseBroadcastScaleProof { prod, bind },
+        vec![
+            EvalClaim { tensor_id: xk, point: z.clone(), value: x_val },
+            EvalClaim { tensor_id: sk, point: z[lgh..].to_vec(), value: s_val },
+        ]))
+}
+
+fn verify_reverse_broadcast_scale(op: &Op, point: &[Goldilocks], value: Goldilocks,
+    proof: &ReverseBroadcastScaleProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+{
+    let (x, scale, _out, h) = broadcast_scale_dims(op)?;
+    if !h.is_power_of_two() { return None; }
+    let lgl = point.len();
+    if lgl == 0 || lgl > 30 { return None; }
+    let lgh = h.trailing_zeros() as usize;
+    if lgh >= lgl { return None; }
+    let q: Vec<Goldilocks> = transcript.field_vec(lgl);
+    let terms = exact_product_terms();
+    let (ok, z, fc) = verify_virtual(&proof.prod, &terms, Goldilocks::ZERO, lgl, transcript);
+    if !ok || z.len() != lgl { return None; }
+    let fe = &proof.prod.final_evals;
+    if fe.len() != 4 || fe[0] != mle::eq_poly(&q, &z) || fc != virtual_eval(&terms, fe) { return None; }
+    if verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
+        return None;
+    }
+    let xk = TensorKey::Field(x).encoded()?;
+    let sk = TensorKey::Field(scale).encoded()?;
+    Some(vec![
+        EvalClaim { tensor_id: xk, point: z.clone(), value: fe[1] },
+        EvalClaim { tensor_id: sk, point: z[lgh..].to_vec(), value: fe[2] },
+    ])
+}
+
+fn prove_reverse_scale_vec(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
+    transcript: &mut Transcript) -> Option<(ReverseScaleVecProof, Vec<EvalClaim>)>
+{
+    let (x, scale, out, shift) = scale_vec_dims(op)?;
+    if shift != 0 { return None; }
+    let xv = store.get(x);
+    let sv = store.get(scale);
+    let ov = store.get(out);
+    let l = xv.len();
+    if l == 0 || ov.len() != l || !l.is_power_of_two() { return None; }
+    if sv.is_empty() || !sv.len().is_power_of_two() || l % sv.len() != 0 { return None; }
+    let lgl = l.trailing_zeros() as usize;
+    let lgs = sv.len().trailing_zeros() as usize;
+    if point.len() != lgl { return None; }
+    let scale_b: Vec<Goldilocks> = (0..l).map(|i| sv[i % sv.len()]).collect();
+    let q: Vec<Goldilocks> = transcript.field_vec(lgl);
+    let eq = mle::eq_evals(&q);
+    let terms = exact_product_terms();
+    let (prod, z) = prove_virtual(&[&eq, xv, &scale_b, ov], &terms, Goldilocks::ZERO, transcript);
+    if z.len() != lgl || prod.final_evals.len() != 4 { return None; }
+    let (bind, _) = prove_same_poly(ov, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
+    let x_val = prod.final_evals[1];
+    let s_val = prod.final_evals[2];
+    let xk = TensorKey::Field(x).encoded()?;
+    let sk = TensorKey::Field(scale).encoded()?;
+    let _ = &prod;
+    Some((ReverseScaleVecProof { prod, bind, scale_arity: lgs },
+        vec![
+            EvalClaim { tensor_id: xk, point: z.clone(), value: x_val },
+            EvalClaim { tensor_id: sk, point: z[..lgs].to_vec(), value: s_val },
+        ]))
+}
+
+fn verify_reverse_scale_vec(op: &Op, point: &[Goldilocks], value: Goldilocks,
+    proof: &ReverseScaleVecProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+{
+    let (x, scale, _out, shift) = scale_vec_dims(op)?;
+    if shift != 0 { return None; }
+    let lgl = point.len();
+    if lgl == 0 || lgl > 30 { return None; }
+    if proof.scale_arity > lgl { return None; }
+    let q: Vec<Goldilocks> = transcript.field_vec(lgl);
+    let terms = exact_product_terms();
+    let (ok, z, fc) = verify_virtual(&proof.prod, &terms, Goldilocks::ZERO, lgl, transcript);
+    if !ok || z.len() != lgl { return None; }
+    let fe = &proof.prod.final_evals;
+    if fe.len() != 4 || fe[0] != mle::eq_poly(&q, &z) || fc != virtual_eval(&terms, fe) { return None; }
+    if verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
+        return None;
+    }
+    let xk = TensorKey::Field(x).encoded()?;
+    let sk = TensorKey::Field(scale).encoded()?;
+    Some(vec![
+        EvalClaim { tensor_id: xk, point: z.clone(), value: fe[1] },
+        EvalClaim { tensor_id: sk, point: z[..proof.scale_arity].to_vec(), value: fe[2] },
+    ])
+}
+
 /// Reverse reduction proof. Its returned leaf claims still need independent
 /// authentication against caller-trusted inputs and model commitments.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1248,6 +1397,10 @@ enum ReverseReduction {
     PadIdx { base: Goldilocks },
     /// S7c: router top-k authentication (pre-committed witness aux).
     TopKSelect { proof: ReverseTopKSelectProof },
+    /// S7c: out = x * scale[i/h].
+    BroadcastScale { proof: ReverseBroadcastScaleProof },
+    /// S7c: out = x * scale[i % s] (shift 0 only).
+    ScaleVec { proof: ReverseScaleVecProof },
     Transpose,
 }
 
@@ -3052,6 +3205,22 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 }
                 ReverseReduction::TopKSelect { proof }
             }
+            Op::BroadcastScale { .. } => {
+                let (proof, incoming) = prove_reverse_broadcast_scale(store, op, &point, value, transcript)?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::BroadcastScale { proof }
+            }
+            Op::ScaleVec { .. } => {
+                let (proof, incoming) = prove_reverse_scale_vec(store, op, &point, value, transcript)?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::ScaleVec { proof }
+            }
             Op::CombineIdx { a, b, scale, out: out_t, .. } => {
                 // S5 (reverse): out = scale*a + b at the claim point. When the
                 // verifier can replay the output (and inputs) from public
@@ -3264,6 +3433,18 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 let range_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::TopKSelectXRange)?;
                 let thr_range_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::TopKSelectThrRange)?;
                 for c in verify_reverse_topk(op, &merged_out, witness, thr_aux, range_aux, thr_range_aux, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+            }
+            (Op::BroadcastScale { .. }, ReverseReduction::BroadcastScale { proof }) => {
+                for c in verify_reverse_broadcast_scale(op, &point, value, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+            }
+            (Op::ScaleVec { .. }, ReverseReduction::ScaleVec { proof }) => {
+                for c in verify_reverse_scale_vec(op, &point, value, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -9282,6 +9463,20 @@ fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<
                 let ko = TensorKey::Index(*out).encoded()?;
                 let lb = *model.tensor_lengths.get(&kb)?;
                 if *model.tensor_lengths.get(&ko)? != lb.checked_mul(*b)? { return None; }
+            }
+            Op::BroadcastScale { x, scale, out, h } => {
+                if !h.is_power_of_two() { return None; }
+                let lx = *model.tensor_lengths.get(&TensorKey::Field(*x).encoded()?)?;
+                let lo = *model.tensor_lengths.get(&TensorKey::Field(*out).encoded()?)?;
+                let ls = *model.tensor_lengths.get(&TensorKey::Field(*scale).encoded()?)?;
+                if lx != lo || !lx.is_power_of_two() || ls.checked_mul(*h)? != lx { return None; }
+            }
+            Op::ScaleVec { x, scale, out, shift } => {
+                if *shift != 0 { return None; }
+                let lx = *model.tensor_lengths.get(&TensorKey::Field(*x).encoded()?)?;
+                let lo = *model.tensor_lengths.get(&TensorKey::Field(*out).encoded()?)?;
+                let ls = *model.tensor_lengths.get(&TensorKey::Field(*scale).encoded()?)?;
+                if lx != lo || !lx.is_power_of_two() || !ls.is_power_of_two() || lx % ls != 0 { return None; }
             }
             Op::Gather { weighted, token_id, gate, out, m, h } => {
                 let kt = TensorKey::Index(*token_id).encoded()?;
@@ -15926,6 +16121,86 @@ mod tests {
     /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and    /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and
     /// sumcheck are both emptied must be rejected (empty lists can never skip
     /// non-empty computation).
+    /// S7c multiplicative tail: BroadcastScale out[i] = x[i]*scale[i/h],
+    /// proven with an eq-weighted product virtual and the S4 same_poly binding
+    /// of the output endpoint to the op's output claim.
+    #[test]
+    fn s7c_broadcast_scale_bound_roundtrip() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..16).map(|i| from_i64(i as i64 - 5)).collect();
+        let sv: Vec<Goldilocks> = vec![from_i64(2), from_i64(-3), from_i64(5), from_i64(-1)];
+        let x = store.push(xv.clone());
+        let scale = store.push(sv.clone());
+        let out = store.push(vec![]);
+        let ops = vec![Op::BroadcastScale { x, scale, out, h: 4 }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-bcast");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(x, xv), (scale, sv)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("broadcast scale proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution),
+            "honest BroadcastScale must verify");
+        let mut bad = proof;
+        for step in bad.reverse.steps.iter_mut() {
+            if let ReverseReduction::BroadcastScale { proof: p } = &mut step.reduction {
+                p.prod.final_evals[1] += Goldilocks::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad, &PublicStatement::Generic, &model, &execution),
+            "tampered BroadcastScale product endpoint must be rejected");
+    }
+    /// S7c multiplicative tail: ScaleVec (shift 0 only) out[i] = x[i]*scale[i%s].
+    /// Non-zero shifts (rounding tail) stay fail-closed.
+    #[test]
+    fn s7c_scale_vec_bound_roundtrip_and_shift_closed() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..16).map(|i| from_i64(i as i64 - 8)).collect();
+        let sv: Vec<Goldilocks> = vec![from_i64(3), from_i64(-2), from_i64(7), from_i64(1)];
+        let x = store.push(xv.clone());
+        let scale = store.push(sv.clone());
+        let out = store.push(vec![]);
+        let ops = vec![Op::ScaleVec { x, scale, out, shift: 0 }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-svec");
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(x, xv), (scale, sv)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("scale vec proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution),
+            "honest ScaleVec(shift 0) must verify");
+
+        // shift != 0 requires the rounding remainder tail: fail closed.
+        let mut store2 = Store::new();
+        let x2 = store2.push((0..16).map(|i| from_i64(i as i64 - 8)).collect());
+        let s2 = store2.push(vec![from_i64(3), from_i64(-2), from_i64(7), from_i64(1)]);
+        let o2 = store2.push(vec![]);
+        // The shift>0 rounding contract references an identity table of
+        // length 2^shift; provide it so the manifest can be built, then the
+        // bound entry must still fail closed for the unsupported shift.
+        let _id2 = store2.push(vec![Goldilocks::ZERO, Goldilocks::ONE]);
+        let ops2 = vec![Op::ScaleVec { x: x2, scale: s2, out: o2, shift: 1 }];
+        let cached2 = commit_model_weights(&store2, &ops2, "/tmp/zkie-s7c-svec-shift");
+        forward_ops(&mut store2, &ops2);
+        let model2 = TrustedModelManifest::from_offline_commitment(&cached2, &store2.owned_slices(), &ops2);
+        let execution2 = TrustedExecution {
+            inputs: [(x2, store2.get(x2).to_vec()), (s2, store2.get(s2).to_vec())].into(),
+            outputs: [(o2, store2.get(o2).to_vec())].into(),
+        };
+        assert!(prove_committed_shard_dag_bound(&mut store2, &ops2, 1, &whir, &cached2, 0, 0,
+            &PublicStatement::Generic, &model2, &execution2).is_none(),
+            "ScaleVec shift != 0 (rounding tail) must stay fail-closed");
+    }
     #[test]
     fn s2_matmul32_empty_commitments_rejected() {
         use zkie_core::pcs::whir::Whir;

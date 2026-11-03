@@ -153,7 +153,13 @@ same `(token_id, expert_of)` pair: `gate_pos` claim → Lookup → idx_gate →
 CombineIdx → token_id/expert_of claims → Scatter routing → TopKSelect sel,
 with `gate` from the same TopKSelect reduction.
 
-### 4. Multiplicative tail reductions (ScaleVec / BroadcastScale)
+### 4. Multiplicative tail reductions (ScaleVec / BroadcastScale) — DONE (best effort)
+
+Implemented as exact-product eq-weighted virtuals with S4 same_poly output
+binding: BroadcastScale (out[i]=x[i]*scale[i/h]) and ScaleVec shift 0
+(out[i]=x[i]*scale[i%s]); ScaleVec shift>0 rounding remains fail-closed.
+The gate-consistency chain test is still blocked on the Scatter order proof.
+
 
 Needed for `weighted = d·gate_pos`. Reverse pattern: eq-weighted product
 virtual with claim 0 at a fresh point; the *output* endpoint must be
