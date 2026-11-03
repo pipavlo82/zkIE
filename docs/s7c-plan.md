@@ -360,8 +360,13 @@ statements; it is explicitly NOT gist S7 acceptance.
   8-expert slice built from the ACTUAL routed experts of this row
   ([13,42,47,9,2,31]) plus real experts 6,7 for the masked padding rows,
   with an explicit public slice table; the external statement binds A's
-  original routing output to B's sliced public input item-by-item. This is
-  a real-weight segmented experiment, not S7 acceptance.
+  original routing output to B's sliced public input item-by-item. The
+  composition verifier authenticates the slice TENSOR commitment and the
+  public slice index mapping, but NOT that the slice equals the
+  corresponding rows of the full 64-expert model: that identity is a
+  trusted-offline manifest/external-modeling assumption (explicit
+  `slice_experts` applied to the real weight file). This is a real-weight
+  segmented experiment, not S7 acceptance.
 
 ## Acceptance gate
 

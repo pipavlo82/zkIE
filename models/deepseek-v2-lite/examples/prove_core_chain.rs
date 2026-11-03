@@ -20,6 +20,12 @@
 //! IdxBroadcast in B uses the existing verifier replay path, which checks
 //! the public index values are < 2^32 and uses checked u32 arithmetic for
 //! b*base+j. No reduction is added and no constraint is bypassed.
+//! TRUSTED-OFFLINE NOTE: the composition verifier authenticates the 8-expert
+//! slice TENSOR commitment and the public slice index mapping, but it does
+//! NOT prove that this slice equals the corresponding rows of the full
+//! 64-expert model. That identity must be established by a trusted offline
+//! manifest / external modeling (here: the explicit slice_experts list
+//! applied to the real L*_experts_gate_i32.bin file).
 //!
 //! BOUNDARY (not gist S7 acceptance): the verifier of B ingests the full
 //! routing arrays as public data, which the gist forbids for the final S7
@@ -389,9 +395,13 @@ fn main() {
         &PublicStatement::Generic, &model_b, &execution_b)
         .expect("phase B real FFN proof");
     let bytes_b = bincode::serialize(&proof_b).expect("serialize B");
+    let b_prove_t = t3.elapsed();
     let t4 = Instant::now();
     assert!(verify_committed_shard_dag_bound_bytes(&bytes_b, &ops_b, 1, &whir,
         &PublicStatement::Generic, &model_b, &execution_b), "phase B must verify");
+    // Capture the B verify time HERE: the print below happens after the
+    // composition/B2 tests and must not fold their cost into this number.
+    let b_verify_t = t4.elapsed();
     // Independent composition verification (caller statement + both proofs
     // + models + ops only).
     assert!(verify_segmented(&stmt, &ops_a, &model_a, &bytes_a, &ops_b, &model_b, &bytes_b, &whir),
@@ -445,7 +455,7 @@ fn main() {
         "cross-segment A1 + B2 mismatch must be rejected");
     println!("negative rejected: cross-segment individually-valid A1+B2 mismatch");
     println!("B commit+prove {:?} verify {:?} bytes {} peak_rss={}kB",
-        t3.elapsed(), t4.elapsed(), bytes_b.len(), peak_rss_kb());
+        b_prove_t, b_verify_t, bytes_b.len(), peak_rss_kb());
 
     // ---------------- real-data malicious regressions (bytes entry) ----------------
     let mut bad_a = execution_a.clone();
