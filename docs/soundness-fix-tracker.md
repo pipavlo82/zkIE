@@ -107,3 +107,16 @@
 | 真实 WHIR opening + 伪造外层 sumcheck | 拒绝 | S1 |
 | 缺 op proof 序列化合法 | 返回 false 不 panic | S8 |
 | GatherMatMul fake counts/table（bound 路径） | 拒绝 | S7 阶段性（S7 未完成）：`s7_equal_length_forged_counts_table_rejected` / `s7_swapped_expert_weights_rejected` 绿；plain shard 路径仍接受该反例，待 S7b 封闭 |
+
+## 2026-11-03 老板决策：暂停 S7 完整 64 专家验收，先做 gist O5
+
+- **顺序**：暂停 S7 完整 64 专家验收；先完成 gist **O5**（权重按形状组 mmap 加载，避免按 claim 复制整张量）并自测；O5 落地后回测 S7 完整 64 专家。**O2/O3/O4/O6/O7** 按老板后续指示依次前置；**S8/S9 后移**。
+- **O5 约束（严格按 /tmp/gist_soundness.md O5 与 docs/streaming-weight-gather.md）**：
+  - 按形状组逐组打开 mmap、收集 claim、归约/open、释放临时缓冲；不把全部权重组 materialize 成常驻 owned Vec。
+  - 接口接受不可变 slice 或共享所有权；每个唯一多项式只保留必要的可变折叠副本。
+  - 同一多项式多点使用合并 equality 权重 `W_t(X)=Σ_i gamma^i eq(r_i,X)`，不为每个请求复制 f_t；权重生成需复用前缀/按块生成，避免以去掉 Vec clone 换取更大的 `N×请求数` 峰值。
+  - owned 折叠缓冲与并行组数仍需预算；mmap 可回收页不保证不 OOM。
+  - **不得改变认证关系或安全等级**（security >= 90 不变）。
+  - 指标（同安全等级、同真实输入、同认证范围对比）：唯一张量数/claim 数/复制字节、RSS、page fault、读盘字节、prove 时间；重点验证 DeepSeek 内存压力；不把文件缓存命中当算法加速。
+  - 验收：security 与认证关系不变；诚实与恶意回归全部保持；记录关闭优化的对照。
+- **状态**：S7 完整 64 专家**未验收**，不得宣称 S7 完成；本轮先同步决策，O5 自测后回测。
