@@ -1,4 +1,7 @@
-//! S7 core-chain real-data proofs (bound/bytes entry), two-statement shape.
+//! SEGMENTED real-data proofs through the expert GATE PROJECTION (bound/bytes
+//! entry), two-statement shape. This is NOT the complete S7 core chain: it
+//! stops at the gate-projection Scale and does not include the router gate
+//! consistency chain (CombineIdx/Lookup gate_pos/dynamic table) or Gather.
 //!
 //! The single-statement chain cannot certify its internal routing INDEX
 //! intermediates: IdxBroadcast requires the base to be verifier-replayable
@@ -188,10 +191,19 @@ fn main() {
 
     // ---------------- Phase B: replay routing + expert FFN gate ----------------
     let mut sb = Store::new();
-    let remap = |e: u32| -> u32 {
-        match e { 26 => 0, 30 => 1, 34 => 2, 51 => 3, 57 => 4, 61 => 5, 0 => 6, _ => 7 }
+    // Real experts actually routed in this row, ascending (scatter order).
+    let mut routed: Vec<usize> = exp_v.iter().take(s).map(|&e| e as usize).collect();
+    routed.sort_unstable();
+    routed.dedup();
+    assert_eq!(routed.len(), s, "routed experts must be distinct");
+    // Slice = the routed real experts + real experts 6,7 for masked padding.
+    const PAD_EXPERTS: [usize; 2] = [6, 7];
+    let slice_experts: Vec<usize> = routed.iter().copied().chain(PAD_EXPERTS).collect();
+    let slice_of = |i: usize| -> u32 {
+        if i < s { routed.iter().position(|&x| x == exp_v[i] as usize).unwrap() as u32 }
+        else { 6 }
     };
-    let exp_slice: Vec<u32> = exp_v.iter().map(|&e| remap(e)).collect();
+    let exp_slice: Vec<u32> = (0..exp_v.len()).map(slice_of).collect();
     let tok_b = sb.push_idx(tok_v.clone());
     let exp_b = sb.push_idx(exp_slice.clone());
     let mask_v: Vec<Goldilocks> = (0..s_pad)
@@ -204,11 +216,10 @@ fn main() {
     let seg_z = sb.push(vec![]);
     let g_raw = sb.push(vec![]);
     let g = sb.push(vec![]);
-    // Real 8-expert slice: routed experts 26,30,34,51,57,61 plus real
-    // experts 6,7 for the masked padding rows. The public statement's remap
-    // table binds the original routing ids to these slice indices.
-    const SLICE_EXPERTS: [usize; 8] = [26, 30, 34, 51, 57, 61, 6, 7];
-    let w = sb.push(load_expert_slice(&dir, layer, &SLICE_EXPERTS));
+    // Real 8-expert slice: the routed experts plus real experts 6,7 for the
+    // masked padding rows. The public statement's slice table binds the
+    // original routing ids to these slice indices.
+    let w = sb.push(load_expert_slice(&dir, layer, &slice_experts));
     let ops_b = vec![
         Op::IdxBroadcast { base: tok_b, out: idx_seg, b: H },
         Op::Lookup { idx: idx_seg, out: seg, table: act },
@@ -235,7 +246,7 @@ fn main() {
     assert_eq!(to_g(&stmt_exp), to_g(&exp_v));
     // Item-by-item external-statement binding through the public remap:
     // B's public routing input is the remap of A's public routing output.
-    let bound: Vec<u32> = stmt_exp.iter().map(|&e| remap(e)).collect();
+    let bound: Vec<u32> = (0..stmt_exp.len()).map(slice_of).collect();
     assert_eq!(bound, exp_slice);
     assert_eq!(sb.idx[tok_b], stmt_tok);
     assert_eq!(sb.idx[exp_b], bound);
@@ -327,7 +338,7 @@ fn main() {
     let act2_t = s2.push(act2);
     let idx2 = s2.push_idx(vec![]); let seg2 = s2.push(vec![]); let segz2 = s2.push(vec![]);
     let graw2 = s2.push(vec![]); let g2 = s2.push(vec![]);
-    let w2 = s2.push(load_expert_slice(&dir, layer, &SLICE_EXPERTS));
+    let w2 = s2.push(load_expert_slice(&dir, layer, &slice_experts));
     let ops2 = vec![
         Op::IdxBroadcast { base: tok2, out: idx2, b: H },
         Op::Lookup { idx: idx2, out: seg2, table: act2_t },
@@ -343,5 +354,5 @@ fn main() {
     assert!(!verify_committed_shard_dag_bound_bytes(&bytes_b, &ops_b, 1, &whir,
         &PublicStatement::Generic, &model2, &execution_b), "wrong activation table root must be rejected");
     println!("negative rejected: wrong activation table root");
-    println!("CORE-CHAIN-OK layer={layer} A_bytes={} B_bytes={}", bytes_a.len(), bytes_b.len());
+    println!("SEGMENT-OK layer={layer} (through expert gate projection) A_bytes={} B_bytes={}", bytes_a.len(), bytes_b.len());
 }

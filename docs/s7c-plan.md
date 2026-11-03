@@ -330,30 +330,36 @@ statements; it is explicitly NOT gist S7 acceptance.
   which the gist forbids for the final S7 construction. Public routing,
   segmented proofs, and replay are acceptable only as a bounded real-data
   experiment; S7 remains incomplete.
-- Real data: layer 10, seq=1, token 549 (first extracted token). Note the
+- Real data: layer 10, seq=1, token 549 (first extracted token).
+  `scripts/ds_layer_core_inputs.py` runs the FULL reference forward: every
+  prior layer includes its FFN/MoE (dense layer 0, routed+shared experts for
+  1..LAYER-1); at LAYER it exports the post-attention RMSNorm MoE input. The
   file `L*_post_attn_norm_i32.bin` is the RMSNorm WEIGHT (all-positive
-  ~0.09-0.91), not an activation; `scripts/ds_layer_core_inputs.py` exports
-  the real post-attn activation from the raw bf16 shards and the Q16 router
-  scores with the model's exact fixed-point recipe. Measured: max score
-  2480, max|logits16| 86270 < 2^22 (the TopKSelectXRange/ThrRange relations
-  enforce the contract inside the proof; an out-of-range real score fails
-  closed at proof level).
+  ~0.09-0.91), not an activation. Measured (corrected): activation
+  max|.|=835232, max score 28854, max|logits16| 272985 < 2^22; top-6 =
+  [13,42,47,9,2,31]. The TopKSelectXRange/ThrRange relations enforce the
+  contract inside the proof; an out-of-range real score fails closed.
+- Scope (NOT the complete S7 core chain): B stops at the expert GATE
+  PROJECTION. It does not include the router gate consistency chain
+  (CombineIdx -> Lookup gate_pos over the dynamic router table ->
+  BroadcastScale -> Gather) and has no Gather reduction.
 - Malicious regressions (bytes entry, real data): tampered A gate/score
   input, tampered B public routing array and g output, cross-segment A
   routing output tamper, cross-segment B routing mismatch, wrong expert
   weight root, wrong activation table root. Aux-level forgeries (committed
   counts/table, duplicate/deleted routes inside the committed routing) are
   covered by the synthetic S7 regressions, not by this public-API experiment.
-- Measured cost (test machine, 90-bit security): A proof 242,514 bytes,
-  ~0.17 s prove. The FULL 64-expert (2^28-element) gate weight opening is a
-  reported memory blocker: the run was OOM-killed at anon-rss 502,710,376 kB
-  (`Out of memory: Killed process ... prove_core_chai`, dmesg), above the
-  495 GB machine. The run therefore uses a REAL 8-expert slice (routed
-  experts 26,30,34,51,57,61 plus real experts 6,7 for the masked padding
-  rows) with an explicit public remap table; the external statement binds
-  A's original routing output to B's remapped public input item-by-item.
-  This is still a real-weight segmented experiment, not S7 acceptance; B
-  proof size/time/peak RSS are reported by the run.
+- Measured cost (test machine, 90-bit security, corrected data): A proof
+  241,874 bytes, ~0.17 s prove; B (real 8-expert slice, 2^25 weight)
+  commit+prove 19.9 s, verify 30 ms, proof 463,092 bytes, peak RSS ~10.0 GB;
+  all eight negative classes rejected. The FULL 64-expert (2^28-element)
+  gate weight opening is a reported memory blocker: OOM-killed at anon-rss
+  502,710,376 kB (dmesg), above the 495 GB machine. The run uses a REAL
+  8-expert slice built from the ACTUAL routed experts of this row
+  ([13,42,47,9,2,31]) plus real experts 6,7 for the masked padding rows,
+  with an explicit public slice table; the external statement binds A's
+  original routing output to B's sliced public input item-by-item. This is
+  a real-weight segmented experiment, not S7 acceptance.
 
 ## Acceptance gate
 

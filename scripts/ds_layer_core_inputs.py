@@ -58,6 +58,10 @@ def apply_rope(x, cos, sin):
                            x[..., half:] * cos + x[..., :half] * sin], axis=-1)
 
 
+def silu(x):
+    return x / (1.0 + np.exp(-x))
+
+
 def softmax(x, axis=-1):
     x = x - np.max(x, axis=axis, keepdims=True)
     e = np.exp(x)
@@ -116,6 +120,37 @@ def main():
         h = rms_norm(x, post_norm)
         if L == LAYER:
             break
+        # Full FFN/MoE of this layer (the reference trajectory needs it for
+        # the next layer's input; omitting it would make h at LAYER wrong).
+        residual = x
+        if L == 0:
+            gw = S.arr(p + "mlp.gate_proj.weight").astype(np.float64)
+            uw = S.arr(p + "mlp.up_proj.weight").astype(np.float64)
+            dw = S.arr(p + "mlp.down_proj.weight").astype(np.float64)
+            mlp = silu(h @ gw.T) * (h @ uw.T)
+            mlp = mlp @ dw.T
+        else:
+            router = S.arr(p + "mlp.gate.weight").astype(np.float64)
+            sg = S.arr(p + "mlp.shared_experts.gate_proj.weight").astype(np.float64)
+            su = S.arr(p + "mlp.shared_experts.up_proj.weight").astype(np.float64)
+            sd = S.arr(p + "mlp.shared_experts.down_proj.weight").astype(np.float64)
+            logits = h @ router.T
+            scores = softmax(logits, axis=-1)
+            topi = np.argsort(-scores, axis=-1)[:, :E.TOPK]
+            topw = np.take_along_axis(scores, topi, axis=-1)
+            mlp = np.zeros_like(h)
+            for e in range(N):
+                eg = S.arr(p + "mlp.experts.%d.gate_proj.weight" % e).astype(np.float64)
+                eu = S.arr(p + "mlp.experts.%d.up_proj.weight" % e).astype(np.float64)
+                ed = S.arr(p + "mlp.experts.%d.down_proj.weight" % e).astype(np.float64)
+                for t in range(seq):
+                    for kk in range(E.TOPK):
+                        if topi[t, kk] == e:
+                            out = silu(h[t] @ eg.T) * (h[t] @ eu.T)
+                            mlp[t] += topw[t, kk] * (out @ ed.T)
+            sh = silu(h @ sg.T) * (h @ su.T)
+            mlp = mlp + sh @ sd.T
+        x = residual + mlp
     act = np.clip(np.round(h.reshape(-1) * E.SCALE), -(2 ** 31), 2 ** 31 - 1).astype(np.int32)
     router = np.fromfile(os.path.join(DS_WEIGHTS, "L%d_router_i32.bin" % LAYER),
                          dtype="<i4").astype(np.int64).reshape(H, N)
