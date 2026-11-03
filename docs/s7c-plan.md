@@ -10,7 +10,10 @@ Status of S7 at this commit: **incomplete**. Implemented and reviewed-in-stage:
 - **TopKSelect**: wired with pre-committed witness/thr aux, whole-column
   broadcast, attainment and a strict-tie fail-closed boundary (see status
   below; the deterministic smaller-index tie rule is still pending).
-- **Fail-closed**: Scatter, Softmax, BatchedMatMul, BroadcastScale, ScaleVec,
+- **Scatter**: authenticated token/expert routing with the sel counts identity;
+  standalone and TopK->Scatter chain bound roundtrips plus duplicate-route
+  rejection are green (separate commit).
+- **Fail-closed**: Softmax, BatchedMatMul, BroadcastScale, ScaleVec,
   and every other op without a reverse reduction. A `Scatter` graph is refused
   (`s7c_scatter_still_fail_closed`); the gate-weighted tail (BroadcastScale)
   is refused (`s7b_gate_weighted_tail_fail_closed`).
