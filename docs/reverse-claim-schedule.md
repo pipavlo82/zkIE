@@ -4,7 +4,9 @@ This document describes the intended committed verifier schedule. It is not a
 claim that all operators or the complete protocol have been migrated or audited.
 The current bound proof supports Add, MatMul, Projection, Scale, Transpose,
 bounded ReLU, GeluIndex, Lookup, Argmax, the GatherMatMul expert-FFN core,
-the Gather scatter-add with authenticated one-hot routing, the linear index ops
+the Gather scatter-add with authenticated one-hot routing, Scatter with the
+expert-major order proof (key column + masked strict-increase + LogUp shift
+permutation), the linear index ops
 CombineIdx/IdxBroadcast/PadIdx, the exact-product tail ops BroadcastScale and
 ScaleVec (shift 0), and TopKSelect with pre-committed witness aux,
 whole-column threshold broadcast, threshold attainment, verifier-authenticated
@@ -12,7 +14,7 @@ signed range proofs for x and thr_b (contract [-2^22, 2^22), out-of-range
 fails closed) and a strict-tie fail-closed boundary (staged parts of S7; S7
 itself remains incomplete; the real DeepSeek single layer has not been run). The
 bound entry also supports the LanguageModel public statement (S6). Still fail
-closed: Scatter (pending the expert-major order proof), BatchedMatMul, Softmax,
+closed: BatchedMatMul, Softmax,
 SoftmaxIndex, StableSoftmaxIndex, LayerNorm/RmsNorm/RoPE, ScaleVec with rounding
 shifts, plus every op whose index inputs are not authenticated. TopKSelect's final acceptance still requires the gist/forward
 deterministic smaller-index tie-break on real tied inputs (the current path

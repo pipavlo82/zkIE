@@ -142,6 +142,53 @@ identity fail against the TopK sel opening; token/expert values stay in
 to be public seeds at the bound entry (execution_seeds requires power-of-two
 public lengths); otherwise fail closed.
 
+### 2b. Scatter expert-major order proof — IMPLEMENTED
+
+The multiset identity is insufficient (TL review f48fcfd): a permuted routing
+array with the same (token, expert) multiset is accepted. The forward contract
+requires the active pairs in column-major key order key = e*m + t, and a formal
+bound counterexample confirms the pre-fix verifier accepted a swap.
+
+Gadget (compatible with the existing LogUp permutation argument):
+
+1. New pre-committed aux `ScatterOrder` over the padded flat position domain:
+   - `k[pos]` = key of the pair at pos (0 on padding), with a B-bit
+     decomposition, B = log2(m*n), masked to pos < s. This gives the key range
+     [0, m*n) for active positions.
+   - `k_next[pos]` = cyclic shift of k: k_next[pos] = k[pos-1] for pos >= 1,
+     k_next[0] = k[2^A - 1].
+   - `d[pos]` = k_next[pos] - k[pos] - 1, committed, with a masked bit
+     decomposition proving d >= 0 for 1 <= pos < s (strict increase on the
+     real sequence; padding unconstrained).
+   - key-consistency virtual (claim 0): k = m * sum_e e*X_e + sum_t t*R_t,
+     endpoints opened from the routing aux; this binds k to the same one-hot
+     columns the tie checks bind to the arrays.
+   - shift bindings: eq-weighted virtuals k_next - k_shift = 0 over the
+     committed columns, where k_shift is the pair-permutation gadget below.
+
+2. Shift via pair-multiset permutation (no shift sumcheck needed): sample gamma,
+   build a[p] = k_next[p] + gamma*p and b[q] = k[q] + gamma*((q+1) mod 2^A),
+   and prove multiset equality with the LogUp permutation argument
+   (prove_permutation/verify_permutation). The deterministic second component
+   makes the matching unique, so multiset equality forces k_next[p] = k[p-1]
+   pointwise (cyclic). The verifier additionally checks the encodings at the
+   fractional leaf points against openings of the committed k/k_next columns
+   (the identity-index MLE is a closed form the verifier computes), which binds
+   the carried a/b vectors to the commitments (Schwartz-Zippel). This is the
+   new primitive to implement and review; it needs aux openings at the
+   fractional leaf points but no changes to the sumcheck core.
+
+3. Consequences: the returned pairs are distinct values in [0, m*n), strictly
+   increasing, and (by the counts identity + sel Booleanity) have exactly the
+   sel support as their multiset. A strictly increasing sequence with that
+   multiset is unique and equals scatter_forward's expert-major enumeration.
+   Padding positions carry no pair (mask), so the compressed length is s.
+
+Until steps 1-3 are implemented and a bound malicious witness for the swapped
+order is rejected, Scatter remains fail-closed (commit 5df8e59). The formal
+pre-fix counterexample already reproduced: with m=n=2, sel all ones and the
+positions 0/2 swapped, the old bound verifier returned true.
+
 ### 3. Gate consistency chain
 
 `idx_gate = token_id·n + expert_of` via `CombineIdx` (linear; already
