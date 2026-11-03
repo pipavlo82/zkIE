@@ -15550,6 +15550,180 @@ mod tests {
             "signed-range wrap (A=2^63, B=2^63-1) must be rejected");
     }
 
+    /// Review coverage: the signed-range linear identity alone is not enough;
+    /// the Booleanity terms are essential. This witness keeps the linear
+    /// identity x + 2^22 = sum 2^b bit_b exactly while using NON-Boolean range
+    /// values (bit_22 = 2 and bit_0 = -e), so only the Booleanity part of the
+    /// range virtual can reject it. A regression that drops those terms would
+    /// accept this witness.
+    #[test]
+    fn s7c_topk_signed_range_nonboolean_bits_rejected() {
+        let (m, n, k) = (4usize, 8usize, 1usize);
+        let arity = (m * n).trailing_zeros() as usize;
+        let lgm = m.trailing_zeros() as usize;
+        let thr_arity = lgm.max(5);
+        let bound = 1i64 << 22;
+        let mut xv = vec![Goldilocks::ZERO; m * n];
+        for e in 0..n { xv[e] = from_i64(bound - e as i64); }
+        for r in 1..m { for e in 0..n { xv[r * n + e] = from_i64((r * 20 + e) as i64); } }
+        let mut sel_v = vec![Goldilocks::ZERO; m * n];
+        let mut thr_v = vec![Goldilocks::ZERO; m];
+        for r in 0..m {
+            let mut best = 0usize;
+            for e in 1..n { if to_i64(xv[r * n + e]) > to_i64(xv[r * n + best]) { best = e; } }
+            sel_v[r * n + best] = Goldilocks::ONE;
+            thr_v[r] = xv[r * n + best];
+        }
+        // Malicious row 0: select the out-of-range maximum 2^22.
+        sel_v[0] = Goldilocks::ONE;
+        thr_v[0] = from_i64(bound);
+        let mut gate_v = vec![Goldilocks::ZERO; m * n];
+        let mut d1_v = vec![Goldilocks::ZERO; m * n];
+        let mut d2s_v = vec![Goldilocks::ZERO; m * n];
+        let mut att = vec![Goldilocks::ZERO; m * n];
+        att[0] = Goldilocks::ONE;
+        for r in 0..m {
+            let t = thr_v[r];
+            for e in 0..n {
+                let at = r * n + e;
+                gate_v[at] = sel_v[at] * xv[at];
+                if sel_v[at] == Goldilocks::ONE { d1_v[at] = xv[at] - t; }
+                else { d2s_v[at] = t - xv[at] - Goldilocks::ONE; }
+                if r > 0 && sel_v[at] == Goldilocks::ONE && xv[at] == t { att[at] = Goldilocks::ONE; }
+            }
+        }
+        let mut thr_b = vec![Goldilocks::ZERO; m * n];
+        for r in 0..m { for e in 0..n { thr_b[r * n + e] = thr_v[r]; } }
+        let wcols = topk_test_witness_columns(&sel_v, &thr_b, &att, &gate_v, &d1_v, &d2s_v, m, n, arity);
+        let mut tcols = vec![vec![Goldilocks::ZERO; 1usize << thr_arity]];
+        for r in 0..m { tcols[0][r] = thr_v[r]; }
+
+        // Non-Boolean range columns: bit_22 = 2, bit_0 = target - 2^23.
+        let padded = 1usize << arity;
+        let mut xcols = vec![vec![Goldilocks::ZERO; padded]; TK_SIGNED_BITS];
+        let mut bcols = vec![vec![Goldilocks::ZERO; padded]; TK_SIGNED_BITS];
+        for at in 0..m * n {
+            let r = at / n;
+            if r == 0 {
+                let target = xv[at] + Goldilocks::from_u64(bound as u64);
+                xcols[22][at] = Goldilocks::from_u64(2);
+                xcols[0][at] = target - Goldilocks::from_u64(2 * (bound as u64));
+                bcols[22][at] = Goldilocks::from_u64(2);
+            } else {
+                let v = to_i64(xv[at]) + bound;
+                assert!(v >= 0 && (v as u64) < (1u64 << TK_SIGNED_BITS));
+                for b in 0..TK_SIGNED_BITS { xcols[b][at] = Goldilocks::from_u64(((v as u64) >> b) & 1); }
+            }
+        }
+        for r in 0..m {
+            let v = to_i64(thr_v[r]) + bound;
+            for e in 0..n {
+                let at = r * n + e;
+                if r == 0 {
+                    bcols[22][at] = Goldilocks::from_u64(2);
+                    bcols[0][at] = Goldilocks::ZERO;
+                } else {
+                    assert!(v >= 0 && (v as u64) < (1u64 << TK_SIGNED_BITS));
+                    for b in 0..TK_SIGNED_BITS { bcols[b][at] = Goldilocks::from_u64(((v as u64) >> b) & 1); }
+                }
+            }
+        }
+        let mut store = Store::new();
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let op = Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k };
+        let outs = topk_test_outs(&op, &wcols, &tcols, arity, lgm, thr_arity);
+        let witness = topk_test_commit(0, AuxRole::TopKSelectWitness, m * n, arity, wcols);
+        let thr_aux = topk_test_commit(0, AuxRole::TopKSelectThr, m, thr_arity, tcols);
+        let range = topk_test_commit(0, AuxRole::TopKSelectXRange, m * n, arity, xcols);
+        let thr_range = topk_test_commit(0, AuxRole::TopKSelectThrRange, m * n, arity, bcols);
+        let wdesc = witness.descriptor.clone();
+        let tdesc = thr_aux.descriptor.clone();
+        let rdesc = range.descriptor.clone();
+        let trdesc = thr_range.descriptor.clone();
+        let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-nonbool");
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, &mut tp);
+        assert!(bad.is_some());
+        let (bad_proof, _) = bad.unwrap();
+        let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-nonbool");
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &bad_proof, &mut tv).is_none(),
+            "non-Boolean range bits must be rejected (Booleanity is essential)");
+    }
+
+    /// Review coverage: k = n selects every position, so row 1 (values
+    /// -2^22 .. -2^22+7) has thr = -2^22 exactly, the in-range boundary;
+    /// x also reaches 2^22-1 in row 0. Must prove and verify through the
+    /// bound entry. A k=1 row containing 2^22 is out of contract (thr = 2^22)
+    /// and fails closed.
+    #[test]
+    fn s7c_topk_signed_range_thr_boundary_roundtrip() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, n, k) = (4usize, 8usize, 8usize);
+        let bound = 1i64 << 22;
+        let mut xv = vec![Goldilocks::ZERO; m * n];
+        for e in 0..n { xv[e] = from_i64(bound - 1 - e as i64); }
+        for e in 0..n { xv[n + e] = from_i64(-bound + e as i64); }
+        for e in 0..n { xv[2 * n + e] = from_i64(e as i64); }
+        for e in 0..n { xv[3 * n + e] = from_i64(-8 + e as i64); }
+        let mut store = Store::new();
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let (thr_v, sel_v, gate_v, d1_v, d2_v) = topk_forward(&xv, m, n, k);
+        assert_eq!(thr_v[1], from_i64(-bound), "row 1 threshold hits -2^22");
+        store.v[sel] = TensorData::Owned(sel_v.clone());
+        store.v[thr] = TensorData::Owned(thr_v.clone());
+        store.v[gate] = TensorData::Owned(gate_v.clone());
+        store.v[d1] = TensorData::Owned(d1_v.clone());
+        store.v[d2] = TensorData::Owned(d2_v.clone());
+        let ops = vec![Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k }];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-topk-thr-edge");
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(x, xv.clone())].into(),
+            outputs: [(sel, sel_v), (thr, thr_v), (gate, gate_v), (d1, d1_v), (d2, d2_v)].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("thr boundary bound proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution),
+            "thr = -2^22 boundary proof must verify");
+
+        // k = 1 with a maximum of 2^22 makes thr = 2^22, outside the contract.
+        let mut store2 = Store::new();
+        let mut xv2 = xv.clone();
+        xv2[0] = from_i64(bound);
+        let x2 = store2.push(xv2.clone());
+        let sel2 = store2.push(vec![]);
+        let thr2 = store2.push(vec![]);
+        let gate2 = store2.push(vec![]);
+        let d12 = store2.push(vec![]);
+        let d22 = store2.push(vec![]);
+        let (t2, s2, g2, d1b, d2b) = topk_forward(&xv2, m, n, 1);
+        store2.v[sel2] = TensorData::Owned(s2.clone());
+        store2.v[thr2] = TensorData::Owned(t2.clone());
+        store2.v[gate2] = TensorData::Owned(g2.clone());
+        store2.v[d12] = TensorData::Owned(d1b.clone());
+        store2.v[d22] = TensorData::Owned(d2b.clone());
+        let ops2 = vec![Op::TopKSelect { x: x2, sel: sel2, thr: thr2, gate: gate2, d1: d12, d2: d22, m, n, k: 1 }];
+        let cached2 = commit_model_weights(&store2, &ops2, "/tmp/zkie-s7c-topk-thr-oob");
+        let model2 = TrustedModelManifest::from_offline_commitment(&cached2, &store2.owned_slices(), &ops2);
+        let execution2 = TrustedExecution {
+            inputs: [(x2, xv2)].into(),
+            outputs: [(sel2, s2), (thr2, t2), (gate2, g2), (d12, d1b), (d22, d2b)].into(),
+        };
+        assert!(prove_committed_shard_dag_bound(&mut store2, &ops2, 1, &whir, &cached2, 0, 0,
+            &PublicStatement::Generic, &model2, &execution2).is_none(),
+            "thr = 2^22 is outside the signed range contract and must fail closed");
+    }
+
     /// Same A/B wrap counterexample, but assembled as a full
     /// BoundExecutionProof and passed through the PUBLIC bound verifier: the
     /// caller trusts the public statement/execution, while the prover forges
