@@ -124,13 +124,12 @@ authentication scope.
 
 ## S7 full 64-expert weight regression (previously OOM-killed)
 
-Harness: temporary full-64 variant of the example (`/tmp/prove_core_chain.rs`,
-copied to `models/deepseek-v2-lite/examples/prove_core_chain_full64.rs` for the
-build): a single 2^28-element real expert-gate weight, mmap-backed
-(`WeightMmap` + `Store::push_mmap`), 64 claims on one table; built as
-`prove_core_chain_full64`, binary retained, source NOT committed. Same real
-layer-10 data, 90-bit, cache in /dev/shm. The `.d` file records the temporary
-source path and no `.rs` under crates/models is newer than the binary.
+Harness (committed): `models/deepseek-v2-lite/examples/prove_core_chain_full64.rs`,
+the full-64 variant of the segmented real-data experiment: a single
+2^28-element real expert-gate weight, mmap-backed (`WeightMmap` +
+`Store::push_mmap`), 64 claims on one table; same real layer-10 data, 90-bit,
+cache in /dev/shm. It is a memory/protocol regression harness, NOT S7
+acceptance (segmented A/B; B reads the full routing arrays as public data).
 
 Command (cold; warm is the same line rerun without the drop):
 ```
@@ -163,13 +162,47 @@ minflt 248,345; majflt 8,209; inblock 2,107,584; sampled read_bytes
 
 The cold-vs-warm wall delta (+14.4 s) is the 1 GiB weight read; no security
 parameter changes. Proof byte size varies run to run (WHIR prover randomness),
-so sizes are reported per run. Logs:
+so sizes are reported per run. Logs for these runs:
 `/data/zkie-soundness-fix/logs/o5-cold-full64-73712b8.log`,
 `/data/zkie-soundness-fix/logs/o5-warm-full64-73712b8.log`.
-Note: an orphaned shell from the stopped continuation agent briefly overwrote
-`prove_core_chain.rs` at 00:38 and was terminated; the tree was restored to
-`73712b8` and the example rebuilt before any further run. These measurements
-completed before that overwrite and used the separate full64 binary.
+
+### Committed harness rerun (reproducible)
+
+The harness is committed at
+`models/deepseek-v2-lite/examples/prove_core_chain_full64.rs`. The
+wrong-activation-table-root negative now evaluates `s2` before manifest
+construction, so the Scale input shape is present and the verifier rejects the
+tampered table (previously it panicked with "missing trusted Scale input
+shape"). Build and run (cold; warm is the same meter line without the drop;
+host load average was ~35 at start, so timings are not comparable to the
+low-load runs above):
+```
+cd /data/zkie-soundness-fix
+cargo build --release -p zkie-models-deepseek-v2-lite --example prove_core_chain_full64
+export DS_WEIGHTS=/data/zkIE/models/deepseek-v2-lite/weights
+export ZKIE_CACHE=/dev/shm/zkie-core-chain-cache DS_LAYER=10
+W=$DS_WEIGHTS/L10_experts_gate_i32.bin
+sync; echo 3 > /proc/sys/vm/drop_caches
+python3 scripts/o5_measure.py target/release/examples/prove_core_chain_full64 \
+  logs/o5-cold-full64-committed.log "$W"
+python3 scripts/o5_measure.py target/release/examples/prove_core_chain_full64 \
+  logs/o5-warm-full64-committed.log "$W"
+```
+
+Cold (fincore 0 -> 1 GiB): read_bytes 1,078,366,208; majflt 8,209; wall
+177.432 s; maxrss 15,998,544 kB; open 150.6 s; B 166.9 s / 156.1 ms; proof
+512,953 B. Warm (fincore_before=1 GiB): read_bytes 0; wall 190.256 s; maxrss
+15,998,592 kB; open 164.5 s; B 179.9 s / 154.0 ms; proof 513,081 B. Both:
+claims=64 unique=1 moved 2,147,483,648 cloned=0; all six harness negatives
+rejected including wrong activation table root; `CORE-CHAIN-OK`. Logs:
+`/data/zkie-soundness-fix/logs/o5-cold-full64-committed.log`,
+`/data/zkie-soundness-fix/logs/o5-warm-full64-committed.log`.
+
+The earlier `/tmp/prove_core_chain.rs` was overwritten by an orphaned shell from
+the stopped continuation agent at 00:38; the source was then fixed (`s2`
+evaluate_ops) and committed, `prove_core_chain.rs` restored to `73712b8`, and
+the binaries rebuilt. The 73712b8 logs above were produced by the separate
+retained binary before the overwrite and are unaffected.
 
 Previous state: OOM-killed at anon-rss 502,710,376 kB (dmesg) on the 495 GB
 machine. The staged RSS shows the peak window is the W_t construction after
