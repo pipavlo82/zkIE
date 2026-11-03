@@ -192,7 +192,16 @@ order is rejected, Scatter remains fail-closed (commit 5df8e59). The formal
 pre-fix counterexample already reproduced: with m=n=2, sel all ones and the
 positions 0/2 swapped, the old bound verifier returned true.
 
-### 2c. Tie-break formalization (topk_forward `then(a.cmp(b))`)
+### 2c. Tie-break formalization (topk_forward `then(a.cmp(b))`) — IMPLEMENTED
+
+As-built summary: `TopKSelectTie` is a pre-committed aux batch (root bound in
+`execution_seeds` before any challenge); its zero/bits/rank/row/less virtuals
+and two pair-multiset permutations all take fresh transcript challenges, and
+the tie-aux openings are checked against the virtual endpoints. The witness
+batch keeps `d2 = (1-sel)*(thr_b-x)` (non-strict); the old `-1` strict gap is
+gone. Honest tied inputs select exactly the smaller-index prefix and verify;
+forged t_b, wrong rank and c_r=0 witnesses are rejected by the row-sum /
+rank-recurrence / selection relations.
 
 Forward rule (verified against `topk_forward`): per row, sort by value
 descending and by ascending column index on ties; select the first k; thr is
@@ -202,9 +211,13 @@ selected ones are exactly the smallest-column prefix of T.
 Definitions (per row r, column e; flat position pos = r*n + e):
 - `T[pos] = [x[pos] = thr_b[pos]]`. With the non-strict gap witnesses
   `d1 = sel*(x - thr_b) >= 0` and `d2 = (1-sel)*(thr_b - x) >= 0`, this is
-  `T = sel*Z(d1) + (1-sel)*Z(d2)` where `Z(v) = prod_b (1 - bit_b(v))`
-  (the all-zero indicator of the 16-bit decomposition; ties are d1=0 for
-  selected and d2=0 for unselected).
+  `T = sel*Z(d1) + (1-sel)*Z(d2)`. As built, `Z(d)` is proven with a
+  committed inverse witness per gap column: `T1*d1 = 0`,
+  `(1-T1)*(d1*w1 - 1) = 0`, `T2*d2 = 0`, `(1-T2)*(d2*w2 - 1) = 0`, and
+  `T = sel*T1 + (1-sel)*T2` (one gamma-combined eq-weighted virtual). The
+  zero-test has degree 4 and avoids the 2^16 expansion of `prod (1-bit_b)`;
+  w1/w2 are the field inverses when the gap is nonzero and 0 otherwise, and
+  all columns live in the pre-committed `TopKSelectTie` aux.
 - 0-based tied rank: `P[pos] = #{e' < e : T[r,e'] = 1}` (the first tied
   position has rank 0).
 - `c_r = sum_e T[r,e]*S[r,e]` = number of selected tied positions in row r;
@@ -242,9 +255,24 @@ Rank reset and padding:
   For e >= 1 the shift stays inside the row; the cyclic wrap (pos 0) is
   overridden by `E0 * P = 0`, so ranks reset exactly at row starts and never
   leak across rows.
-- `t_b` is a flat column; `c_r = sum_e T*S` is enforced by the eq-weighted
-  row-sum virtual with the row-broadcast kernel (exactly m rows, no padding
-  rows). The comparison uses the committed t_b bits per position.
+- `t_b` is a flat column; `c_r = sum_e T*S` is enforced by the row-sum
+  identity `eq_rows*(T*S - E0*t_b) = 0`: weighting the broadcast value by E0
+  reads it once per row, so the identity forces `t_b(r) = sum_e T*S` (without
+  E0 it would force `n*t_b`). The virtual's `sel` endpoint is bound by the
+  witness-batch opening at the same point; `t_b` and `T` endpoints by the
+  tie-aux opening.
+- Row-constancy of the broadcast cutoff is a SEPARATE identity in the same
+  virtual, with its own full-domain eq weight:
+  `gamma*eq_full*(1-E0)*(t_b - t_b_prev) = 0`, where `t_b_prev` is bound to
+  the cyclic shift by a third pair-multiset permutation (same primitive as
+  P_prev/T_prev). A row-constant weight would only constrain the row sum of
+  the difference, which telescopes and is satisfied whenever the row's first
+  and last values agree; the full eq makes any pointwise difference a
+  nonzero polynomial in the fresh challenge. Without this, a prover could
+  set a per-position cutoff and select an arbitrary tied subset.
+- The comparison uses the committed t_b bits per position with the MSB-first
+  prefix recurrence `E_{B-1} = 1`, `E_b = E_{b+1}*eq_{b+1}` and
+  `less = sum_b (1-P_b)*C_b*E_b` (degree <= 5).
 
 ### 3. Gate consistency chain — IMPLEMENTED (dynamic router-gate table; see tracker)
 

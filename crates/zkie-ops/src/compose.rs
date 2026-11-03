@@ -421,20 +421,23 @@ fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
 //    at q_hi = q[lgn..]. A column that matches thr only on a coordinate
 //    subset fails this check w.h.p.
 //  * thr is ATTAINED: `att` marks a selected position whose x equals thr
-//    (att Boolean, one per row, att*(1-sel)=0, att*(x-thr_b)=0). With
-//    d1 = sel*(x-thr_b) >= 0 (selected x >= thr) and
-//    d2s = (1-sel)*(thr_b-x-1) >= 0 (unselected x < thr) this forces
-//    exactly k positions >= thr with thr attained: thr is the k-th largest.
-//  * Boundary ties (an UNSELECTED position equal to thr) are not provable:
-//    d2s would be -1, outside the 16-bit range, so the honest builder fails
-//    closed and no malicious witness can satisfy the d2s relation. This is
-//    a STAGED safety boundary, NOT the final tie rule: the gist/forward
-//    requirement is `topk_forward`'s deterministic smaller-index tie-break,
-//    which must be generated and verified for real tied inputs. S7 stays
-//    incomplete until that lands (docs/soundness-fix-tracker.md).
+//    (att Boolean, one per row, att*(1-sel)=0, att*(x-thr_b)=0).
+//  * Threshold order: d1 = sel*(x-thr_b) >= 0 (selected x >= thr) and
+//    d2 = (1-sel)*(thr_b-x) >= 0 (unselected x <= thr), both 16-bit; with
+//    exactly k selected positions and thr attained, thr is the k-th largest.
+//  * Deterministic tie-break (gist S7, topk_forward's `then(a.cmp(b))`):
+//    T = sel*Z(d1) + (1-sel)*Z(d2) marks positions whose value equals thr,
+//    proven with a committed inverse witness per gap. The 0-based prefix
+//    rank P is reset at row starts by the closed-form E0 indicator
+//    (E0*P = 0, (1-E0)*(P-P_prev-T_prev) = 0) and P_prev/T_prev are tied to
+//    the cyclic shift by the pair-multiset permutation primitive; t_b =
+//    sum_e T*sel is an eq-weighted row sum broadcast per row; and
+//    T*(sel - less(P, t_b)) = 0, with a B = log2(n)+1 bit strict less,
+//    selects exactly the smaller-index tied positions. The witness domain
+//    must be exactly 1<<arity == m*n (fail-closed otherwise).
 const TK_RANGE_BITS: usize = 16;
 /// Witness columns: 0 sel, 1 gate, 2 thr_b, 3 att, 4..4+R d1 bits,
-/// 4+R..4+2R d2s bits (d2s = (1-sel)*(thr_b-x-1)), over the padded m*n domain.
+/// 4+R..4+2R d2 bits (d2 = (1-sel)*(thr_b-x)), over the padded m*n domain.
 const TK_SEL_COL: usize = 0;
 const TK_GATE_COL: usize = 1;
 const TK_THR_B_COL: usize = 2;
@@ -450,6 +453,26 @@ const TK_COLS: usize = 4 + 2 * TK_RANGE_BITS;
 /// wrap A - B = 1 (mod P) for A = 2^63, B = 2^63 - 1 is excluded.
 const TK_SIGNED_BITS: usize = 23;
 const TK_SIGNED_OFFSET: i64 = 1 << 22;
+
+// Tie aux column layout (TopKSelectTie). B = log2(n)+1 bit width for the
+// prefix rank P and the row cutoff t_b. Columns: T1, W1, T2, W2, T, P,
+// P_prev, T_prev, t_b, P bits (B), t_b bits (B), prefix-equality E (B).
+const TIE_T1: usize = 0;
+const TIE_W1: usize = 1;
+const TIE_T2: usize = 2;
+const TIE_W2: usize = 3;
+const TIE_T: usize = 4;
+const TIE_P: usize = 5;
+const TIE_P_PREV: usize = 6;
+const TIE_T_PREV: usize = 7;
+const TIE_TB: usize = 8;
+const TIE_P_BITS: usize = 9;
+fn tie_b_bits(lgn: usize) -> usize { lgn + 1 }
+fn tie_p_bits_col(b: usize) -> usize { TIE_P_BITS + b }
+fn tie_tb_bits_col(b_bits: usize, b: usize) -> usize { TIE_P_BITS + b_bits + b }
+fn tie_eq_col(b_bits: usize, b: usize) -> usize { TIE_P_BITS + 2 * b_bits + b }
+fn tie_tb_prev_col(b_bits: usize) -> usize { TIE_P_BITS + 3 * b_bits }
+fn tie_total_cols(b_bits: usize) -> usize { TIE_P_BITS + 3 * b_bits + 1 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseTopKSelectProof {
@@ -489,6 +512,20 @@ struct ReverseTopKSelectProof {
     /// thr_b range-aux evaluations and opening.
     thr_range_values: Vec<Goldilocks>,
     thr_range_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    /// Deterministic tie-break relations (see the module comment above).
+    tie_zero: VirtualProof,
+    tie_bits: VirtualProof,
+    tie_rank: VirtualProof,
+    tie_row: VirtualProof,
+    tie_less: VirtualProof,
+    /// Pair-multiset permutations proving P_prev/T_prev are the cyclic
+    /// shifts of P/T (same primitive as ScatterOrder).
+    perm_p: PermutationProof,
+    perm_t: PermutationProof,
+    perm_b: PermutationProof,
+    /// Tie-aux evaluations in the exact order rebuilt by the verifier.
+    tie_aux_values: Vec<Goldilocks>,
+    tie_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
 }
 
 /// Shared by prove/verify: V1 mles are [eq, sel, att, d1 bits..., d2s bits...].
@@ -529,15 +566,15 @@ fn topk_d1_terms() -> Vec<(Goldilocks, Vec<usize>)> {
     }
     terms
 }
-/// Shared by prove/verify: V5 mles are [eq, sel, x, thr_b, d2s bits...].
-/// One identity: eq*(thr_b - x - 1 + sel - sel*thr_b + sel*x - d2s) = 0.
+/// Shared by prove/verify: V5 mles are [eq, sel, x, thr_b, d2 bits...].
+/// One identity (non-strict gap): eq*(thr_b - x - sel*thr_b + sel*x - d2) = 0,
+/// i.e. d2 = (1-sel)*(thr_b-x). Equality is allowed here; the tie-break
+/// relations decide which equal-to-thr positions are selected.
 fn topk_d2s_terms() -> Vec<(Goldilocks, Vec<usize>)> {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let mut terms = vec![
         (Goldilocks::ONE, vec![0usize, 3usize]),
         (neg, vec![0usize, 2usize]),
-        (neg, vec![0usize]),
-        (Goldilocks::ONE, vec![0usize, 1usize]),
         (neg, vec![0usize, 1usize, 3usize]),
         (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
     ];
@@ -649,9 +686,9 @@ fn prepare_topk_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
                         if gate[at] != s * x_at { return None; }
                         let d1v = if s == Goldilocks::ONE { to_i64(x_at) - to_i64(t) } else { 0 };
                         let d2v = if s == Goldilocks::ZERO { to_i64(t) - to_i64(x_at) } else { 0 };
-                        // d2s = (1-sel)*(thr - x - 1); a boundary tie gives -1
-                        // and therefore fails closed here.
-                        let d2s = d2v - 1 + (if s == Goldilocks::ONE { 1 } else { 0 });
+                        // d2 = (1-sel)*(thr - x), non-strict: equality marks a
+                        // tied position, resolved by the TopKSelectTie aux.
+                        let d2s = d2v;
                         if d1[at] != from_i64(d1v) || d2[at] != from_i64(d2v) { return None; }
                         if d1v < 0 || (d1v as u64) >= (1u64 << TK_RANGE_BITS) { return None; }
                         if d2s < 0 || (d2s as u64) >= (1u64 << TK_RANGE_BITS) { return None; }
@@ -768,7 +805,8 @@ fn prepare_topk_thr_range_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedA
 #[allow(clippy::too_many_arguments)]
 fn topk_witness_layout(z1: &[Goldilocks], z2: &[Goldilocks], z3: &[Goldilocks],
     z4: &[Goldilocks], z5: &[Goldilocks], z6: &[Goldilocks], z7: &[Goldilocks],
-    z8: &[Goldilocks], z10: &[Goldilocks], qs: &[Goldilocks], qg: &[Goldilocks],
+    z8: &[Goldilocks], z10: &[Goldilocks], z_zero: &[Goldilocks], z_less: &[Goldilocks],
+    z_row: &[Goldilocks], qs: &[Goldilocks], qg: &[Goldilocks],
     qd: &[Goldilocks], q2: &[Goldilocks], arity: usize) -> Vec<(usize, Vec<Goldilocks>)>
 {
     let pad = |z: &[Goldilocks]| argmax_pad_point(z, arity);
@@ -800,12 +838,20 @@ fn topk_witness_layout(z1: &[Goldilocks], z2: &[Goldilocks], z3: &[Goldilocks],
     e.push((TK_THR_B_COL, pad(z8)));
     // thr_b signed-range endpoint (same column, range virtual).
     e.push((TK_THR_B_COL, pad(z10)));
-    // Output claims: sel, gate, d1 bits, d2s bits + sel (d2 = d2s + 1 - sel).
+    // Output claims: sel, gate, d1 bits, d2s bits + sel (non-strict d2 = d2s).
     e.push((TK_SEL_COL, pad(qs)));
     e.push((TK_GATE_COL, pad(qg)));
     for b in 0..TK_RANGE_BITS { e.push((TK_D1_COL + b, pad(qd))); }
     for b in 0..TK_RANGE_BITS { e.push((TK_D2S_COL + b, pad(q2))); }
     e.push((TK_SEL_COL, pad(q2)));
+    // Tie break: zero-test witness endpoints (sel, d1 bits, d2 bits) and the
+    // selection's sel at the strict-less point.
+    e.push((TK_SEL_COL, pad(z_zero)));
+    for b in 0..TK_RANGE_BITS { e.push((TK_D1_COL + b, pad(z_zero))); }
+    for b in 0..TK_RANGE_BITS { e.push((TK_D2S_COL + b, pad(z_zero))); }
+    e.push((TK_SEL_COL, pad(z_less)));
+    // Row-sum sel endpoint (t_b = sum_e T*sel).
+    e.push((TK_SEL_COL, pad(z_row)));
     e
 }
 
@@ -820,9 +866,275 @@ fn topk_thr_layout(q_hi: &[Goldilocks], qt: &[Goldilocks], thr_arity: usize)
     ]
 }
 
+/// Shared by prove/verify: mles are
+/// [eq, sel, d1, w1, T1, d2, w2, T2, T]. Five gamma-combined identities:
+/// T1*d1 = 0, (1-T1)*(d1*w1-1) = 0, T2*d2 = 0, (1-T2)*(d2*w2-1) = 0 and
+/// T = sel*T1 + (1-sel)*T2, so T1 = Z(d1), T2 = Z(d2) and T is the exact
+/// equality-to-threshold indicator.
+fn tie_zero_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+    let mut t = Vec::new();
+    let mut g = Goldilocks::ONE;
+    t.push((g, vec![0usize, 2usize, 4usize]));
+    g = g * gamma;
+    t.push((g, vec![0usize, 2usize, 3usize]));
+    t.push((-g, vec![0usize, 4usize, 2usize, 3usize]));
+    t.push((-g, vec![0usize]));
+    t.push((g, vec![0usize, 4usize]));
+    g = g * gamma;
+    t.push((g, vec![0usize, 5usize, 7usize]));
+    g = g * gamma;
+    t.push((g, vec![0usize, 5usize, 6usize]));
+    t.push((-g, vec![0usize, 7usize, 5usize, 6usize]));
+    t.push((-g, vec![0usize]));
+    t.push((g, vec![0usize, 7usize]));
+    g = g * gamma;
+    t.push((g, vec![0usize, 8usize]));
+    t.push((-g, vec![0usize, 1usize, 4usize]));
+    t.push((-g, vec![0usize, 7usize]));
+    t.push((g, vec![0usize, 1usize, 7usize]));
+    t
+}
+
+/// Shared by prove/verify: mles are [eq, P, t_b, P bits..., t_b bits...].
+/// Linear decompositions plus gamma-weighted bit Booleanity (claim 0).
+fn tie_bits_terms(b_bits: usize, gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+    let mut t = vec![
+        (Goldilocks::ONE, vec![0usize, 1usize]),
+        (Goldilocks::ONE, vec![0usize, 2usize]),
+    ];
+    for b in 0..b_bits {
+        t.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 3 + b]));
+        t.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 3 + b_bits + b]));
+    }
+    let mut g = gamma;
+    for b in 0..b_bits {
+        t.push((g, vec![0usize, 3 + b]));
+        t.push((-g, vec![0usize, 3 + b, 3 + b]));
+        g = g * gamma;
+    }
+    for b in 0..b_bits {
+        t.push((g, vec![0usize, 3 + b_bits + b]));
+        t.push((-g, vec![0usize, 3 + b_bits + b, 3 + b_bits + b]));
+        g = g * gamma;
+    }
+    t
+}
+
+/// Shared by prove/verify: mles are [eq, P, P_prev, T_prev, E0] where E0 is
+/// the row-start indicator (e = 0). E0*P = 0 and
+/// (1-E0)*(P - P_prev - T_prev) = 0 pin the 0-based prefix rank.
+fn tie_rank_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    vec![
+        (Goldilocks::ONE, vec![0usize, 4usize, 1usize]),
+        (gamma, vec![0usize, 1usize]),
+        (-gamma, vec![0usize, 2usize]),
+        (-gamma, vec![0usize, 3usize]),
+        (-gamma, vec![0usize, 4usize, 1usize]),
+        (gamma, vec![0usize, 4usize, 2usize]),
+        (gamma, vec![0usize, 4usize, 3usize]),
+    ]
+}
+
+/// Shared by prove/verify: mles are [row-broadcast eq, full-domain eq, T,
+/// sel, t_b, E0, t_b_prev]. Two gamma-combined identities with DIFFERENT
+/// weights: (1) the row-broadcast eq with the E0 term forces the E0-weighted
+/// row sum t_b(r) = sum_e T(r,e)*sel(r,e); (2) the FULL-domain eq is needed
+/// for the constancy identity (1-E0)*(t_b - t_b_prev) = 0: a row-constant
+/// weight would only constrain the row sum of the difference (telescoping,
+/// satisfied whenever the row's first and last values agree). With the full
+/// eq, a nonzero pointwise difference is a nonzero polynomial in the fresh
+/// challenge and is caught w.h.p. t_b_prev is bound to the cyclic shift by
+/// the permutation, so t_b is constant inside every row and `less` cannot
+/// use a per-position cutoff.
+fn tie_row_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    vec![
+        (Goldilocks::ONE, vec![0usize, 2usize, 3usize]),
+        (neg, vec![0usize, 5usize, 4usize]),
+        (gamma, vec![1usize, 4usize]),
+        (-gamma, vec![1usize, 5usize, 4usize]),
+        (-gamma, vec![1usize, 6usize]),
+        (gamma, vec![1usize, 5usize, 6usize]),
+    ]
+}
+
+/// Shared by prove/verify: mles are [eq, T, sel, t_b, P bits..., t_b bits...,
+/// E...]. The E recurrence is MSB-first prefix equality,
+/// E_{B-1} = 1, E_b = E_{b+1}*(1-P_b-C_b+2*P_b*C_b), and the strict less is
+/// sum_b (1-P_b)*C_b*E_b. The selection condition
+/// T*(sel - less(P, t_b)) = 0 is gamma-separated from the recurrence.
+fn tie_less_terms(b_bits: usize, gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let e0 = 4 + 2 * b_bits;
+    let mut t = Vec::new();
+    let mut g = Goldilocks::ONE;
+    t.push((g, vec![0usize, e0 + b_bits - 1]));
+    t.push((-g, vec![0usize]));
+    g = g * gamma;
+    for b in 0..(b_bits - 1) {
+        // E_b = E_{b+1} * eq_{b+1}: the prefix above bit b includes bit b+1.
+        t.push((g, vec![0usize, e0 + b]));
+        t.push((-g, vec![0usize, e0 + b + 1]));
+        t.push((g, vec![0usize, e0 + b + 1, 4 + b + 1]));
+        t.push((g, vec![0usize, e0 + b + 1, 4 + b_bits + b + 1]));
+        t.push((-g - g, vec![0usize, e0 + b + 1, 4 + b + 1, 4 + b_bits + b + 1]));
+        g = g * gamma;
+    }
+    g = g * gamma;
+    t.push((g, vec![0usize, 1usize, 2usize]));
+    for b in 0..b_bits {
+        t.push((-g, vec![0usize, 1usize, 4 + b_bits + b, e0 + b]));
+        t.push((g, vec![0usize, 1usize, 4 + b, 4 + b_bits + b, e0 + b]));
+    }
+    t
+}
+
+fn topk_tie_aux_specs(ops: &[Op]) -> Option<Vec<(usize, AuxRole, usize, usize, usize)>> {
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if !matches!(op, Op::TopKSelect { .. }) { continue; }
+        let (_, _, _, _, _, _, m, n, _) = topk_dims(op)?;
+        let lgn = n.trailing_zeros() as usize;
+        let lgm = m.trailing_zeros() as usize;
+        specs.push((i, AuxRole::TopKSelectTie, m.checked_mul(n)?, lgn + lgm,
+            tie_total_cols(tie_b_bits(lgn))));
+    }
+    Some(specs)
+}
+
+fn prepare_topk_tie_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
+    let mut prepared = Vec::new();
+    for (op_index, role, len, arity, count) in topk_tie_aux_specs(ops)? {
+        if role != AuxRole::TopKSelectTie { return None; }
+        let (_, sel_t, _, _, d1_t, d2_t, m, n, _) = topk_dims(&ops[op_index])?;
+        let lgn = n.trailing_zeros() as usize;
+        let lgm = m.trailing_zeros() as usize;
+        let b_bits = tie_b_bits(lgn);
+        if arity != lgn + lgm || len != m.checked_mul(n)? || count != tie_total_cols(b_bits) {
+            return None;
+        }
+        let padded = 1usize.checked_shl(arity as u32)?;
+        // Exact domain: no padding rows participate in the rank/row-sum or
+        // in the cyclic-shift permutation.
+        if padded != len || padded != (1usize << arity) { return None; }
+        let sel = store.get(sel_t);
+        let d1 = store.get(d1_t);
+        let d2 = store.get(d2_t);
+        if sel.len() != len || d1.len() != len || d2.len() != len { return None; }
+        let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
+        for at in 0..len {
+            let sv = sel[at];
+            if sv != Goldilocks::ZERO && sv != Goldilocks::ONE { return None; }
+            let t1 = if d1[at] == Goldilocks::ZERO { Goldilocks::ONE } else { Goldilocks::ZERO };
+            let t2 = if d2[at] == Goldilocks::ZERO { Goldilocks::ONE } else { Goldilocks::ZERO };
+            let w1 = if d1[at] == Goldilocks::ZERO { Goldilocks::ZERO } else { d1[at].try_inverse()? };
+            let w2 = if d2[at] == Goldilocks::ZERO { Goldilocks::ZERO } else { d2[at].try_inverse()? };
+            let tv = if sv == Goldilocks::ONE { t1 } else { t2 };
+            columns[TIE_T1][at] = t1;
+            columns[TIE_W1][at] = w1;
+            columns[TIE_T2][at] = t2;
+            columns[TIE_W2][at] = w2;
+            columns[TIE_T][at] = tv;
+        }
+        for row in 0..m {
+            let mut pv = 0u64;
+            let mut tb = 0u64;
+            for e in 0..n {
+                let at = row * n + e;
+                columns[TIE_P][at] = Goldilocks::from_u64(pv);
+                let tv = to_i64(columns[TIE_T][at]);
+                if tv != 0 && tv != 1 { return None; }
+                pv = pv.checked_add(tv as u64)?;
+                let sv = to_i64(sel[at]);
+                if sv != 0 && sv != 1 { return None; }
+                tb = tb.checked_add((tv * sv) as u64)?;
+            }
+            if pv > n as u64 || tb > n as u64 || tb >= (1u64 << b_bits) { return None; }
+            for e in 0..n {
+                let at = row * n + e;
+                let p_at = to_i64(columns[TIE_P][at]) as u64;
+                columns[TIE_TB][at] = Goldilocks::from_u64(tb);
+                for b in 0..b_bits {
+                    columns[tie_p_bits_col(b)][at] = Goldilocks::from_u64((p_at >> b) & 1);
+                    columns[tie_tb_bits_col(b_bits, b)][at] = Goldilocks::from_u64((tb >> b) & 1);
+                }
+                let mut eq = Goldilocks::ONE;
+                for b in (0..b_bits).rev() {
+                    columns[tie_eq_col(b_bits, b)][at] = eq;
+                    if ((p_at >> b) & 1) != ((tb >> b) & 1) { eq = Goldilocks::ZERO; }
+                }
+            }
+        }
+        // Cyclic shifts (the permutation relations bind these columns).
+        let p_col = columns[TIE_P].clone();
+        let t_col = columns[TIE_T].clone();
+        let tb_col = columns[TIE_TB].clone();
+        for pos in 0..padded {
+            columns[TIE_P_PREV][pos] = p_col[(pos + padded - 1) % padded];
+            columns[TIE_T_PREV][pos] = t_col[(pos + padded - 1) % padded];
+            columns[tie_tb_prev_col(b_bits)][pos] = tb_col[(pos + padded - 1) % padded];
+        }
+        let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        let descriptor = AuxDescriptor { op_index, role, len, arity, columns: count, commitment };
+        prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+    }
+    Some(prepared)
+}
+
+/// Exact tie-aux opening layout, shared by prove/verify.
+#[allow(clippy::too_many_arguments)]
+fn topk_tie_layout(z_zero: &[Goldilocks], z_bits: &[Goldilocks], z_rank: &[Goldilocks],
+    z_row: &[Goldilocks], z_less: &[Goldilocks],
+    q_den_ap: &[Goldilocks], q_den_bp: &[Goldilocks],
+    q_den_at: &[Goldilocks], q_den_bt: &[Goldilocks],
+    q_den_abt: &[Goldilocks], q_den_bbt: &[Goldilocks],
+    b_bits: usize, arity: usize) -> Vec<(usize, Vec<Goldilocks>)>
+{
+    let pad = |z: &[Goldilocks]| argmax_pad_point(z, arity);
+    let mut e: Vec<(usize, Vec<Goldilocks>)> = Vec::new();
+    // zero virtual: w1, T1, w2, T2, T.
+    e.push((TIE_W1, pad(z_zero)));
+    e.push((TIE_T1, pad(z_zero)));
+    e.push((TIE_W2, pad(z_zero)));
+    e.push((TIE_T2, pad(z_zero)));
+    e.push((TIE_T, pad(z_zero)));
+    // bits virtual: P, t_b, P bits, t_b bits.
+    e.push((TIE_P, pad(z_bits)));
+    e.push((TIE_TB, pad(z_bits)));
+    for b in 0..b_bits { e.push((tie_p_bits_col(b), pad(z_bits))); }
+    for b in 0..b_bits { e.push((tie_tb_bits_col(b_bits, b), pad(z_bits))); }
+    // rank virtual: P, P_prev, T_prev.
+    e.push((TIE_P, pad(z_rank)));
+    e.push((TIE_P_PREV, pad(z_rank)));
+    e.push((TIE_T_PREV, pad(z_rank)));
+    // row virtual: T, t_b, t_b_prev.
+    e.push((TIE_T, pad(z_row)));
+    e.push((TIE_TB, pad(z_row)));
+    e.push((tie_tb_prev_col(b_bits), pad(z_row)));
+    // less virtual: T, t_b, P bits, t_b bits, E.
+    e.push((TIE_T, pad(z_less)));
+    e.push((TIE_TB, pad(z_less)));
+    for b in 0..b_bits { e.push((tie_p_bits_col(b), pad(z_less))); }
+    for b in 0..b_bits { e.push((tie_tb_bits_col(b_bits, b), pad(z_less))); }
+    for b in 0..b_bits { e.push((tie_eq_col(b_bits, b), pad(z_less))); }
+    // permutation leaf points.
+    e.push((TIE_P_PREV, pad(q_den_ap)));
+    e.push((TIE_P, pad(q_den_bp)));
+    e.push((TIE_T_PREV, pad(q_den_at)));
+    e.push((TIE_T, pad(q_den_bt)));
+    e.push((tie_tb_prev_col(b_bits), pad(q_den_abt)));
+    e.push((TIE_TB, pad(q_den_bbt)));
+    e
+}
+
 fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     witness: PreparedAux, thr_aux: PreparedAux, range_aux: PreparedAux,
-    thr_range_aux: PreparedAux, transcript: &mut Transcript)
+    thr_range_aux: PreparedAux, tie_aux: PreparedAux, transcript: &mut Transcript)
     -> Option<(ReverseTopKSelectProof, Vec<EvalClaim>)>
 {
     let (x, sel_t, thr_t, gate_t, d1_t, d2_t, m, n, k) = topk_dims(op)?;
@@ -934,8 +1246,134 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldi
     for b in 0..TK_SIGNED_BITS { mles10.push(&thr_range_cols[b]); }
     let (thr_range, z10) = prove_virtual(&mles10, &topk_range_terms(gamma10), Goldilocks::ZERO, transcript);
 
+    // ---- Deterministic tie-break (S7c task 2a) ----
+    let b_bits = tie_b_bits(lgn);
+    if b_bits == 0 || b_bits > 40 { return None; }
+    if tie_aux.descriptor.role != AuxRole::TopKSelectTie
+        || tie_aux.descriptor.len != len || tie_aux.descriptor.arity != arity
+        || tie_aux.descriptor.columns != tie_total_cols(b_bits) { return None; }
+    if tie_aux.columns.len() != tie_total_cols(b_bits) { return None; }
+    let tc = &tie_aux.columns;
+    // The zero tests are stated on the gap values reconstructed from the
+    // committed 16-bit witness columns, so the verifier can bind them with
+    // the same openings the d1/d2 relations already use.
+    let mut d1_vals = vec![Goldilocks::ZERO; padded];
+    let mut d2_vals = vec![Goldilocks::ZERO; padded];
+    for at in 0..len {
+        for b in 0..TK_RANGE_BITS {
+            d1_vals[at] = d1_vals[at] + Goldilocks::from_u64(1u64 << b) * cols[TK_D1_COL + b][at];
+            d2_vals[at] = d2_vals[at] + Goldilocks::from_u64(1u64 << b) * cols[TK_D2S_COL + b][at];
+        }
+    }
+
+    let qz: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gz = transcript.field();
+    let eqz = mle::eq_evals(&qz);
+    let (tie_zero, z_zero) = prove_virtual(
+        &[&eqz, &cols[TK_SEL_COL], &d1_vals, &tc[TIE_W1], &tc[TIE_T1],
+          &d2_vals, &tc[TIE_W2], &tc[TIE_T2], &tc[TIE_T]],
+        &tie_zero_terms(gz), Goldilocks::ZERO, transcript);
+    if z_zero.len() != arity || tie_zero.final_evals.len() != 9 { return None; }
+
+    let qbits: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gbits = transcript.field();
+    let eqbits = mle::eq_evals(&qbits);
+    let mut mles_bits: Vec<&[Goldilocks]> = vec![&eqbits, &tc[TIE_P], &tc[TIE_TB]];
+    for b in 0..b_bits { mles_bits.push(&tc[tie_p_bits_col(b)]); }
+    for b in 0..b_bits { mles_bits.push(&tc[tie_tb_bits_col(b_bits, b)]); }
+    let (tie_bits, z_bits) = prove_virtual(&mles_bits,
+        &tie_bits_terms(b_bits, gbits), Goldilocks::ZERO, transcript);
+    if z_bits.len() != arity || tie_bits.final_evals.len() != 3 + 2 * b_bits { return None; }
+
+    let qrank: Vec<Goldilocks> = transcript.field_vec(arity);
+    let grank = transcript.field();
+    let eqrank = mle::eq_evals(&qrank);
+    let mut e0 = vec![Goldilocks::ZERO; padded];
+    for row in 0..m { e0[row * n] = Goldilocks::ONE; }
+    let (tie_rank, z_rank) = prove_virtual(
+        &[&eqrank, &tc[TIE_P], &tc[TIE_P_PREV], &tc[TIE_T_PREV], &e0],
+        &tie_rank_terms(grank), Goldilocks::ZERO, transcript);
+    if z_rank.len() != arity || tie_rank.final_evals.len() != 5 { return None; }
+
+    let qrow_t: Vec<Goldilocks> = transcript.field_vec(lgm);
+    let qfull: Vec<Goldilocks> = transcript.field_vec(arity);
+    let grow = transcript.field();
+    let eq_rows_t = mle::eq_evals(&qrow_t);
+    let mut eq_rows_bt = vec![Goldilocks::ZERO; padded];
+    for row in 0..m { for e in 0..n { eq_rows_bt[row * n + e] = eq_rows_t[row]; } }
+    let eq_full_t = mle::eq_evals(&qfull);
+    let (tie_row, z_row) = prove_virtual(
+        &[&eq_rows_bt, &eq_full_t, &tc[TIE_T], &cols[TK_SEL_COL], &tc[TIE_TB], &e0,
+          &tc[tie_tb_prev_col(b_bits)]],
+        &tie_row_terms(grow), Goldilocks::ZERO, transcript);
+    if z_row.len() != arity || tie_row.final_evals.len() != 7 { return None; }
+
+    let qless: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gless = transcript.field();
+    let eqless = mle::eq_evals(&qless);
+    let mut mles_less: Vec<&[Goldilocks]> =
+        vec![&eqless, &tc[TIE_T], &cols[TK_SEL_COL], &tc[TIE_TB]];
+    for b in 0..b_bits { mles_less.push(&tc[tie_p_bits_col(b)]); }
+    for b in 0..b_bits { mles_less.push(&tc[tie_tb_bits_col(b_bits, b)]); }
+    for b in 0..b_bits { mles_less.push(&tc[tie_eq_col(b_bits, b)]); }
+    let (tie_less, z_less) = prove_virtual(&mles_less,
+        &tie_less_terms(b_bits, gless), Goldilocks::ZERO, transcript);
+    if z_less.len() != arity || tie_less.final_evals.len() != 4 + 3 * b_bits { return None; }
+
+    // Cyclic-shift pair-multiset permutations for P and T: prove that
+    // P_prev[pos] = P[pos-1 mod dom] (and likewise T) using the ScatterOrder
+    // primitive with the position encoding.
+    let gamma_pp = transcript.field();
+    let mut per_a_p = vec![Goldilocks::ZERO; padded];
+    let mut per_b_p = vec![Goldilocks::ZERO; padded];
+    for q in 0..padded {
+        per_a_p[q] = tc[TIE_P_PREV][q] + gamma_pp * Goldilocks::from_u64(q as u64);
+        per_b_p[q] = tc[TIE_P][q] + gamma_pp * Goldilocks::from_u64(((q + 1) % padded) as u64);
+    }
+    let perm_p = prove_permutation(&per_a_p, &per_b_p, transcript);
+    let q_den_ap = fractional_leaf(&perm_p.a_side).2;
+    let q_den_bp = fractional_leaf(&perm_p.b_side).2;
+
+    let gamma_pt = transcript.field();
+    let mut per_a_t = vec![Goldilocks::ZERO; padded];
+    let mut per_b_t = vec![Goldilocks::ZERO; padded];
+    for q in 0..padded {
+        per_a_t[q] = tc[TIE_T_PREV][q] + gamma_pt * Goldilocks::from_u64(q as u64);
+        per_b_t[q] = tc[TIE_T][q] + gamma_pt * Goldilocks::from_u64(((q + 1) % padded) as u64);
+    }
+    let perm_t = prove_permutation(&per_a_t, &per_b_t, transcript);
+    let q_den_at = fractional_leaf(&perm_t.a_side).2;
+    let q_den_bt = fractional_leaf(&perm_t.b_side).2;
+
+    // t_b_prev must be the cyclic shift of t_b; together with the
+    // (1-E0)*(t_b - t_b_prev) identity this forces t_b to be constant inside
+    // every row (the per-position cutoff equals the row's t_b).
+    let gamma_pb = transcript.field();
+    let mut per_a_b = vec![Goldilocks::ZERO; padded];
+    let mut per_b_b = vec![Goldilocks::ZERO; padded];
+    for q in 0..padded {
+        per_a_b[q] = tc[tie_tb_prev_col(b_bits)][q] + gamma_pb * Goldilocks::from_u64(q as u64);
+        per_b_b[q] = tc[TIE_TB][q] + gamma_pb * Goldilocks::from_u64(((q + 1) % padded) as u64);
+    }
+    let perm_b = prove_permutation(&per_a_b, &per_b_b, transcript);
+    let q_den_abt = fractional_leaf(&perm_b.a_side).2;
+    let q_den_bbt = fractional_leaf(&perm_b.b_side).2;
+
+    let tie_layout = topk_tie_layout(&z_zero, &z_bits, &z_rank, &z_row, &z_less,
+        &q_den_ap, &q_den_bp, &q_den_at, &q_den_bt, &q_den_abt, &q_den_bbt, b_bits, arity);
+    let tie_idxs: Vec<usize> = tie_layout.iter().map(|e| e.0).collect();
+    let tie_points: Vec<Vec<Goldilocks>> = tie_layout.iter().map(|e| e.1.clone()).collect();
+    let tie_values: Vec<Goldilocks> = tie_layout.iter().map(|e| mle::eval(&tc[e.0], &e.1)).collect();
+    let tie_tensors: Vec<Vec<Goldilocks>> = tie_idxs.iter().map(|&c| tc[c].clone()).collect();
+    let tie_ctx = zkie_core::pcs::committed::BatchCtx {
+        commitment: tie_aux.descriptor.commitment.clone(), prover_data: tie_aux.prover_data,
+        protocol: tie_aux.protocol, whir: tie_aux.whir, num_tables: tie_aux.descriptor.columns,
+    };
+    let tie_opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
+        tie_ctx, &tie_idxs, &tie_tensors, &tie_points, &tie_values).ok()?;
+
     let layout = topk_witness_layout(&z1, &z2, &z3, &z4, &z5, &z6, &z7, &z8, &z10,
-        &qs, &qg, &qd, &q2, arity);
+        &z_zero, &z_less, &z_row, &qs, &qg, &qd, &q2, arity);
     let idxs: Vec<usize> = layout.iter().map(|e| e.0).collect();
     let points: Vec<Vec<Goldilocks>> = layout.iter().map(|e| e.1.clone()).collect();
     let values: Vec<Goldilocks> = layout.iter().map(|e| mle::eval(&cols[e.0], &e.1)).collect();
@@ -1006,12 +1444,14 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldi
         aux_values: values, opening, thr_values, thr_opening,
         range_aux_values: range_values, range_opening,
         thr_range_values: tr_range_values, thr_range_opening,
+        tie_zero, tie_bits, tie_rank, tie_row, tie_less, perm_p, perm_t, perm_b,
+        tie_aux_values: tie_values, tie_opening,
     }, claims))
 }
 
 fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     witness: &AuxDescriptor, thr_aux: &AuxDescriptor, range_aux: &AuxDescriptor,
-    thr_range_aux: &AuxDescriptor,
+    thr_range_aux: &AuxDescriptor, tie_aux: &AuxDescriptor,
     proof: &ReverseTopKSelectProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
 {
     let (x, sel_t, thr_t, gate_t, d1_t, d2_t, m, n, k) = topk_dims(op)?;
@@ -1028,6 +1468,10 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
         || range_aux.arity != arity || range_aux.columns != TK_SIGNED_BITS { return None; }
     if thr_range_aux.role != AuxRole::TopKSelectThrRange || thr_range_aux.len != len
         || thr_range_aux.arity != arity || thr_range_aux.columns != TK_SIGNED_BITS { return None; }
+    let b_bits = tie_b_bits(lgn);
+    if b_bits == 0 || b_bits > 40 { return None; }
+    if tie_aux.role != AuxRole::TopKSelectTie || tie_aux.len != len
+        || tie_aux.arity != arity || tie_aux.columns != tie_total_cols(b_bits) { return None; }
     if proof.arity != arity { return None; }
     let (qs, vs) = argmax_claim(outs, sel_t)?;
     let (qt, vt) = argmax_claim(outs, thr_t)?;
@@ -1139,8 +1583,141 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
         if proof.thr_range.final_evals[2 + b] != proof.thr_range_values[b] { return None; }
     }
 
+    // ---- Deterministic tie-break (S7c task 2a) ----
+    if proof.tie_zero.final_evals.len() != 9
+        || proof.tie_bits.final_evals.len() != 3 + 2 * b_bits
+        || proof.tie_rank.final_evals.len() != 5
+        || proof.tie_row.final_evals.len() != 7
+        || proof.tie_less.final_evals.len() != 4 + 3 * b_bits { return None; }
+
+    let qz: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gz = transcript.field();
+    let terms = tie_zero_terms(gz);
+    let (ok, z_zero, fz) = verify_virtual(&proof.tie_zero, &terms, Goldilocks::ZERO, arity, transcript);
+    if !ok || fz != virtual_eval(&terms, &proof.tie_zero.final_evals)
+        || proof.tie_zero.final_evals[0] != mle::eq_poly(&qz, &z_zero) { return None; }
+
+    let qbits: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gbits = transcript.field();
+    let terms = tie_bits_terms(b_bits, gbits);
+    let (ok, z_bits, fb) = verify_virtual(&proof.tie_bits, &terms, Goldilocks::ZERO, arity, transcript);
+    if !ok || fb != virtual_eval(&terms, &proof.tie_bits.final_evals)
+        || proof.tie_bits.final_evals[0] != mle::eq_poly(&qbits, &z_bits) { return None; }
+
+    let qrank: Vec<Goldilocks> = transcript.field_vec(arity);
+    let grank = transcript.field();
+    let terms = tie_rank_terms(grank);
+    let (ok, z_rank, fr) = verify_virtual(&proof.tie_rank, &terms, Goldilocks::ZERO, arity, transcript);
+    if !ok || fr != virtual_eval(&terms, &proof.tie_rank.final_evals)
+        || proof.tie_rank.final_evals[0] != mle::eq_poly(&qrank, &z_rank) { return None; }
+    // E0 is not committed: the verifier evaluates its MLE (row start e = 0)
+    // in closed form at the final point.
+    let e0_at = z_rank[..lgn].iter()
+        .fold(Goldilocks::ONE, |a, &v| a * (Goldilocks::ONE - v));
+    if proof.tie_rank.final_evals[4] != e0_at { return None; }
+
+    let qrow_t: Vec<Goldilocks> = transcript.field_vec(lgm);
+    let qfull: Vec<Goldilocks> = transcript.field_vec(arity);
+    let grow = transcript.field();
+    let terms = tie_row_terms(grow);
+    let (ok, z_row, fw) = verify_virtual(&proof.tie_row, &terms, Goldilocks::ZERO, arity, transcript);
+    if !ok || fw != virtual_eval(&terms, &proof.tie_row.final_evals) { return None; }
+    if z_row.len() != arity
+        || proof.tie_row.final_evals[0] != mle::eq_poly(&qrow_t, &z_row[lgn..])
+        || proof.tie_row.final_evals[1] != mle::eq_poly(&qfull, &z_row) { return None; }
+    let e0_row_at = z_row[..lgn].iter()
+        .fold(Goldilocks::ONE, |a, &v| a * (Goldilocks::ONE - v));
+    if proof.tie_row.final_evals[5] != e0_row_at { return None; }
+
+    let qless: Vec<Goldilocks> = transcript.field_vec(arity);
+    let gless = transcript.field();
+    let terms = tie_less_terms(b_bits, gless);
+    let (ok, z_less, fl) = verify_virtual(&proof.tie_less, &terms, Goldilocks::ZERO, arity, transcript);
+    if !ok || fl != virtual_eval(&terms, &proof.tie_less.final_evals)
+        || proof.tie_less.final_evals[0] != mle::eq_poly(&qless, &z_less) { return None; }
+
+    // Cyclic-shift pair-multiset permutations (same primitive as ScatterOrder).
+    let gamma_pp = transcript.field();
+    let alpha_pp = transcript.field();
+    if alpha_pp != proof.perm_p.alpha { return None; }
+    let wcp = verify_fractional_chain_core(&proof.perm_p.a_side, arity, transcript)?;
+    let tcp = verify_fractional_chain_core(&proof.perm_p.b_side, arity, transcript)?;
+    if wcp.final_den == Goldilocks::ZERO || tcp.final_den == Goldilocks::ZERO { return None; }
+    if wcp.final_num * tcp.final_den != tcp.final_num * wcp.final_den { return None; }
+    if wcp.num_leaf != Goldilocks::ONE || tcp.num_leaf != Goldilocks::ONE { return None; }
+
+    let gamma_pt = transcript.field();
+    let alpha_pt = transcript.field();
+    if alpha_pt != proof.perm_t.alpha { return None; }
+    let wct = verify_fractional_chain_core(&proof.perm_t.a_side, arity, transcript)?;
+    let tct = verify_fractional_chain_core(&proof.perm_t.b_side, arity, transcript)?;
+    if wct.final_den == Goldilocks::ZERO || tct.final_den == Goldilocks::ZERO { return None; }
+    if wct.final_num * tct.final_den != tct.final_num * wct.final_den { return None; }
+    if wct.num_leaf != Goldilocks::ONE || tct.num_leaf != Goldilocks::ONE { return None; }
+    let gamma_pb = transcript.field();
+    let alpha_pb = transcript.field();
+    if alpha_pb != proof.perm_b.alpha { return None; }
+    let wcb = verify_fractional_chain_core(&proof.perm_b.a_side, arity, transcript)?;
+    let tcb = verify_fractional_chain_core(&proof.perm_b.b_side, arity, transcript)?;
+    if wcb.final_den == Goldilocks::ZERO || tcb.final_den == Goldilocks::ZERO { return None; }
+    if wcb.final_num * tcb.final_den != tcb.final_num * wcb.final_den { return None; }
+    if wcb.num_leaf != Goldilocks::ONE || tcb.num_leaf != Goldilocks::ONE { return None; }
+    let dom = 1usize.checked_shl(arity as u32)?;
+    // Exact domain: no padding rows take part in the rank recurrence or in
+    // the cyclic-shift permutation.
+    if dom != len || dom != 1usize.checked_shl(arity as u32)? { return None; }
+
+    let tie_layout = topk_tie_layout(&z_zero, &z_bits, &z_rank, &z_row, &z_less,
+        &wcp.q_den, &tcp.q_den, &wct.q_den, &tct.q_den, &wcb.q_den, &tcb.q_den, b_bits, arity);
+    let tie_idxs: Vec<usize> = tie_layout.iter().map(|e| e.0).collect();
+    let tie_points: Vec<Vec<Goldilocks>> = tie_layout.iter().map(|e| e.1.clone()).collect();
+    if proof.tie_aux_values.len() != tie_layout.len() { return None; }
+    if !verify_aux_open(tie_aux, &tie_idxs, &tie_points, &proof.tie_aux_values, &proof.tie_opening) { return None; }
+    let tv = &proof.tie_aux_values;
+    let mut to = 0usize;
+    let mut ttake = || { let v = tv[to]; to += 1; v };
+    // zero virtual: w1, T1, w2, T2, T.
+    if proof.tie_zero.final_evals[3] != ttake() { return None; }
+    if proof.tie_zero.final_evals[4] != ttake() { return None; }
+    if proof.tie_zero.final_evals[6] != ttake() { return None; }
+    if proof.tie_zero.final_evals[7] != ttake() { return None; }
+    if proof.tie_zero.final_evals[8] != ttake() { return None; }
+    // bits virtual: P, t_b, P bits, t_b bits.
+    if proof.tie_bits.final_evals[1] != ttake() { return None; }
+    if proof.tie_bits.final_evals[2] != ttake() { return None; }
+    for b in 0..b_bits { if proof.tie_bits.final_evals[3 + b] != ttake() { return None; } }
+    for b in 0..b_bits { if proof.tie_bits.final_evals[3 + b_bits + b] != ttake() { return None; } }
+    // rank virtual: P, P_prev, T_prev.
+    if proof.tie_rank.final_evals[1] != ttake() { return None; }
+    if proof.tie_rank.final_evals[2] != ttake() { return None; }
+    if proof.tie_rank.final_evals[3] != ttake() { return None; }
+    // row virtual: T, t_b, t_b_prev (sel is bound by the witness opening).
+    if proof.tie_row.final_evals[2] != ttake() { return None; }
+    if proof.tie_row.final_evals[4] != ttake() { return None; }
+    if proof.tie_row.final_evals[6] != ttake() { return None; }
+    // less virtual: T, t_b, P bits, t_b bits, E.
+    if proof.tie_less.final_evals[1] != ttake() { return None; }
+    if proof.tie_less.final_evals[3] != ttake() { return None; }
+    for b in 0..b_bits { if proof.tie_less.final_evals[4 + b] != ttake() { return None; } }
+    for b in 0..b_bits { if proof.tie_less.final_evals[4 + b_bits + b] != ttake() { return None; } }
+    for b in 0..b_bits { if proof.tie_less.final_evals[4 + 2 * b_bits + b] != ttake() { return None; } }
+    // permutation leaf openings.
+    let p_prev_at_ap = ttake();
+    let p_at_bp = ttake();
+    let t_prev_at_at = ttake();
+    let t_at_bt = ttake();
+    let tb_prev_at_abt = ttake();
+    let tb_at_bbt = ttake();
+    if to != tv.len() { return None; }
+    if wcp.den_leaf != alpha_pp - (p_prev_at_ap + gamma_pp * pos_mle(&wcp.q_den)) { return None; }
+    if tcp.den_leaf != alpha_pp - (p_at_bp + gamma_pp * pos_plus1_mle(&tcp.q_den, dom)) { return None; }
+    if wct.den_leaf != alpha_pt - (t_prev_at_at + gamma_pt * pos_mle(&wct.q_den)) { return None; }
+    if tct.den_leaf != alpha_pt - (t_at_bt + gamma_pt * pos_plus1_mle(&tct.q_den, dom)) { return None; }
+    if wcb.den_leaf != alpha_pb - (tb_prev_at_abt + gamma_pb * pos_mle(&wcb.q_den)) { return None; }
+    if tcb.den_leaf != alpha_pb - (tb_at_bbt + gamma_pb * pos_plus1_mle(&tcb.q_den, dom)) { return None; }
+
     let layout = topk_witness_layout(&z1, &z2, &z3, &z4, &z5, &z6, &z7, &z8, &z10,
-        &qs, &qg, &qd, &q2, arity);
+        &z_zero, &z_less, &z_row, &qs, &qg, &qd, &q2, arity);
     let idxs: Vec<usize> = layout.iter().map(|e| e.0).collect();
     let points: Vec<Vec<Goldilocks>> = layout.iter().map(|e| e.1.clone()).collect();
     if proof.aux_values.len() != layout.len() { return None; }
@@ -1195,9 +1772,25 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     let mut d2sv = Goldilocks::ZERO;
     for b in 0..TK_RANGE_BITS { d2sv = d2sv + Goldilocks::from_u64(1u64 << b) * take(); }
     let out_sel_q2 = take();
+    // Tie endpoints: sel + d1 bits + d2 bits at z_zero, then sel at z_less.
+    let zero_sel = take();
+    let mut zero_d1 = Goldilocks::ZERO;
+    for b in 0..TK_RANGE_BITS { zero_d1 = zero_d1 + Goldilocks::from_u64(1u64 << b) * take(); }
+    let mut zero_d2 = Goldilocks::ZERO;
+    for b in 0..TK_RANGE_BITS { zero_d2 = zero_d2 + Goldilocks::from_u64(1u64 << b) * take(); }
+    let less_sel = take();
+    let row_sel = take();
     if o != av.len() { return None; }
-    let d2v = d2sv + Goldilocks::ONE - out_sel_q2;
+    // Non-strict gap: d2 = (1-sel)*(thr_b-x); no sel adjustment.
+    let d2v = d2sv;
     if out_sel != vs || out_gate != vg || d1v != vd || d2v != v2 { return None; }
+    // Bind the tie virtuals to the witness openings.
+    if proof.tie_zero.final_evals[1] != zero_sel
+        || proof.tie_zero.final_evals[2] != zero_d1
+        || proof.tie_zero.final_evals[5] != zero_d2 { return None; }
+    if proof.tie_less.final_evals[2] != less_sel { return None; }
+    if proof.tie_row.final_evals[3] != row_sel { return None; }
+    let _ = out_sel_q2;
 
     let xk = TensorKey::Field(x).encoded()?;
     let x_claim = |z: &[Goldilocks], v: Goldilocks| -> Option<EvalClaim> {
@@ -1294,7 +1887,7 @@ fn verify_reverse_broadcast_scale(op: &Op, point: &[Goldilocks], value: Goldiloc
     let fe = &proof.prod.final_evals;
     if fe.len() != 4 || fe[0] != mle::eq_poly(&q, &z) || fc != virtual_eval(&terms, fe) { return None; }
     if verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
-        return None;
+        { return None; }
     }
     let xk = TensorKey::Field(x).encoded()?;
     let sk = TensorKey::Field(scale).encoded()?;
@@ -1352,7 +1945,7 @@ fn verify_reverse_scale_vec(op: &Op, point: &[Goldilocks], value: Goldilocks,
     let fe = &proof.prod.final_evals;
     if fe.len() != 4 || fe[0] != mle::eq_poly(&q, &z) || fc != virtual_eval(&terms, fe) { return None; }
     if verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
-        return None;
+        { return None; }
     }
     let xk = TensorKey::Field(x).encoded()?;
     let sk = TensorKey::Field(scale).encoded()?;
@@ -1640,7 +2233,7 @@ fn prove_reverse_scatter(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Go
 {
     let (sel, token_id, expert_of, m, n) = scatter_dims(op)?;
     if aux.descriptor.role != AuxRole::ScatterRouting || aux.descriptor.columns != m.checked_add(n)? {
-        return None;
+        { return None; }
     }
     let lgm = m.trailing_zeros() as usize;
     let lgn = n.trailing_zeros() as usize;
@@ -1786,7 +2379,7 @@ fn verify_reverse_scatter(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
 {
     let (sel, token_id, expert_of, m, n) = scatter_dims(op)?;
     if descriptor.role != AuxRole::ScatterRouting || descriptor.columns != m.checked_add(n)? {
-        return None;
+        { return None; }
     }
     let lgm = m.trailing_zeros() as usize;
     let lgn = n.trailing_zeros() as usize;
@@ -2891,7 +3484,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, ScatterRouting, ScatterOrder }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -3291,8 +3884,9 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
+    match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::ScatterRouting => 11, AuxRole::ScatterOrder => 12 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -3820,8 +4414,9 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 let thr_aux = aux.remove(&(op_index, AuxRole::TopKSelectThr))?;
                 let range_aux = aux.remove(&(op_index, AuxRole::TopKSelectXRange))?;
                 let thr_range_aux = aux.remove(&(op_index, AuxRole::TopKSelectThrRange))?;
+                let tie_aux = aux.remove(&(op_index, AuxRole::TopKSelectTie))?;
                 let (proof, incoming) = prove_reverse_topk(store, op, &pairs, witness, thr_aux,
-                    range_aux, thr_range_aux, transcript)?;
+                    range_aux, thr_range_aux, tie_aux, transcript)?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -4081,7 +4676,8 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 let thr_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::TopKSelectThr)?;
                 let range_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::TopKSelectXRange)?;
                 let thr_range_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::TopKSelectThrRange)?;
-                for c in verify_reverse_topk(op, &merged_out, witness, thr_aux, range_aux, thr_range_aux, proof, transcript)? {
+                let tie_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::TopKSelectTie)?;
+                for c in verify_reverse_topk(op, &merged_out, witness, thr_aux, range_aux, thr_range_aux, tie_aux, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -7004,7 +7600,7 @@ fn verify_shard_precomputed_inner(
     mode: FracMode,
 ) -> Option<Vec<EvalClaim>> {
     if proof.ops.len() != ops.len() || proof.bound.len() != proof.binds.len() {
-        return None;
+        { return None; }
     }
 
     let mut claims: Vec<EvalClaim> = Vec::new();
@@ -7020,19 +7616,19 @@ fn verify_shard_precomputed_inner(
                 // remainder range-checked by the 2^shift identity lookup.
                 let r_s: Vec<Goldilocks> = transcript.field_vec(r.len());
                 if r_s != *r {
-                    return None;
+                    { return None; }
                 }
                 let two_shift = Goldilocks::from_u64(1u64 << shift);
                 if *shift == 0 {
                     if evals[0] * from_i64(*factor) != evals[1] {
-                        return None;
+                        { return None; }
                     }
                 } else {
                     let half = Goldilocks::from_u64(1u64 << (shift - 1));
                     if evals[0] * from_i64(*factor)
                         != two_shift * evals[1] + evals[2] - half
                     {
-                        return None;
+                        { return None; }
                     }
                 }
                 claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: evals[0] });
@@ -7045,7 +7641,7 @@ fn verify_shard_precomputed_inner(
                 let arity = r.len();
                 let q_s: Vec<Goldilocks> = transcript.field_vec(arity);
                 if *r_scale != r[..s_len_log].to_vec() {
-                    return None;
+                    { return None; }
                 }
                 let neg = Goldilocks::ZERO - Goldilocks::ONE;
                 let terms = if *shift == 0 {
@@ -7064,7 +7660,7 @@ fn verify_shard_precomputed_inner(
                     ]
                 };
                 if !verify_eq_weighted(vp, &terms, arity, &q_s, r, transcript) {
-                    return None;
+                    { return None; }
                 }
                 claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: vp.final_evals[1] });
                 claims.push(EvalClaim { tensor_id: *scale, point: r_scale.clone(), value: vp.final_evals[2] });
@@ -7072,12 +7668,12 @@ fn verify_shard_precomputed_inner(
             }
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
                 if !verify_scatter_with_mode(p, *m, *n, transcript, mode) {
-                    return None;
+                    { return None; }
                 }
             }
             (Op::Gather { m: _, h: _, .. }, OpProof::Gather(p)) => {
                 if !verify_scatter_add_with_mode(p, transcript, mode) {
-                    return None;
+                    { return None; }
                 }
             }
             (
@@ -7087,11 +7683,11 @@ fn verify_shard_precomputed_inner(
                 let u_s: Vec<Goldilocks> = transcript.field_vec(s.trailing_zeros() as usize);
                 let v_s: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
                 if u_s != *u || v_s != *v {
-                    return None;
+                    { return None; }
                 }
                 let (ok, ch_derived) = bmm::verify(p, *s, *k, u, transcript);
                 if !ok || ch_derived != *ch {
-                    return None;
+                    { return None; }
                 }
                 claims.push(EvalClaim { tensor_id: *a, point: ch.clone(), value: p.sumcheck.final_evals[0] });
                 let mut wp = v.clone();
@@ -7108,11 +7704,11 @@ fn verify_shard_precomputed_inner(
                 let u_s: Vec<Goldilocks> = transcript.field_vec(s.trailing_zeros() as usize);
                 let v_s: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
                 if u_s != *u || v_s != *v {
-                    return None;
+                    { return None; }
                 }
                 let (ok, ch_derived) = bmm::verify_gather_matmul(p, *s, *k, u, transcript);
                 if !ok || ch_derived != *ch {
-                    return None;
+                    { return None; }
                 }
                 claims.push(EvalClaim { tensor_id: *a, point: ch.clone(), value: p.sumcheck.final_evals[0] });
                 let mut cp = v.clone();
@@ -7124,7 +7720,7 @@ fn verify_shard_precomputed_inner(
                 // low-bit index value of r).
                 let r_s: Vec<Goldilocks> = transcript.field_vec(r.len());
                 if r_s != *r {
-                    return None;
+                    { return None; }
                 }
                 let b_log = b.trailing_zeros() as usize;
                 let r_base = &r[b_log..];
@@ -7133,7 +7729,7 @@ fn verify_shard_precomputed_inner(
                     jval = jval + Goldilocks::from_u64(1u64 << k) * pk;
                 }
                 if evals[1] != Goldilocks::from_u64(*b as u64) * evals[0] + jval {
-                    return None;
+                    { return None; }
                 }
                 let _ = (base, out, r_base);
             }
@@ -7141,10 +7737,10 @@ fn verify_shard_precomputed_inner(
                 // S5: out = scale*a + b — direct linear formula at r.
                 let r_s: Vec<Goldilocks> = transcript.field_vec(r.len());
                 if r_s != *r {
-                    return None;
+                    { return None; }
                 }
                 if evals[2] != Goldilocks::from_u64(*scale as u64) * evals[0] + evals[1] {
-                    return None;
+                    { return None; }
                 }
                 let _ = (a, b, out);
             }
@@ -7157,7 +7753,7 @@ fn verify_shard_precomputed_inner(
                 // relation is multiplicative).
                 let q_s: Vec<Goldilocks> = transcript.field_vec(r.len());
                 if q_s != *q {
-                    return None;
+                    { return None; }
                 }
                 let mut mask_col = vec![Goldilocks::ZERO; *len];
                 for i in 0..*base_len {
@@ -7169,7 +7765,7 @@ fn verify_shard_precomputed_inner(
                     (neg, vec![0usize, 1usize, 3usize]),
                 ];
                 if !verify_eq_weighted(vp, &terms, r.len(), &q_s, r, transcript) {
-                    return None;
+                    { return None; }
                 }
                 let _ = (base, out);
             }
@@ -7178,7 +7774,7 @@ fn verify_shard_precomputed_inner(
                 let q_s: Vec<Goldilocks> = transcript.field_vec(arity);
                 let h_log = h.trailing_zeros() as usize;
                 if *r_scale != r[h_log..].to_vec() {
-                    return None;
+                    { return None; }
                 }
                 let neg = Goldilocks::ZERO - Goldilocks::ONE;
                 let terms = vec![
@@ -7186,7 +7782,7 @@ fn verify_shard_precomputed_inner(
                     (neg, vec![0usize, 3usize]),
                 ];
                 if !verify_eq_weighted(vp, &terms, arity, &q_s, r, transcript) {
-                    return None;
+                    { return None; }
                 }
                 claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: vp.final_evals[1] });
                 claims.push(EvalClaim { tensor_id: *scale, point: r_scale.clone(), value: vp.final_evals[2] });
@@ -7202,7 +7798,7 @@ fn verify_shard_precomputed_inner(
                     .collect();
                 r_gate_s.extend_from_slice(&r[h_log..]);
                 if r_gate_s != *r_gate {
-                    return None;
+                    { return None; }
                 }
                 let neg = Goldilocks::ZERO - Goldilocks::ONE;
                 let terms = if *shift == 0 {
@@ -7221,7 +7817,7 @@ fn verify_shard_precomputed_inner(
                     ]
                 };
                 if !verify_eq_weighted(vp, &terms, arity, &q_s, r, transcript) {
-                    return None;
+                    { return None; }
                 }
                 claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: vp.final_evals[1] });
                 claims.push(EvalClaim { tensor_id: *gate, point: r_gate.clone(), value: vp.final_evals[2] });
@@ -7233,7 +7829,7 @@ fn verify_shard_precomputed_inner(
                 // via the range lookup.
                 let q_s: Vec<Goldilocks> = transcript.field_vec(r.len());
                 if q_s != *q {
-                    return None;
+                    { return None; }
                 }
                 let neg = Goldilocks::ZERO - Goldilocks::ONE;
                 let terms = vec![
@@ -7241,13 +7837,13 @@ fn verify_shard_precomputed_inner(
                     (neg, vec![0usize, 1usize, 2usize]),
                 ];
                 if !verify_eq_weighted(vp, &terms, r.len(), &q_s, r, transcript) {
-                    return None;
+                    { return None; }
                 }
                 let t_22 = find_identity_table_slices(tables, 1usize << 22);
                 match t_22 {
                     Some(tw) => {
                         if !proof.witness_columns.iter().any(|w| w.table == tw) {
-                            return None;
+                            { return None; }
                         }
                     }
                     None => return None,
@@ -7262,11 +7858,11 @@ fn verify_shard_precomputed_inner(
                 let u_s: Vec<Goldilocks> = transcript.field_vec(m.trailing_zeros() as usize);
                 let v_s: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
                 if u_s != *u || v_s != *v {
-                    return None;
+                    { return None; }
                 }
                 let (ok, ch_derived) = matmul_verify(mp, k.trailing_zeros() as usize, transcript);
                 if !ok || ch_derived != *ch {
-                    return None;
+                    { return None; }
                 }
                 let mut ap = ch.clone();
                 ap.extend_from_slice(u);
@@ -7283,7 +7879,7 @@ fn verify_shard_precomputed_inner(
                 OpProof::Projection(pp),
             ) => {
                 if !verify_projection(pp, *shift, *m, *k, *n, transcript) {
-                    return None;
+                    { return None; }
                 }
                 let mut in_pt = pp.ch.clone();
                 in_pt.extend_from_slice(&pp.u);
@@ -7298,10 +7894,10 @@ fn verify_shard_precomputed_inner(
                 // S5: DIRECT position-wise relation — no sumcheck.
                 let r_s: Vec<Goldilocks> = transcript.field_vec(r.len());
                 if r_s != *r {
-                    return None;
+                    { return None; }
                 }
                 if evals[0] + evals[1] != evals[2] {
-                    return None;
+                    { return None; }
                 }
                 claims.push(EvalClaim { tensor_id: *a, point: r.clone(), value: evals[0] });
                 claims.push(EvalClaim { tensor_id: *b, point: r.clone(), value: evals[1] });
@@ -7320,7 +7916,7 @@ fn verify_shard_precomputed_inner(
             }
             (Op::Softmax { out, m, n, .. }, OpProof::Softmax(sp)) => {
                 if !verify_softmax_rounded(sp, *m, *n, transcript) {
-                    return None;
+                    { return None; }
                 }
                 claims.push(EvalClaim {
                     tensor_id: *out,
@@ -7337,7 +7933,7 @@ fn verify_shard_precomputed_inner(
                 // at r; q and idx are range-checked by the lookups.
                 let q_s: Vec<Goldilocks> = transcript.field_vec(r.len());
                 if q_s != *q {
-                    return None;
+                    { return None; }
                 }
                 let neg = Goldilocks::ZERO - Goldilocks::ONE;
                 let terms = vec![
@@ -7345,11 +7941,11 @@ fn verify_shard_precomputed_inner(
                     (neg, vec![0usize, 1usize, 2usize]),
                 ];
                 if !verify_eq_weighted(vp, &terms, r.len(), &q_s, r, transcript) {
-                    return None;
+                    { return None; }
                 }
                 let trunc_r = vp.final_evals[2];
                 if trunc_r != *q_eval * Goldilocks::from_u64(*table_len as u64) + *idx_eval {
-                    return None;
+                    { return None; }
                 }
                 let t_len = find_identity_table_slices(tables, *table_len);
                 let t_22 = find_identity_table_slices(tables, 1usize << 22);
@@ -7358,7 +7954,7 @@ fn verify_shard_precomputed_inner(
                         let has_len = proof.witness_columns.iter().any(|w| w.table == tl);
                         let has_22 = proof.witness_columns.iter().any(|w| w.table == tw);
                         if !has_len || !has_22 {
-                            return None;
+                            { return None; }
                         }
                     }
                     _ => return None,
@@ -7376,7 +7972,7 @@ fn verify_shard_precomputed_inner(
                 let g1 = transcript.field();
                 let g2 = transcript.field();
                 if q_s != *q {
-                    return None;
+                    { return None; }
                 }
                 let l1 = Goldilocks::from_u64((*table_len - 1) as u64);
                 let neg = Goldilocks::ZERO - Goldilocks::ONE;
@@ -7389,7 +7985,7 @@ fn verify_shard_precomputed_inner(
                     (g2 * l1, vec![0usize, 2usize]),
                 ];
                 if !verify_eq_weighted(vp, &terms, r.len(), &q_s, r, transcript) {
-                    return None;
+                    { return None; }
                 }
                 let t_len = find_identity_table_slices(tables, *table_len);
                 let t_22 = find_identity_table_slices(tables, 1usize << 22);
@@ -7398,7 +7994,7 @@ fn verify_shard_precomputed_inner(
                         let has_len = proof.witness_columns.iter().any(|w| w.table == tl);
                         let has_22 = proof.witness_columns.iter().any(|w| w.table == tw);
                         if !has_len || !has_22 {
-                            return None;
+                            { return None; }
                         }
                     }
                     _ => return None,
@@ -7423,7 +8019,7 @@ fn verify_shard_precomputed_inner(
                 let g3 = transcript.field();
                 let q_s: Vec<Goldilocks> = transcript.field_vec(r.len());
                 if q_s != *q {
-                    return None;
+                    { return None; }
                 }
                 let ofs = from_i64(*offset);
                 let l1 = Goldilocks::from_u64((*table_len - 1) as u64);
@@ -7440,11 +8036,11 @@ fn verify_shard_precomputed_inner(
                     (neg * g3 * ofs, vec![0usize, 6usize]),
                 ];
                 if !verify_eq_weighted(vp, &f_terms, r.len(), &q_s, r, transcript) {
-                    return None;
+                    { return None; }
                 }
                 // masked(r) = x(r) + mask(r) with the carried claim values.
                 if vp.final_evals[1] != *x_eval + *mask_eval {
-                    return None;
+                    { return None; }
                 }
                 // The row virtual: its row point is the formula point's row
                 // bits; rmax = row_max(r_row) == vp.final_evals[2].
@@ -7466,13 +8062,13 @@ fn verify_shard_precomputed_inner(
                     transcript,
                 );
                 if !ok || s.len() != row_arity {
-                    return None;
+                    { return None; }
                 }
                 if row_vp.final_evals[0] != mle::eq_poly(&r_row, &s[n_log..]) {
-                    return None;
+                    { return None; }
                 }
                 if fc != virtual_eval(&row_terms, &row_vp.final_evals) {
-                    return None;
+                    { return None; }
                 }
                 let t_len = find_identity_table_slices(tables, *table_len);
                 let t_22 = find_identity_table_slices(tables, 1usize << 22);
@@ -7481,7 +8077,7 @@ fn verify_shard_precomputed_inner(
                         let has_len = proof.witness_columns.iter().any(|w| w.table == tl);
                         let has_22 = proof.witness_columns.iter().any(|w| w.table == tw);
                         if !has_len || !has_22 {
-                            return None;
+                            { return None; }
                         }
                     }
                     _ => return None,
@@ -7492,7 +8088,7 @@ fn verify_shard_precomputed_inner(
             }
             (Op::Layernorm { out, w, b, m, d, .. }, OpProof::Layernorm(lp)) => {
                 if !verify_layernorm_chain(lp, *m, *d, transcript) {
-                    return None;
+                    { return None; }
                 }
                 // out relation mles [x, rsqrt_b, w, b, out] (degree 3, S2).
                 claims.push(EvalClaim { tensor_id: *out, point: lp.r_out.clone(), value: lp.out.final_evals[5] });
@@ -7504,7 +8100,7 @@ fn verify_shard_precomputed_inner(
                 OpProof::LayerNormCentered(lp),
             ) => {
                 if !verify_layer_norm_centered(lp, *m, *d, *n_real, transcript) {
-                    return None;
+                    { return None; }
                 }
                 claims.push(EvalClaim {
                     tensor_id: *x,
@@ -7518,7 +8114,7 @@ fn verify_shard_precomputed_inner(
             }
             (Op::RmsNorm { out, w, m, d, n_real, .. }, OpProof::RmsNorm(p)) => {
                 if !verify_rms_norm(p, *m, *d, *n_real, transcript) {
-                    return None;
+                    { return None; }
                 }
                 // out relation mles [x, rstd_b, w, raw, out, rem_out, ones].
                 claims.push(EvalClaim { tensor_id: *out, point: p.r_out.clone(), value: p.out.final_evals[5] });
@@ -7526,7 +8122,7 @@ fn verify_shard_precomputed_inner(
             }
             (Op::RoPE { out, d, shift, .. }, OpProof::RoPE(p)) => {
                 if !verify_rope(p, *shift, transcript) {
-                    return None;
+                    { return None; }
                 }
                 // S2: `out` is claimed at the two half points whose values are
                 // the checked sumcheck final evals (first/second.final_evals[4]).
@@ -7536,7 +8132,7 @@ fn verify_shard_precomputed_inner(
             }
             (Op::TopKSelect { x, sel, gate, k, m, n, .. }, OpProof::TopKSelect(p)) => {
                 if !verify_topk(p, *k, *m, *n, transcript) {
-                    return None;
+                    { return None; }
                 }
                 claims.push(EvalClaim { tensor_id: *x, point: p.r.clone(), value: p.gate_rel.final_evals[1] });
                 claims.push(EvalClaim { tensor_id: *sel, point: p.r.clone(), value: p.gate_rel.final_evals[2] });
@@ -7546,7 +8142,7 @@ fn verify_shard_precomputed_inner(
                 // S6: committed mode defers the out-binding to the committed
                 // per-position selector openings; plain mode checks directly.
                 if !verify_argmax(p, *m, *n, transcript, mode != FracMode::Committed) {
-                    return None;
+                    { return None; }
                 }
                 claims.push(EvalClaim { tensor_id: *x, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[1] });
                 claims.push(EvalClaim { tensor_id: *sel, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[2] });
@@ -7568,7 +8164,7 @@ fn verify_shard_precomputed_inner(
             .collect();
         for &(_, _, m, k) in &transposes {
             if !m.is_power_of_two() || !k.is_power_of_two() {
-                return None;
+                { return None; }
             }
         }
         for _ in 0..transposes.len().max(1) {
@@ -7601,7 +8197,7 @@ fn verify_shard_precomputed_inner(
         match seen.get(&(c.tensor_id, c.point.clone())) {
             Some(&v) => {
                 if v != c.value {
-                    return None;
+                    { return None; }
                 }
             }
             None => {
@@ -7626,14 +8222,14 @@ fn verify_shard_precomputed_inner(
     let bound_groups: Vec<(&T, &Vec<(Vec<Goldilocks>, Goldilocks)>)> =
         by_tensor.iter().filter(|(_, cs)| cs.len() >= 2).collect();
     if bound_groups.len() != proof.bound.len() {
-        return None;
+        { return None; }
     }
     for (i, (t, cs)) in bound_groups.iter().enumerate() {
         if **t != proof.bound[i] {
-            return None;
+            { return None; }
         }
         if verify_same_poly(&proof.binds[i], cs, transcript).is_none() {
-            return None;
+            { return None; }
         }
     }
 
@@ -7643,11 +8239,11 @@ fn verify_shard_precomputed_inner(
     // on the committed transcript.
     if mode == FracMode::Plain {
         if proof.witness_columns.len() != proof.table_columns.len() {
-            return None;
+            { return None; }
         }
         for (wc, tc) in proof.witness_columns.iter().zip(proof.table_columns.iter()) {
             if transcript.field() != wc.alpha || transcript.field() != wc.beta {
-                return None;
+                { return None; }
             }
             // S3: the depths come from the columns — the plain proof carries
             // the witness columns, the table depth from the statement table.
@@ -7657,7 +8253,7 @@ fn verify_shard_precomputed_inner(
                 .next_power_of_two()
                 .trailing_zeros() as usize;
             if !verify_lookup_split(&wc.proof, &tc.proof, t_w, t_t, transcript) {
-                return None;
+                { return None; }
             }
         }
     }
@@ -7923,10 +8519,10 @@ pub fn committed_cross_bind(
             .ok()?
             != opened
         {
-            return None;
+            { return None; }
         }
         if opened != *expected || opened != mle::eval(tensor, pt) {
-            return None;
+            { return None; }
         }
         openings.push((open, opened));
     }
@@ -10254,6 +10850,10 @@ fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &Trusted
     for (&id, tensor) in execution.inputs.iter().chain(&execution.outputs) {
         if model.tensor_lengths.get(&id) != Some(&tensor.len()) { return None; }
     }
+    // Structural aux validation (restored): the dynamic-table-aware specs
+    // must match the submitted descriptors exactly (count, order, role,
+    // length, arity, columns); roots are bound below via bincode(aux).
+    if !validate_aux_descriptors(ops, model, aux) { return None; }
     let mut transcript = Transcript::new(b"zkie-bound-execution-v1");
     transcript.absorb(&bincode::serialize(model).ok()?);
     transcript.absorb(&bincode::serialize(execution).ok()?);
@@ -10416,6 +11016,8 @@ pub fn prove_committed_shard_dag_bound(
     prepared.extend(prepare_topk_aux(store, ops)?);
     prepared.extend(prepare_topk_range_aux(store, ops)?);
     prepared.extend(prepare_topk_thr_range_aux(store, ops)?);
+    let tie_dbg = prepare_topk_tie_aux(store, ops);
+    prepared.extend(tie_dbg?);
     prepared.extend(prepare_scatter_aux(store, ops, model)?);
     prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
@@ -11312,7 +11914,7 @@ fn verify_committed_shard_dag_inner(
                     let get = |batch: usize, table: usize| -> Option<(&Vec<usize>, &Vec<Vec<Goldilocks>>, &Vec<Goldilocks>)> {
                         let o = proof.gather_batch_openings.get(batch)?;
                         if table >= o.points.len() {
-                            return None;
+                            { return None; }
                         }
                         Some((&o.table_idxs, &o.points, &o.claimed))
                     };
@@ -16023,6 +16625,70 @@ mod tests {
         topk_test_commit(op_index, AuxRole::ScatterOrder, s, arity, cols)
     }
 
+    /// Test-side TopKSelectTie columns from the same sel/d1/d2 arrays used by
+    /// the witness batch, mirroring prepare_topk_tie_aux. Tests mutate the
+    /// returned columns to build independent malicious-witness negatives.
+    fn topk_test_tie_columns(sel: &[Goldilocks], d1: &[Goldilocks],
+        d2: &[Goldilocks], m: usize, n: usize, arity: usize) -> Vec<Vec<Goldilocks>> {
+        let len = m * n;
+        let padded = 1usize << arity;
+        let lgn = n.trailing_zeros() as usize;
+        let b_bits = tie_b_bits(lgn);
+        let count = tie_total_cols(b_bits);
+        let mut cols = vec![vec![Goldilocks::ZERO; padded]; count];
+        for at in 0..len {
+            let sv = sel[at];
+            let t1 = if d1[at] == Goldilocks::ZERO { Goldilocks::ONE } else { Goldilocks::ZERO };
+            let t2 = if d2[at] == Goldilocks::ZERO { Goldilocks::ONE } else { Goldilocks::ZERO };
+            let w1 = if d1[at] == Goldilocks::ZERO { Goldilocks::ZERO } else { d1[at].try_inverse().unwrap() };
+            let w2 = if d2[at] == Goldilocks::ZERO { Goldilocks::ZERO } else { d2[at].try_inverse().unwrap() };
+            cols[TIE_T1][at] = t1;
+            cols[TIE_W1][at] = w1;
+            cols[TIE_T2][at] = t2;
+            cols[TIE_W2][at] = w2;
+            cols[TIE_T][at] = if sv == Goldilocks::ONE { t1 } else { t2 };
+        }
+        for row in 0..m {
+            let mut pv = 0u64;
+            let mut tb = 0u64;
+            for e in 0..n {
+                let at = row * n + e;
+                cols[TIE_P][at] = Goldilocks::from_u64(pv);
+                pv += to_i64(cols[TIE_T][at]) as u64;
+                tb += to_i64(cols[TIE_T][at]) as u64 * to_i64(sel[at]) as u64;
+            }
+            for e in 0..n {
+                let at = row * n + e;
+                let p_at = to_i64(cols[TIE_P][at]) as u64;
+                cols[TIE_TB][at] = Goldilocks::from_u64(tb);
+                for b in 0..b_bits {
+                    cols[tie_p_bits_col(b)][at] = Goldilocks::from_u64((p_at >> b) & 1);
+                    cols[tie_tb_bits_col(b_bits, b)][at] = Goldilocks::from_u64((tb >> b) & 1);
+                }
+                let mut eq = Goldilocks::ONE;
+                for b in (0..b_bits).rev() {
+                    cols[tie_eq_col(b_bits, b)][at] = eq;
+                    if ((p_at >> b) & 1) != ((tb >> b) & 1) { eq = Goldilocks::ZERO; }
+                }
+            }
+        }
+        let p_col = cols[TIE_P].clone();
+        let t_col = cols[TIE_T].clone();
+        let tb_col = cols[TIE_TB].clone();
+        for pos in 0..padded {
+            cols[TIE_P_PREV][pos] = p_col[(pos + padded - 1) % padded];
+            cols[TIE_T_PREV][pos] = t_col[(pos + padded - 1) % padded];
+            cols[tie_tb_prev_col(b_bits)][pos] = tb_col[(pos + padded - 1) % padded];
+        }
+        cols
+    }
+
+    fn topk_test_tie_commit(sel: &[Goldilocks], d1: &[Goldilocks], d2: &[Goldilocks],
+        m: usize, n: usize, arity: usize, op_index: usize) -> PreparedAux {
+        let cols = topk_test_tie_columns(sel, d1, d2, m, n, arity);
+        topk_test_commit(op_index, AuxRole::TopKSelectTie, m * n, arity, cols)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn topk_test_witness_columns(sel: &[Goldilocks], thr_b: &[Goldilocks],
         att: &[Goldilocks], gate: &[Goldilocks], d1: &[Goldilocks], d2s: &[Goldilocks],
@@ -16061,7 +16727,7 @@ mod tests {
         let vg = pe(&wcols[TK_GATE_COL], &qg);
         let mut vd = Goldilocks::ZERO;
         for b in 0..TK_RANGE_BITS { vd = vd + Goldilocks::from_u64(1u64 << b) * pe(&wcols[TK_D1_COL + b], &qd); }
-        let mut v2 = Goldilocks::ONE - pe(&wcols[TK_SEL_COL], &q2);
+        let mut v2 = Goldilocks::ZERO;
         for b in 0..TK_RANGE_BITS { v2 = v2 + Goldilocks::from_u64(1u64 << b) * pe(&wcols[TK_D2S_COL + b], &q2); }
         let vt = mle::eval(&tcols[0], &argmax_pad_point(&qt, thr_arity));
         vec![(sel, qs, vs), (thr, qt, vt), (gate, qg, vg), (d1, qd, vd), (d2, q2, v2)]
@@ -16133,14 +16799,14 @@ mod tests {
     }
 
     #[test]
-    fn s7c_topk_bound_tied_input_fails_closed() {
+    fn s7c_topk_bound_tied_input_roundtrip() {
         use zkie_core::pcs::whir::Whir;
         let (m, n, k) = (4usize, 8usize, 1usize);
         let mut store = Store::new();
         let mut xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
         // Real boundary tie in row 0 (the two largest values are equal):
-        // forward picks the smaller index (pos 0), but the staged strict-tie
-        // boundary refuses to prove it.
+        // forward picks the smaller index (pos 0); the deterministic tie
+        // rule must prove and verify exactly that selection.
         for e in 0..n { xv[e] = from_i64([10i64, 10, 1, 8, 2, 9, 3, 4][e]); }
         let x = store.push(xv.clone());
         let sel = store.push(vec![]);
@@ -16163,12 +16829,51 @@ mod tests {
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
         let execution = TrustedExecution {
             inputs: [(x, xv.clone())].into(),
-            outputs: [(sel, sel_v), (thr, thr_v), (gate, gate_v), (d1, d1_v), (d2, d2_v)].into(),
+            outputs: [(sel, sel_v.clone()), (thr, thr_v.clone()), (gate, gate_v.clone()),
+                      (d1, d1_v.clone()), (d2, d2_v.clone())].into(),
         };
-        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
-            &PublicStatement::Generic, &model, &execution).is_none(),
-            "staged strict-tie boundary: real boundary ties fail closed until the \
-             deterministic smaller-index tie rule is implemented");
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("tied input bound proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution),
+            "honest tied input must verify under the smaller-index tie rule");
+        // The forged larger-index selection for the same row is rejected by
+        // the tie-break relations (independent honest proof, target changed).
+        let mut bad_sel = sel_v.clone();
+        bad_sel[0] = Goldilocks::ZERO;
+        bad_sel[1] = Goldilocks::ONE;
+        let mut bad_gate = gate_v.clone();
+        bad_gate[0] = Goldilocks::ZERO;
+        bad_gate[1] = xv[1];
+        let mut bad_d1 = d1_v.clone();
+        bad_d1[0] = Goldilocks::ZERO;
+        bad_d1[1] = from_i64(to_i64(xv[1]) - to_i64(thr_v[0]));
+        let mut bad_d2 = d2_v.clone();
+        bad_d2[0] = from_i64(to_i64(thr_v[0]) - to_i64(xv[0]));
+        bad_d2[1] = Goldilocks::ZERO;
+        let mut store2 = Store::new();
+        let x2 = store2.push(xv.clone());
+        let sel2 = store2.push(vec![]);
+        let thr2 = store2.push(vec![]);
+        let gate2 = store2.push(vec![]);
+        let d12 = store2.push(vec![]);
+        let d22 = store2.push(vec![]);
+        store2.v[sel2] = TensorData::Owned(bad_sel.clone());
+        store2.v[thr2] = TensorData::Owned(thr_v.clone());
+        store2.v[gate2] = TensorData::Owned(bad_gate.clone());
+        store2.v[d12] = TensorData::Owned(bad_d1.clone());
+        store2.v[d22] = TensorData::Owned(bad_d2.clone());
+        let ops2 = vec![Op::TopKSelect { x: x2, sel: sel2, thr: thr2, gate: gate2, d1: d12, d2: d22, m, n, k }];
+        let cached2 = commit_model_weights(&store2, &ops2, "/tmp/zkie-s7c-topk-tied-bad");
+        let model2 = TrustedModelManifest::from_offline_commitment(&cached2, &store2.owned_slices(), &ops2);
+        let execution2 = TrustedExecution {
+            inputs: [(x2, xv.clone())].into(),
+            outputs: [(sel2, bad_sel), (thr2, thr_v), (gate2, bad_gate), (d12, bad_d1), (d22, bad_d2)].into(),
+        };
+        // The forged selection is internally consistent as a k-subset, but it
+        // is not the smaller-index tie rule: the bound prover must refuse it.
+        assert!(prove_committed_shard_dag_bound(&mut store2, &ops2, 1, &whir, &cached2, 0, 0,
+            &PublicStatement::Generic, &model2, &execution2).is_none(),
+            "larger-index tied selection must be rejected");
     }
 
     #[test]
@@ -16199,7 +16904,7 @@ mod tests {
         }
         let d2s: Vec<Goldilocks> = (0..m * n).map(|at| {
             if sel_v[at] == Goldilocks::ONE { Goldilocks::ZERO }
-            else { d2_v[at] - Goldilocks::ONE }
+            else { d2_v[at] }
         }).collect();
         let wcols = topk_test_witness_columns(&sel_v, &thr_b, &att, &gate_v, &d1_v, &d2s, m, n, arity);
         let mut tcols = vec![vec![Goldilocks::ZERO; 1usize << thr_arity]];
@@ -16213,11 +16918,13 @@ mod tests {
         let rdesc = range.descriptor.clone();
         let thr_range = topk_test_thr_range_commit(&thr_v, m, n, arity, 0);
         let trdesc = thr_range.descriptor.clone();
+        let tie = topk_test_tie_commit(&sel_v, &d1_v, &d2_v, m, n, arity, 0);
+        let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-test");
-        let (proof, claims) = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, &mut tp)
+        let (proof, claims) = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp)
             .expect("honest reduction proof");
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-test");
-        let vclaims = verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &proof, &mut tv)
+        let vclaims = verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &proof, &mut tv)
             .expect("honest reduction must verify");
         assert_eq!(vclaims, claims);
         let _ = lgn;
@@ -16242,13 +16949,15 @@ mod tests {
         let bad_rdesc = bad_range.descriptor.clone();
         let bad_thr_range = topk_test_thr_range_commit(&thr_v, m, n, arity, 0);
         let bad_trdesc = bad_thr_range.descriptor.clone();
+        let bad_tie = topk_test_tie_commit(&sel_v, &bad_d1, &bad_d2s, m, n, arity, 0);
+        let bad_tiedesc = bad_tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-bad-broadcast");
-        let bad = prove_reverse_topk(&store, &op, &bad_outs, bad_witness, bad_thr_aux, bad_range, bad_thr_range, &mut tp);
+        let bad = prove_reverse_topk(&store, &op, &bad_outs, bad_witness, bad_thr_aux, bad_range, bad_thr_range, bad_tie, &mut tp);
         assert!(bad.is_some(), "a malicious prover can commit and prove any witness columns");
         let (bad_proof, _) = bad.unwrap();
         let bad_thr_desc = topk_test_commit(0, AuxRole::TopKSelectThr, m, thr_arity, tcols).descriptor;
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-bad-broadcast");
-        assert!(verify_reverse_topk(&op, &bad_outs, &bad_wdesc, &bad_thr_desc, &bad_rdesc, &bad_trdesc, &bad_proof, &mut tv).is_none(),
+        assert!(verify_reverse_topk(&op, &bad_outs, &bad_wdesc, &bad_thr_desc, &bad_rdesc, &bad_trdesc, &bad_tiedesc, &bad_proof, &mut tv).is_none(),
             "non-broadcast thr_b must be rejected");
     }
 
@@ -16276,14 +16985,14 @@ mod tests {
         for r in 1..m {
             for e in 0..n {
                 let at = r * n + e;
-                d2s_v[at] = if sel_v[at] == Goldilocks::ONE { Goldilocks::ZERO } else { honest_d2[at] - Goldilocks::ONE };
+                d2s_v[at] = if sel_v[at] == Goldilocks::ONE { Goldilocks::ZERO } else { honest_d2[at] };
             }
         }
         for e in 0..n {
             let s = sel_v[e];
             gate_v[e] = s * xv[e];
             d1_v[e] = if s == Goldilocks::ONE { from_i64(to_i64(xv[e]) - 5) } else { Goldilocks::ZERO };
-            d2s_v[e] = if s == Goldilocks::ZERO { from_i64(5 - to_i64(xv[e]) - 1) } else { Goldilocks::ZERO };
+            d2s_v[e] = if s == Goldilocks::ZERO { from_i64(5 - to_i64(xv[e])) } else { Goldilocks::ZERO };
         }
         // att: rows >= 1 mark the selected max; row 0 has NO attained
         // selected threshold position (x = 10 != 5).
@@ -16316,12 +17025,14 @@ mod tests {
         let rdesc = range.descriptor.clone();
         let thr_range = topk_test_thr_range_commit(&thr_v, m, n, arity, 0);
         let trdesc = thr_range.descriptor.clone();
+        let tie = topk_test_tie_commit(&sel_v, &d1_v, &d2s_v, m, n, arity, 0);
+        let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-no-attain");
-        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, &mut tp);
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp);
         assert!(bad.is_some());
         let (bad_proof, _) = bad.unwrap();
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-no-attain");
-        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &bad_proof, &mut tv).is_none(),
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv).is_none(),
             "a threshold not attained by a selected position must be rejected");
     }
 
@@ -16347,16 +17058,16 @@ mod tests {
         for r in 1..m {
             for e in 0..n {
                 let at = r * n + e;
-                d2s_v[at] = if sel_v[at] == Goldilocks::ONE { Goldilocks::ZERO } else { honest_d2[at] - Goldilocks::ONE };
+                d2s_v[at] = if sel_v[at] == Goldilocks::ONE { Goldilocks::ZERO } else { honest_d2[at] };
             }
         }
         for e in 0..n {
             let s = sel_v[e];
             gate_v[e] = s * xv[e];
             d1_v[e] = if s == Goldilocks::ONE { from_i64(5 - to_i64(xv[e])) } else { Goldilocks::ZERO };
-            // pos 0 is unselected x = 5 = thr: the d2s relation wants -1,
-            // which no 16-bit decomposition can represent; commit zero bits.
-            d2s_v[e] = Goldilocks::ZERO;
+            // pos 0 is unselected x = 5 = thr: the non-strict gap is zero;
+            // the tie-break relations reject selecting pos 1 instead.
+            d2s_v[e] = if s == Goldilocks::ZERO { from_i64(5 - to_i64(xv[e])) } else { Goldilocks::ZERO };
         }
         let mut att = vec![Goldilocks::ZERO; m * n];
         att[1] = Goldilocks::ONE; // selected pos 1 attains thr = 5
@@ -16388,13 +17099,146 @@ mod tests {
         let rdesc = range.descriptor.clone();
         let thr_range = topk_test_thr_range_commit(&honest_thr, m, n, arity, 0);
         let trdesc = thr_range.descriptor.clone();
+        let tie = topk_test_tie_commit(&sel_v, &d1_v, &d2s_v, m, n, arity, 0);
+        let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-tie");
-        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, &mut tp);
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp);
         assert!(bad.is_some());
         let (bad_proof, _) = bad.unwrap();
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-tie");
-        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &bad_proof, &mut tv).is_none(),
-            "the boundary-tie selection must be rejected (staged strict boundary)");
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv).is_none(),
+            "selecting the larger index at a boundary tie must be rejected");
+    }
+
+    /// S7c task 2a negatives: each case starts from a fresh honest tied
+    /// witness and changes ONLY the tie-aux target column, so the rejection
+    /// is attributable to the tie relations:
+    ///  A) forged t_b (row cutoff 2 while exactly one tie is selected),
+    ///  B) c_r = 0 contradiction (cutoff 0 while a tie is selected),
+    ///  C) wrong rank (P swapped at the two tied positions; the rank
+    ///     recurrence E0*P = 0 fails and the shift permutation no longer
+    ///     matches the modified ranks).
+    #[test]
+    fn s7c_topk_tie_forgeries_rejected() {
+        let (m, n, k) = (4usize, 8usize, 1usize);
+        let arity = (m * n).trailing_zeros() as usize;
+        let lgm = m.trailing_zeros() as usize;
+        let thr_arity = lgm.max(5);
+        let lgn = n.trailing_zeros() as usize;
+        let b_bits = tie_b_bits(lgn);
+        let mut xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
+        for e in 0..n { xv[e] = from_i64([10i64, 10, 1, 8, 2, 9, 3, 4][e]); }
+        let (thr_v, sel_v, gate_v, d1_v, d2_v) = topk_forward(&xv, m, n, k);
+        assert_eq!(sel_v[0], Goldilocks::ONE);
+        assert_eq!(sel_v[1], Goldilocks::ZERO);
+        let mut thr_b = vec![Goldilocks::ZERO; m * n];
+        for r in 0..m { for e in 0..n { thr_b[r * n + e] = thr_v[r]; } }
+        let mut att = vec![Goldilocks::ZERO; m * n];
+        for r in 0..m {
+            for e in 0..n {
+                let at = r * n + e;
+                if sel_v[at] == Goldilocks::ONE && xv[at] == thr_v[r] { att[at] = Goldilocks::ONE; break; }
+            }
+        }
+        let mut store = Store::new();
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let op = Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k };
+        let wcols = topk_test_witness_columns(&sel_v, &thr_b, &att, &gate_v, &d1_v, &d2_v, m, n, arity);
+        let mut tcols = vec![vec![Goldilocks::ZERO; 1usize << thr_arity]];
+        for r in 0..m { tcols[0][r] = thr_v[r]; }
+        let outs = topk_test_outs(&op, &wcols, &tcols, arity, lgm, thr_arity);
+        let base = topk_test_tie_columns(&sel_v, &d1_v, &d2_v, m, n, arity);
+
+        // Recompute the MSB-first prefix-equality columns from the (possibly
+        // forged) P and t_b bits, so each case is internally consistent
+        // except for the targeted relation.
+        let recompute_e = |cols: &mut Vec<Vec<Goldilocks>>| {
+            let padded = 1usize << arity;
+            for at in 0..padded {
+                let mut eq = Goldilocks::ONE;
+                for b in (0..b_bits).rev() {
+                    cols[tie_eq_col(b_bits, b)][at] = eq;
+                    if cols[tie_p_bits_col(b)][at] != cols[tie_tb_bits_col(b_bits, b)][at] {
+                        eq = Goldilocks::ZERO;
+                    }
+                }
+            }
+        };
+        let run_case = |tie_cols: Vec<Vec<Goldilocks>>| -> bool {
+            let witness = topk_test_commit(0, AuxRole::TopKSelectWitness, m * n, arity, wcols.clone());
+            let thr_aux = topk_test_commit(0, AuxRole::TopKSelectThr, m, thr_arity, tcols.clone());
+            let range = topk_test_range_commit(&xv, m, n, arity, 0);
+            let thr_range = topk_test_thr_range_commit(&thr_v, m, n, arity, 0);
+            let tie = topk_test_commit(0, AuxRole::TopKSelectTie, m * n, arity, tie_cols);
+            let wdesc = witness.descriptor.clone();
+            let tdesc = thr_aux.descriptor.clone();
+            let rdesc = range.descriptor.clone();
+            let trdesc = thr_range.descriptor.clone();
+            let tiedesc = tie.descriptor.clone();
+            let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-tie-forge");
+            let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp);
+            let (bad_proof, _) = match bad { Some(v) => v, None => return true };
+            let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-tie-forge");
+            verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv).is_none()
+        };
+
+        // A) forged t_b = 2 in row 0 (honest cutoff is 1).
+        let mut forged_tb = base.clone();
+        for e in 0..n {
+            let at = e;
+            forged_tb[TIE_TB][at] = Goldilocks::from_u64(2);
+            for b in 0..b_bits {
+                forged_tb[tie_tb_bits_col(b_bits, b)][at] = Goldilocks::from_u64((2u64 >> b) & 1);
+            }
+            recompute_e(&mut forged_tb);
+        }
+        assert!(run_case(forged_tb), "forged t_b must be rejected");
+
+        // B) c_r = 0 contradiction: t_b = 0 while a tie is selected.
+        let mut zero_tb = base.clone();
+        for e in 0..n {
+            zero_tb[TIE_TB][e] = Goldilocks::ZERO;
+            for b in 0..b_bits { zero_tb[tie_tb_bits_col(b_bits, b)][e] = Goldilocks::ZERO; }
+        }
+        recompute_e(&mut zero_tb);
+        assert!(run_case(zero_tb), "c_r = 0 with a selected tie must be rejected");
+
+        // C) wrong rank: swap the two tied ranks in row 0 (0,1 -> 1,0),
+        // rebuild the rank bits and the cyclic-shift column.
+        let padded = 1usize << arity;
+        let mut bad_rank = base.clone();
+        let tmp = bad_rank[TIE_P][0];
+        bad_rank[TIE_P][0] = bad_rank[TIE_P][1];
+        bad_rank[TIE_P][1] = tmp;
+        for e in 0..n {
+            let pv = to_i64(bad_rank[TIE_P][e]) as u64;
+            for b in 0..b_bits { bad_rank[tie_p_bits_col(b)][e] = Goldilocks::from_u64((pv >> b) & 1); }
+        }
+        let p_col = bad_rank[TIE_P].clone();
+        for pos in 0..padded { bad_rank[TIE_P_PREV][pos] = p_col[(pos + padded - 1) % padded]; }
+        recompute_e(&mut bad_rank);
+        assert!(run_case(bad_rank), "wrong prefix rank must be rejected");
+
+        // D) t_b constant-in-row identity: keep t_b(row 0, e=0) = 1 (so the
+        // E0-weighted row sum passes) but set t_b(row 0, e=1) = 0 and rebuild
+        // its bits, E and the true cyclic shift. The selection condition
+        // still holds at both tied positions (less(0,1)=1=sel(0),
+        // less(1,0)=0=sel(1)), so only the (1-E0)*(t_b - t_b_prev) identity
+        // can reject this per-position cutoff forgery.
+        let mut var_tb = base.clone();
+        var_tb[TIE_TB][1] = Goldilocks::ZERO;
+        for b in 0..b_bits { var_tb[tie_tb_bits_col(b_bits, b)][1] = Goldilocks::ZERO; }
+        recompute_e(&mut var_tb);
+        let tb_col = var_tb[TIE_TB].clone();
+        for pos in 0..padded {
+            var_tb[tie_tb_prev_col(b_bits)][pos] = tb_col[(pos + padded - 1) % padded];
+        }
+        assert!(run_case(var_tb), "per-position t_b forgery must be rejected by the row-constancy identity");
     }
 
     /// P0 (TL): the 16-bit field gap only shows the field difference is small,
@@ -16448,15 +17292,15 @@ mod tests {
                 if sel_v[at] == Goldilocks::ONE {
                     d1_v[at] = xv[at] - t;
                 } else {
-                    d2s_v[at] = t - xv[at] - Goldilocks::ONE;
+                    d2s_v[at] = t - xv[at];
                 }
                 if r > 0 && sel_v[at] == Goldilocks::ONE && xv[at] == t { att[at] = Goldilocks::ONE; }
             }
         }
         // The TL counterexample relations: selected A gives d1 = 0; B gives
-        // thr - B - 1 = 0. All 16-bit representable.
+        // thr - B = 1 (mod P), so the 16-bit non-strict gap relation holds.
         assert_eq!(d1_v[0], Goldilocks::ZERO);
-        assert_eq!(d2s_v[1], Goldilocks::ZERO);
+        assert_eq!(d2s_v[1], Goldilocks::ONE);
         let mut thr_b = vec![Goldilocks::ZERO; m * n];
         for r in 0..m { for e in 0..n { thr_b[r * n + e] = thr_v[r]; } }
         let wcols = topk_test_witness_columns(&sel_v, &thr_b, &att, &gate_v, &d1_v, &d2s_v, m, n, arity);
@@ -16482,12 +17326,14 @@ mod tests {
         let rdesc = range.descriptor.clone();
         let thr_range = topk_test_thr_range_commit(&thr_v, m, n, arity, 0);
         let trdesc = thr_range.descriptor.clone();
+        let tie = topk_test_tie_commit(&sel_v, &d1_v, &d2s_v, m, n, arity, 0);
+        let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-wrap");
-        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, &mut tp);
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp);
         assert!(bad.is_some(), "the prover can always emit rounds; the verifier must reject");
         let (bad_proof, _) = bad.unwrap();
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-wrap");
-        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &bad_proof, &mut tv).is_none(),
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv).is_none(),
             "signed-range wrap (A=2^63, B=2^63-1) must be rejected");
     }
 
@@ -16529,7 +17375,7 @@ mod tests {
                 let at = r * n + e;
                 gate_v[at] = sel_v[at] * xv[at];
                 if sel_v[at] == Goldilocks::ONE { d1_v[at] = xv[at] - t; }
-                else { d2s_v[at] = t - xv[at] - Goldilocks::ONE; }
+                else { d2s_v[at] = t - xv[at]; }
                 if r > 0 && sel_v[at] == Goldilocks::ONE && xv[at] == t { att[at] = Goldilocks::ONE; }
             }
         }
@@ -16586,12 +17432,14 @@ mod tests {
         let tdesc = thr_aux.descriptor.clone();
         let rdesc = range.descriptor.clone();
         let trdesc = thr_range.descriptor.clone();
+        let tie = topk_test_tie_commit(&sel_v, &d1_v, &d2s_v, m, n, arity, 0);
+        let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-nonbool");
-        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, &mut tp);
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp);
         assert!(bad.is_some());
         let (bad_proof, _) = bad.unwrap();
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-nonbool");
-        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &bad_proof, &mut tv).is_none(),
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv).is_none(),
             "non-Boolean range bits must be rejected (Booleanity is essential)");
     }
     /// Review coverage: k = n selects every position, so row 1 (values
@@ -16705,7 +17553,7 @@ mod tests {
                 let at = r * n + e;
                 gate_v[at] = sel_v[at] * xv[at];
                 if sel_v[at] == Goldilocks::ONE { d1_v[at] = xv[at] - t; }
-                else { d2s_v[at] = t - xv[at] - Goldilocks::ONE; }
+                else { d2s_v[at] = t - xv[at]; }
                 if r > 0 && sel_v[at] == Goldilocks::ONE && xv[at] == t { att[at] = Goldilocks::ONE; }
             }
         }
@@ -16714,9 +17562,8 @@ mod tests {
         let wcols = topk_test_witness_columns(&sel_v, &thr_b, &att, &gate_v, &d1_v, &d2s_v, m, n, arity);
         let mut tcols = vec![vec![Goldilocks::ZERO; 1usize << thr_arity]];
         for r in 0..m { tcols[0][r] = thr_v[r]; }
-        let d2_v: Vec<Goldilocks> = (0..m * n).map(|at| {
-            if sel_v[at] == Goldilocks::ONE { Goldilocks::ZERO } else { d2s_v[at] + Goldilocks::ONE }
-        }).collect();
+        // Non-strict gap: the op's d2 output equals the committed d2 values.
+        let d2_v: Vec<Goldilocks> = d2s_v.clone();
         let mut store = Store::new();
         let x = store.push(xv.clone());
         let sel = store.push(vec![]);
@@ -16735,21 +17582,25 @@ mod tests {
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
         let execution = TrustedExecution {
             inputs: [(x, xv.clone())].into(),
-            outputs: [(sel, sel_v), (thr, thr_v.clone()), (gate, gate_v), (d1, d1_v), (d2, d2_v)].into(),
+            outputs: [(sel, sel_v.clone()), (thr, thr_v.clone()), (gate, gate_v),
+                      (d1, d1_v.clone()), (d2, d2_v)].into(),
         };
         let witness = topk_test_commit(0, AuxRole::TopKSelectWitness, m * n, arity, wcols);
         let thr_aux = topk_test_commit(0, AuxRole::TopKSelectThr, m, thr_arity, tcols);
         let range = topk_test_range_commit(&xv, m, n, arity, 0);
         let thr_range = topk_test_thr_range_commit(&thr_v, m, n, arity, 0);
+        let tie_aux = topk_test_tie_commit(&sel_v, &d1_v, &d2s_v, m, n, arity, 0);
         let aux = vec![
             witness.descriptor.clone(), thr_aux.descriptor.clone(),
             range.descriptor.clone(), thr_range.descriptor.clone(),
+            tie_aux.descriptor.clone(),
         ];
         let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = std::collections::BTreeMap::new();
         prepared.insert((0, AuxRole::TopKSelectWitness), witness);
         prepared.insert((0, AuxRole::TopKSelectThr), thr_aux);
         prepared.insert((0, AuxRole::TopKSelectXRange), range);
         prepared.insert((0, AuxRole::TopKSelectThrRange), thr_range);
+        prepared.insert((0, AuxRole::TopKSelectTie), tie_aux);
         let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux).unwrap();
         let certified = certified_index_tensors(&ops, &execution);
         let reverse = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
@@ -16982,6 +17833,8 @@ mod tests {
         let range_aux = rprep.remove(0);
         let mut trprep = prepare_topk_thr_range_aux(&store, &ops).unwrap();
         let thr_range_aux = trprep.remove(0);
+        let mut tprep = prepare_topk_tie_aux(&store, &ops).unwrap();
+        let tie_aux = tprep.remove(0);
         let wdesc = witness.descriptor.clone();
         let tdesc = thr_aux.descriptor.clone();
         let rdesc = range_aux.descriptor.clone();
@@ -16998,7 +17851,7 @@ mod tests {
             }
         }
         let (tproof, _) = prove_reverse_topk(&store, &topk_op, &tk_outs, witness, thr_aux,
-            range_aux, thr_range_aux, &mut tp)
+            range_aux, thr_range_aux, tie_aux, &mut tp)
             .expect("topk proof is producible with the forged sel claim");
 
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-scatter-dup");
