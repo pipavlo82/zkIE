@@ -10986,6 +10986,20 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
     Some((sel_openings, token_binding))
 }
 
+fn peak_rss_kb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            for line in s.lines() {
+                if let Some(v) = line.strip_prefix("VmHWM:") {
+                    return v.trim().trim_end_matches(" kB").parse().unwrap_or(0);
+                }
+            }
+        }
+    }
+    0
+}
+
 pub fn prove_committed_shard_dag_bound(
     store: &mut Store, ops: &[Op], ops_per_shard: usize,
     whir: &zkie_core::pcs::whir::Whir, cached: &[CachedWeightBatch],
@@ -11055,17 +11069,23 @@ pub fn prove_committed_shard_dag_bound(
             continue;
         }
         let cw = &cached[bi];
+        let t_mat = std::time::Instant::now();
         let mut tensors: Vec<Vec<Goldilocks>> = cw.table_ids.iter().map(|&id| {
             let mut v = store.materialize(id).into_owned();
             v.resize(1usize << cw.arity, Goldilocks::ZERO);
             v
         }).collect();
         let refs: Vec<&[Goldilocks]> = tensors.iter().map(Vec::as_slice).collect();
+        let mat_ms = t_mat.elapsed().as_secs_f64() * 1e3;
+        let rss_mat = peak_rss_kb();
         let batch_whir = zkie_core::pcs::whir::Whir::with_params(cw.num_vars, cw.security, cw.pow_bits);
         let mut reader = std::io::BufReader::new(std::fs::File::open(&cw.cache_path).ok()?);
         let commitment: zkie_core::pcs::whir::Commitment = bincode::deserialize_from(&mut reader).ok()?;
         if bincode::serialize(&commitment).ok()? != bincode::serialize(&cw.commitment).ok()? { return None; }
+        let t_res = std::time::Instant::now();
         let prover_data = batch_whir.restore_batch_prover_data_from(&refs, &mut reader).ok()?;
+        let res_ms = t_res.elapsed().as_secs_f64() * 1e3;
+        let rss_res = peak_rss_kb();
         let protocol = batch_whir.batch_opening_protocol(cw.num_tables, cw.arity);
         let ctx = zkie_core::pcs::committed::BatchCtx { commitment, prover_data, protocol, whir: batch_whir, num_tables: cw.num_tables };
         // O5: one owned copy per UNIQUE polynomial. When every claim targets
@@ -11083,7 +11103,11 @@ pub fn prove_committed_shard_dag_bound(
         }).collect();
         eprintln!("O5-metrics batch={} claims={} unique={} cloned_bytes={} tables={}",
             bi, table_idxs.len(), unique, cloned_bytes, cw.num_tables);
+        let t_open = std::time::Instant::now();
         let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &table_idxs, &opened, &points, &claimed).ok()?;
+        let open_ms = t_open.elapsed().as_secs_f64() * 1e3;
+        eprintln!("O5-phases mat_ms={:.1} restore_ms={:.1} open_ms={:.1} rss_mat={} rss_restore={} rss_open={}",
+            mat_ms, res_ms, open_ms, rss_mat, rss_res, peak_rss_kb());
         weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: Some(opening) });
     }
     Some(BoundExecutionProof { aux, reverse, weight_openings, sel_openings, token_binding })
