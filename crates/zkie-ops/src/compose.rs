@@ -8891,10 +8891,11 @@ pub fn commit_model_weights(
     const SECURITY: usize = 90;
 
     let weight_tensors = collect_weight_tensors(ops);
-    let mut by_size: std::collections::BTreeMap<usize, Vec<(T, Vec<Goldilocks>)>> =
+    let mut by_size: std::collections::BTreeMap<usize, Vec<(T, Vec<Goldilocks>, usize)>> =
         std::collections::BTreeMap::new();
     for &t in &weight_tensors {
         let v = store.materialize(t).into_owned();
+        let original_len = v.len();
         // WHIR folding factor is 5, so every weight is committed at arity
         // >= 5: tensors shorter than 2^5 are zero-padded (their claim
         // points get zero-extended the same way, so the padded MLE matches
@@ -8903,7 +8904,7 @@ pub fn commit_model_weights(
         let padded_len = v.len().next_power_of_two().max(32);
         let mut padded = v;
         padded.resize(padded_len, Goldilocks::ZERO);
-        by_size.entry(padded_len).or_default().push((t, padded));
+        by_size.entry(padded_len).or_default().push((t, padded, original_len));
     }
     std::fs::create_dir_all(cache_dir).expect("create weight cache dir");
 
@@ -8926,12 +8927,12 @@ pub fn commit_model_weights(
             // (e.g. a 2^28 lm_head) gets a higher budget while small groups stay
             // cheap. See Whir::required_pow_bits.
             let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, SECURITY);
-            let refs: Vec<&[Goldilocks]> = ids.iter().map(|(_, v)| v.as_slice()).collect();
+            let refs: Vec<&[Goldilocks]> = ids.iter().map(|(_, v, _)| v.as_slice()).collect();
             let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, SECURITY, pow_bits);
             let (commitment, prover_data, _protocol, batch_whir) =
                 base_whir.commit_batch(&refs);
             let num_vars = batch_whir.num_variables();
-            let table_ids: Vec<T> = ids.iter().map(|(t, _)| *t).collect();
+            let table_ids: Vec<T> = ids.iter().map(|(t, _, _)| *t).collect();
             let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
                 "weight-a{arity}-g{}.bin",
                 batches.len()
@@ -8950,7 +8951,7 @@ pub fn commit_model_weights(
                 security: SECURITY,
                 pow_bits,
                 table_ids,
-                tensor_lengths: ids.iter().map(|(t, _)| store.materialize(*t).len()).collect(),
+                tensor_lengths: ids.iter().map(|(_, _, l)| *l).collect(),
                 cache_path,
             });
         }
@@ -11054,7 +11055,7 @@ pub fn prove_committed_shard_dag_bound(
             continue;
         }
         let cw = &cached[bi];
-        let tensors: Vec<Vec<Goldilocks>> = cw.table_ids.iter().map(|&id| {
+        let mut tensors: Vec<Vec<Goldilocks>> = cw.table_ids.iter().map(|&id| {
             let mut v = store.materialize(id).into_owned();
             v.resize(1usize << cw.arity, Goldilocks::ZERO);
             v
@@ -11067,7 +11068,21 @@ pub fn prove_committed_shard_dag_bound(
         let prover_data = batch_whir.restore_batch_prover_data_from(&refs, &mut reader).ok()?;
         let protocol = batch_whir.batch_opening_protocol(cw.num_tables, cw.arity);
         let ctx = zkie_core::pcs::committed::BatchCtx { commitment, prover_data, protocol, whir: batch_whir, num_tables: cw.num_tables };
-        let opened: Vec<Vec<Goldilocks>> = table_idxs.iter().map(|&i| tensors[i].clone()).collect();
+        // O5: one owned copy per UNIQUE polynomial. When every claim targets
+        // a distinct table we move the padded buffer instead of cloning it;
+        // duplicate-table claims still clone until the combined-equality
+        // W_t(X)=Sum gamma^i eq(r_i,X) grouping lands.
+        let mut seen = std::collections::BTreeSet::new();
+        let unique = table_idxs.iter().all(|&i| seen.insert(i));
+        let mut cloned_bytes = 0usize;
+        let opened: Vec<Vec<Goldilocks>> = table_idxs.iter().map(|&i| {
+            if unique { std::mem::take(&mut tensors[i]) } else {
+                cloned_bytes += tensors[i].len() * std::mem::size_of::<Goldilocks>();
+                tensors[i].clone()
+            }
+        }).collect();
+        eprintln!("O5-metrics batch={} claims={} unique={} cloned_bytes={} tables={}",
+            bi, table_idxs.len(), unique, cloned_bytes, cw.num_tables);
         let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &table_idxs, &opened, &points, &claimed).ok()?;
         weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: Some(opening) });
     }
