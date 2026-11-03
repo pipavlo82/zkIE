@@ -18515,7 +18515,7 @@ mod tests {
             Op::Scatter { sel, token_id, expert_of, m, n },
             Op::CombineIdx { a: token_id, b: expert_of, scale: n, out: idx },
             Op::Lookup { idx, out: gate_pos_raw, table: gate_table },
-            Op::Scale { x: gate_pos_raw, out: gate_pos_scaled, factor: 1, shift: 0 },
+            Op::Scale { x: gate_pos_raw, out: gate_pos_scaled, factor: 1, shift: 16 },
             Op::BroadcastScale { x: d, scale: gate_pos_scaled, out: weighted, h },
             Op::Gather { weighted, token_id, gate: ones, out, m, h },
         ];
@@ -18579,7 +18579,7 @@ mod tests {
             Op::BroadcastScale { x: d, scale: gate_pos, out: weighted, h },
             Op::Lookup { idx: idx_s, out: lookup_gate, table: bad_table_s },
             Op::BroadcastScale { x: ones_s, scale: lookup_gate, out: gate_bcast, h: 1 },
-            Op::Scale { x: gate_bcast, out: gate_scaled, factor: 1, shift: 0 },
+            Op::Scale { x: gate_bcast, out: gate_scaled, factor: 1, shift: 16 },
             Op::Gather { weighted, token_id, gate: gate_scaled, out, m, h },
         ];
         let whir = Whir::new_testing(5);
