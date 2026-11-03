@@ -82,57 +82,101 @@ accepted. No security/transcript change is introduced by O5.
 
 ## Measurements (real layer-10 segmented example, 8-expert slice, 90-bit)
 
-Command:
-`DS_WEIGHTS=/data/zkIE/models/deepseek-v2-lite/weights ZKIE_CACHE=/dev/shm/zkie-core-chain-cache target/release/examples/prove_core_chain`
+Cold-read metering fix: `scripts/o5_measure.py` records page-cache residency
+with `fincore --bytes` immediately before and after each run, samples
+`/proc/<pid>/{io,status,stat}`, and reports child rusage. A run is classified
+cold only when `fincore_before=0` and warm when it equals the probed file size.
+The earlier full-64 RESULT had `read_bytes=0` because that run was warm and had
+no cache-state probe; zero read bytes was not cold evidence. On this kernel the
+cold mmap path also reports the file bytes in `read_bytes`, so the RESULT line
+reports `read_bytes`, `ru_inblock` and `majflt` together with `fincore`
+before/after. `/dev/shm` (ZKIE_CACHE) is tmpfs and is NOT dropped.
 
-Warm page cache (measured): wall 11.147 s; maxrss 2,417,552 kB (rusage);
-minflt 71,570; majflt 0; `ru_inblock` 0; sampled `/proc/self/io` read_bytes 0
-(file-cache hits are not an algorithmic speedup). First weight batch:
-`claims=8 unique=1 moved_bytes=268,435,456 cloned_bytes=0`; mat 45.7 ms,
-restore 426.4 ms, open 3,177.4 ms; VmRSS mat 555,584 kB, restore 1,616,468 kB,
-open 422,340 kB; VmHWM 2,133,352 kB (cumulative). Second (B2) open 3,119.9 ms,
-VmHWM 2,417,552 kB cumulative. B commit+prove 5.30 s, verify 29.7 ms, B proof
-461,940 B. Composition and all eight negatives rejected; SEGMENT-OK.
+Exact command (cold: drop caches first; warm: rerun immediately):
+```
+cd /data/zkie-soundness-fix
+export DS_WEIGHTS=/data/zkIE/models/deepseek-v2-lite/weights
+export ZKIE_CACHE=/dev/shm/zkie-core-chain-cache DS_LAYER=10
+W=$DS_WEIGHTS/L10_experts_gate_i32.bin
+sync; echo 3 > /proc/sys/vm/drop_caches
+python3 scripts/o5_measure.py target/release/examples/prove_core_chain \
+  logs/o5-cold-seg-73712b8.log "$W"
+python3 scripts/o5_measure.py target/release/examples/prove_core_chain \
+  logs/o5-warm-seg-73712b8.log "$W"
+```
 
-Cold page cache (`sync; echo 3 > /proc/sys/vm/drop_caches`; /dev/shm is tmpfs
-and is NOT dropped): wall 12.193 s; maxrss 2,449,648 kB; minflt 69,028;
-majflt 6; `ru_inblock` 2,106,888 (512-byte blocks); sampled read_bytes
-1,078,726,656 (1.08 GB, essentially the full 64-expert weight file read by the
-example's `load_expert_slice`). B commit+prove 5.247 s, verify 30.0 ms; all
-negative classes rejected; SEGMENT-OK.
+Cold (fincore 0 -> 1,073,741,824 B): wall 12.207 s; maxrss 2,450,004 kB;
+minflt 67,858; majflt 9; inblock 2,107,840 (512-B blocks); sampled read_bytes
+1,078,497,280 B (the full `L10_experts_gate_i32.bin` read by `load_expert_slice`,
+plus ~4.7 MB binary/libs). Warm (fincore_before=1 GiB): wall 11.147 s;
+maxrss 2,449,624 kB; majflt 0; inblock 0; read_bytes 0. Both:
+`claims=8 unique=1 moved_bytes=268,435,456 cloned_bytes=0`; open 3.12 s;
+B commit+prove 5.32/5.29 s; verify 29.6/30.0 ms; all eight negatives rejected;
+SEGMENT-OK. Logs:
+`/data/zkie-soundness-fix/logs/o5-cold-seg-73712b8.log`,
+`/data/zkie-soundness-fix/logs/o5-warm-seg-73712b8.log`.
 
 Before this step (same example, documented baseline): per-claim clone
 +2.10 GB, open 17.2 s, VmHWM 10.0-10.3 GB, B commit+prove 19.9 s. After:
-cloned_bytes=0, 256 MiB moved once, open 3.12-3.18 s, VmHWM 2.42 GB, B
-commit+prove 5.25-5.30 s. Same 90-bit security, same real inputs, same
+cloned_bytes=0, 256 MiB moved once, open 3.12-3.18 s, VmHWM 2.42-2.45 GB,
+B commit+prove 5.25-5.32 s. Same 90-bit security, same real inputs, same
 authentication scope.
 
 ## S7 full 64-expert weight regression (previously OOM-killed)
 
-Harness: the temporary `/tmp/prove_core_chain.rs` full-64 variant (a single
-2^28-element real expert-gate weight, mmap-backed, 64 claims on one table),
-built as `prove_core_chain_full64` and NOT committed; same real layer-10 data,
-90-bit, warm page cache, cache in /dev/shm.
+Harness: temporary full-64 variant of the example (`/tmp/prove_core_chain.rs`,
+copied to `models/deepseek-v2-lite/examples/prove_core_chain_full64.rs` for the
+build): a single 2^28-element real expert-gate weight, mmap-backed
+(`WeightMmap` + `Store::push_mmap`), 64 claims on one table; built as
+`prove_core_chain_full64`, binary retained, source NOT committed. Same real
+layer-10 data, 90-bit, cache in /dev/shm. The `.d` file records the temporary
+source path and no `.rs` under crates/models is newer than the binary.
 
-Result: completes (no OOM).
+Command (cold; warm is the same line rerun without the drop):
+```
+cd /data/zkie-soundness-fix
+export DS_WEIGHTS=/data/zkIE/models/deepseek-v2-lite/weights
+export ZKIE_CACHE=/dev/shm/zkie-core-chain-cache DS_LAYER=10
+W=$DS_WEIGHTS/L10_experts_gate_i32.bin
+sync; echo 3 > /proc/sys/vm/drop_caches
+python3 scripts/o5_measure.py target/release/examples/prove_core_chain_full64 \
+  logs/o5-cold-full64-73712b8.log "$W"
+python3 scripts/o5_measure.py target/release/examples/prove_core_chain_full64 \
+  logs/o5-warm-full64-73712b8.log "$W"
+```
+
+Cold (fincore 0 -> 1,073,741,824 B): wall 162.664 s; maxrss 15,998,568 kB;
+minflt 248,345; majflt 8,209; inblock 2,107,584; sampled read_bytes
+1,078,366,208 B. Warm (fincore_before=1 GiB): wall 148.303 s; maxrss
+15,997,612 kB; majflt 0; inblock 0; read_bytes 0. Both:
 - `O5-metrics batch=0 claims=64 unique=1 moved_bytes=2,147,483,648
   cloned_bytes=0 tables=1`
-- `O5-phases mat_ms=686.8 restore_ms=3279.9 open_ms=127367.4
-  rss_now_mat=3,177,672 rss_now_restore=11,808,392 rss_now_clone=11,808,392
-  rss_now_open=1,192,540 hwm=15,998,796` (kB; VmHWM is cumulative)
-- B commit+prove 142.71 s, verify 154.7 ms, proof 513,849 B, peak RSS
-  15,998,796 kB (15.26 GiB); wall 153.0 s; minflt 271,684; majflt 0; sampled
-  read_bytes 0 (warm).
+- `O5-phases mat_ms=690.6/693.6 restore_ms=3300.7/3263.8
+  open_ms=136099.4/122529.9 rss_now_mat=3,178,036/3,177,752
+  rss_now_restore=11,808,468/11,808,248 rss_now_open=1,192,436/1,192,256
+  hwm=15,998,568/15,997,612` (kB; cold/warm; VmHWM is cumulative)
+- B commit+prove 152.45/137.84 s, verify 155.4/152.7 ms, proof
+  514,681/513,209 B, peak RSS 15,998,568/15,997,612 kB (15.26 GiB).
 - Harness negatives rejected: A gate/score tamper, B public routing array,
   B g output, wrong expert root, wrong activation table root;
   `CORE-CHAIN-OK`.
+
+The cold-vs-warm wall delta (+14.4 s) is the 1 GiB weight read; no security
+parameter changes. Proof byte size varies run to run (WHIR prover randomness),
+so sizes are reported per run. Logs:
+`/data/zkie-soundness-fix/logs/o5-cold-full64-73712b8.log`,
+`/data/zkie-soundness-fix/logs/o5-warm-full64-73712b8.log`.
+Note: an orphaned shell from the stopped continuation agent briefly overwrote
+`prove_core_chain.rs` at 00:38 and was terminated; the tree was restored to
+`73712b8` and the example rebuilt before any further run. These measurements
+completed before that overwrite and used the separate full64 binary.
 
 Previous state: OOM-killed at anon-rss 502,710,376 kB (dmesg) on the 495 GB
 machine. The staged RSS shows the peak window is the W_t construction after
 the prover-data restore: restore VmRSS 11.26 GiB, then one 2 GiB table buffer +
 one 2 GiB W_t + one 2 GiB transient eq buffer; by the opening sample current
-VmRSS is 1.14 GiB and VmHWM stays at 15.26 GiB. The opening (127 s) dominates
-the time, not memory.
+VmRSS is 1.14 GiB and VmHWM stays at 15.26 GiB. The opening (122-136 s)
+dominates the time, not memory.
 
 ## Remaining / acceptance reminders
 
