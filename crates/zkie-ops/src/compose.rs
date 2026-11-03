@@ -4311,6 +4311,7 @@ pub fn prove_reverse_dag(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcr
     prove_reverse_dag_inner(store, ops, seeds, transcript, &mut std::collections::BTreeMap::new(), None, None, None)
 }
 
+
 fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>) -> Option<ReverseDagProof> {
     let replayed = execution.and_then(|e| replay_index_columns(ops, e));
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
@@ -6049,6 +6050,12 @@ pub fn forward_shard(store: &mut Store, ops: &[Op], shard: std::ops::Range<usize
             }
         }
     }
+}
+
+/// Public forward evaluator for examples/tools. This runs the same op
+/// semantics the prover checks internally; it performs no proof work.
+pub fn evaluate_ops(store: &mut Store, ops: &[Op]) {
+    forward_ops(store, ops)
 }
 
 fn forward_ops(store: &mut Store, ops: &[Op]) {
@@ -11023,8 +11030,7 @@ pub fn prove_committed_shard_dag_bound(
     prepared.extend(prepare_topk_aux(store, ops)?);
     prepared.extend(prepare_topk_range_aux(store, ops)?);
     prepared.extend(prepare_topk_thr_range_aux(store, ops)?);
-    let tie_dbg = prepare_topk_tie_aux(store, ops);
-    prepared.extend(tie_dbg?);
+    prepared.extend(prepare_topk_tie_aux(store, ops)?);
     prepared.extend(prepare_scatter_aux(store, ops, model)?);
     prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();

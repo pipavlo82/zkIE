@@ -5,7 +5,12 @@ use zkie_core::common::field::XorShift64;
 use zkie_core::pcs::whir::Whir;
 use zkie_models_timesfm::build_timesfm;
 use zkie_ops::compose::{
-    commit_model_weights, prove_committed_shard_dag, verify_committed_shard_dag_bytes, Store,
+    commit_model_weights,
+    prove_committed_shard_dag,
+    verify_committed_shard_dag_bytes,
+    Store,
+    TrustedModelManifest,
+    PublicStatement,
 };
 
 fn peak_rss_kb() -> u64 {
@@ -33,6 +38,8 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     let cached = commit_model_weights(&store, &ops, "/data/jimmyshi/zkie-cache/timesfm-model-batches-v2");
+    let trusted_model = TrustedModelManifest::from_offline_commitment(
+        &cached, &store.owned_slices(), &ops);
     let commit_t = t0.elapsed();
 
     let t1 = std::time::Instant::now();
@@ -42,7 +49,7 @@ fn main() {
     let t2 = std::time::Instant::now();
     let bytes = bincode::serialize(&proof).unwrap();
     assert!(
-        verify_committed_shard_dag_bytes(&bytes, &store.owned_slices(), &ops, 108, &whir),
+        verify_committed_shard_dag_bytes(&bytes, &store.owned_slices(), &ops, 108, &whir, &PublicStatement::Generic, &trusted_model),
         "committed proof failed"
     );
     let verify_t = t2.elapsed();

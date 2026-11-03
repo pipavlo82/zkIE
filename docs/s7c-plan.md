@@ -303,16 +303,57 @@ claimed value refer to the same polynomial; return claims on x/scale at the
 virtual endpoint. Rounding (ScaleVec) reuses the committed remainder aux
 (`ScaleRemainder`).
 
-### 5. Real DeepSeek single layer
+### 5. Real DeepSeek single layer — SEGMENTED REAL-DATA EXPERIMENT (not S7)
 
-Remaining ops in the layer: Softmax, StableSoftmaxIndex/SoftmaxIndex,
-LayerNorm/RmsNorm (centered LN), RoPE, Transpose, BatchedMatMul, plus the
-S7c pieces above. Real weights are available on the test machine at
-`/data/zkIE/models/deepseek-v2-lite/weights/` (492 files). Acceptance: build
-layer 0 via the model builder, commit weights, prove/verify the bound
-single-layer statement with the public input/output, plus the S7 malicious
-regressions (forged counts/table, swapped expert roots, duplicate/dropped
-routes, tampered gate) through the bytes entry.
+Status: a real-data core-chain experiment is implemented as TWO bound
+statements; it is explicitly NOT gist S7 acceptance.
+
+- Full-layer blocker: RmsNorm/RoPE/Softmax/StableSoftmaxIndex/ScaleVec-shift16
+  remain fail-closed in the bound path (S5-family devices). No new reductions
+  were added for them.
+- Routing blocker: the single-statement core chain stops at IdxBroadcast.
+  Its reduction needs the base index tensor to be verifier-replayable or
+  certified public u32 data; internal routing intermediates are neither, and
+  random-point claims cannot replace the pointwise u32 / b*base+j overflow
+  contract. That branch stays fail-closed (the attempted relaxation was
+  reverted).
+- Segmentation: A = TopKSelect -> Scatter -> PadIdx, publishing the padded
+  routing arrays as public index outputs; B = IdxBroadcast -> Lookup(real
+  post-attn activation) -> BroadcastScale(mask) -> GatherMatMul(real expert
+  gate weights) -> Scale(shift 16), taking those arrays as public index
+  inputs. B's IdxBroadcast uses the existing verifier replay path (u32
+  checked arithmetic), so no constraint is bypassed. The A/B link is the
+  SAME caller-owned external statement bound item-by-item; the proofs'
+  self-reported fields are never used for the link. The bytes entry is used
+  for both segments and for the cross-segment tamper tests.
+- Gist limitation (recorded): B's verifier ingests the full routing table,
+  which the gist forbids for the final S7 construction. Public routing,
+  segmented proofs, and replay are acceptable only as a bounded real-data
+  experiment; S7 remains incomplete.
+- Real data: layer 10, seq=1, token 549 (first extracted token). Note the
+  file `L*_post_attn_norm_i32.bin` is the RMSNorm WEIGHT (all-positive
+  ~0.09-0.91), not an activation; `scripts/ds_layer_core_inputs.py` exports
+  the real post-attn activation from the raw bf16 shards and the Q16 router
+  scores with the model's exact fixed-point recipe. Measured: max score
+  2480, max|logits16| 86270 < 2^22 (the TopKSelectXRange/ThrRange relations
+  enforce the contract inside the proof; an out-of-range real score fails
+  closed at proof level).
+- Malicious regressions (bytes entry, real data): tampered A gate/score
+  input, tampered B public routing array and g output, cross-segment A
+  routing output tamper, cross-segment B routing mismatch, wrong expert
+  weight root, wrong activation table root. Aux-level forgeries (committed
+  counts/table, duplicate/deleted routes inside the committed routing) are
+  covered by the synthetic S7 regressions, not by this public-API experiment.
+- Measured cost (test machine, 90-bit security): A proof 242,514 bytes,
+  ~0.17 s prove. The FULL 64-expert (2^28-element) gate weight opening is a
+  reported memory blocker: the run was OOM-killed at anon-rss 502,710,376 kB
+  (`Out of memory: Killed process ... prove_core_chai`, dmesg), above the
+  495 GB machine. The run therefore uses a REAL 8-expert slice (routed
+  experts 26,30,34,51,57,61 plus real experts 6,7 for the masked padding
+  rows) with an explicit public remap table; the external statement binds
+  A's original routing output to B's remapped public input item-by-item.
+  This is still a real-weight segmented experiment, not S7 acceptance; B
+  proof size/time/peak RSS are reported by the run.
 
 ## Acceptance gate
 
