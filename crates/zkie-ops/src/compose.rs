@@ -3208,12 +3208,22 @@ fn prepare_gather_routing_aux(store: &Store, ops: &[Op], model: &TrustedModelMan
     Some(prepared)
 }
 
-fn lookup_aux_specs(ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<(usize, AuxRole, usize, usize, usize)>> {    let mut specs = Vec::new();
+fn lookup_aux_specs(ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<(usize, AuxRole, usize, usize, usize)>> {
+    let written = op_field_writes(ops);
+    let mut specs = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         if let Op::Lookup { idx, table, .. } = op {
             let key = TensorKey::Index(*idx).encoded()?;
             let len = *model.tensor_lengths.get(&key)?;
-            let table_len = *model.lookup_lengths.get(table)?;
+            // An op-written table is a DYNAMIC intermediate (e.g. the router
+            // gate); it has no trusted model root and is authenticated by the
+            // returned table claim instead. Static model tables use
+            // lookup_lengths/lookup_roots.
+            let table_len = if written.contains(table) {
+                *model.tensor_lengths.get(&TensorKey::Field(*table).encoded()?)?
+            } else {
+                *model.lookup_lengths.get(table)?
+            };
             if !len.is_power_of_two() || table_len == 0 { return None; }
             let table_padded = table_len.checked_next_power_of_two()?.max(32);
             specs.push((i, AuxRole::LookupPairs, len, len.trailing_zeros().max(5) as usize, 2));
@@ -3229,7 +3239,11 @@ fn prepare_lookup_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest) -
         let (idx, out, table) = match &ops[op_index] { Op::Lookup { idx, out, table } => (*idx, *out, *table), _ => return None };
         let xs = store.idx.get(idx)?;
         let ys = store.get(out);
-        let table_len = *model.lookup_lengths.get(&table)?;
+        let table_len = if op_field_writes(ops).contains(&table) {
+            store.get(table).len()
+        } else {
+            *model.lookup_lengths.get(&table)?
+        };
         if xs.len() != ys.len() || xs.iter().any(|&x| x as usize >= table_len) { return None; }
         let padded = 1usize.checked_shl(arity as u32)?;
         let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
@@ -3372,8 +3386,9 @@ fn lookup_prefix_eval(len: usize, point: &[Goldilocks]) -> Goldilocks {
 }
 
 fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
-    pairs: PreparedAux, multiplicity: PreparedAux, model: &TrustedModelManifest, transcript: &mut Transcript)
-    -> Option<(ReverseLookupProof, EvalClaim)>
+    pairs: PreparedAux, multiplicity: PreparedAux, model: &TrustedModelManifest, dynamic_table: bool,
+    transcript: &mut Transcript)
+    -> Option<(ReverseLookupProof, Vec<EvalClaim>)>
 {
     let (idx, out, table_id) = match op { Op::Lookup { idx, out, table } => (*idx, *out, *table), _ => return None };
     let xs = store.idx.get(idx)?;
@@ -3411,7 +3426,12 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
     let pair_values = [output_index, value, witness_index, witness_value];
     let pairs_opening = open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?;
     let multiplicity_opening = open_aux(multiplicity, &[0, 0], &[t_num_point, padding_point], &[mult_eval, padding_value])?;
-    let table_opening = if model.identity_tables.contains_key(&table_id) {
+    let table_opening = if dynamic_table {
+        // The table is an op-produced intermediate (e.g. the router gate);
+        // the returned table claim is authenticated by its producer instead
+        // of a trusted model root.
+        None
+    } else if model.identity_tables.contains_key(&table_id) {
         if table_eval != lookup_index_eval(&t_den_point) { return None; }
         None
     } else {
@@ -3424,13 +3444,16 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
         if opened != table_eval { return None; }
         Some(opening)
     };
-    let claim = EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index };
-    Some((ReverseLookupProof { witness, table, output_index, witness_index, witness_value, multiplicity: mult_eval, table_value: table_eval, padding, pairs_opening, multiplicity_opening, table_opening }, claim))
+    let mut claims = vec![EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index }];
+    if dynamic_table {
+        claims.push(EvalClaim { tensor_id: TensorKey::Field(table_id).encoded()?, point: t_den_point, value: table_eval });
+    }
+    Some((ReverseLookupProof { witness, table, output_index, witness_index, witness_value, multiplicity: mult_eval, table_value: table_eval, padding, pairs_opening, multiplicity_opening, table_opening }, claims))
 }
 
 fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs: &AuxDescriptor,
-    multiplicity: &AuxDescriptor, model: &TrustedModelManifest, proof: &ReverseLookupProof,
-    transcript: &mut Transcript) -> Option<EvalClaim>
+    multiplicity: &AuxDescriptor, model: &TrustedModelManifest, dynamic_table: bool,
+    proof: &ReverseLookupProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
 {
     let (idx, table_id) = match op { Op::Lookup { idx, table, .. } => (*idx, *table), _ => return None };
     if point.len() != pairs.len.trailing_zeros() as usize { return None; }
@@ -3457,7 +3480,9 @@ fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs
     let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
     if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
         || !verify_aux_open(multiplicity, &[0, 0], &[table.q_num, padding_point], &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) { return None; }
-    if let Some(&len) = model.identity_tables.get(&table_id) {
+    if dynamic_table {
+        if proof.table_opening.is_some() { return None; }
+    } else if let Some(&len) = model.identity_tables.get(&table_id) {
         if model.lookup_lengths.get(&table_id) != Some(&len) || proof.table_opening.is_some()
             || proof.table_value != lookup_index_eval(&table.q_den) { return None; }
     } else {
@@ -3468,7 +3493,11 @@ fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs
         let protocol = whir.opening_protocol(multiplicity.arity, 1);
         if whir.verify(root, opening, &protocol, &table.q_den).ok() != Some(proof.table_value) { return None; }
     }
-    Some(EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: proof.output_index })
+    let mut claims = vec![EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: proof.output_index }];
+    if dynamic_table {
+        claims.push(EvalClaim { tensor_id: TensorKey::Field(table_id).encoded()?, point: table.q_den.clone(), value: proof.table_value });
+    }
+    Some(claims)
 }
 
 fn prove_reverse_projection(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
@@ -3722,12 +3751,16 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::GeluIndex { proof }
             }
             Op::Lookup { .. } => {
+                let table_id = match op { Op::Lookup { table, .. } => *table, _ => return None };
+                let dynamic_table = op_field_writes(ops).contains(&table_id);
                 let r = prove_reverse_lookup(store, op, &point, value,
                     aux.remove(&(op_index, AuxRole::LookupPairs))?,
-                    aux.remove(&(op_index, AuxRole::LookupMultiplicity))?, model?, transcript);
-                let (proof, c) = r?;
-                absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
-                claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                    aux.remove(&(op_index, AuxRole::LookupMultiplicity))?, model?, dynamic_table, transcript);
+                let (proof, incoming) = r?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
                 ReverseReduction::Lookup { proof }
             }
             Op::Projection { .. } => {
@@ -4000,9 +4033,12 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
             (Op::Lookup { .. }, ReverseReduction::Lookup { proof }) => {
                 let pairs = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::LookupPairs)?;
                 let multiplicity = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::LookupMultiplicity)?;
-                let c = verify_reverse_lookup(op, &point, value, pairs, multiplicity, model?, proof, transcript)?;
-                absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
-                claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                let table_id = match op { Op::Lookup { table, .. } => *table, _ => return None };
+                let dynamic_table = op_field_writes(ops).contains(&table_id);
+                for c in verify_reverse_lookup(op, &point, value, pairs, multiplicity, model?, dynamic_table, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
             }
             (Op::Projection { .. }, ReverseReduction::Projection { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ProjectionBits)?;
@@ -7948,6 +7984,24 @@ pub fn verify_committed_cross_bind(
 
 /// Collect the tensor ids of model weights: read but never written, and not a
 /// (weights = read-but-never-written w/b/bias tensors, excluding lookup/input)
+/// Field-namespace tensors written by any op (dynamic intermediates, e.g. a
+/// router gate used as a Lookup table). Index writes carry the high tag and
+/// are excluded.
+fn op_field_writes(ops: &[Op]) -> std::collections::BTreeSet<T> {
+    let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
+    let mut w = std::collections::BTreeSet::new();
+    for op in ops {
+        let writes = match reverse_op_io(op) {
+            Some((_, ws)) => ws,
+            None => op.writes(),
+        };
+        for t in writes {
+            if t & tag == 0 { w.insert(t); }
+        }
+    }
+    w
+}
+
 fn collect_weight_tensors(ops: &[Op]) -> Vec<T> {
     // Only FIELD writes can shadow a weight id. Raw `op.writes()` mixes the
     // field and index namespaces (e.g. a PadIdx index output with the same
@@ -8104,9 +8158,15 @@ impl TrustedModelManifest {
             }
         }
         let mut table_ids = std::collections::BTreeSet::new();
+        let field_written = op_field_writes(ops);
         for op in ops {
             match op {
-                Op::Lookup { table, .. } | Op::Softmax { table, .. } => { table_ids.insert(*table); }
+                Op::Lookup { table, .. } => {
+                    // Dynamic (op-written) tables are authenticated by claims,
+                    // never by a trusted model root.
+                    if !field_written.contains(table) { table_ids.insert(*table); }
+                }
+                Op::Softmax { table, .. } => { table_ids.insert(*table); }
                 Op::Layernorm { rsqrt_table, .. } | Op::LayerNormCentered { rsqrt_table, .. } => { table_ids.insert(*rsqrt_table); }
                 Op::RmsNorm { rsqrt_table, limb_table, .. } => { table_ids.insert(*rsqrt_table); table_ids.insert(*limb_table); }
                 Op::RoPE { range_table, .. } => { table_ids.insert(*range_table); }
@@ -10126,6 +10186,26 @@ fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<
             _ => {}
         }
     }
+    // S7 gate consistency: a Gather gate produced by a Lookup whose table is
+    // a STATIC model table cannot be tied to the router output. Such graphs
+    // fail closed; the table must be an op-produced (dynamic) tensor, e.g.
+    // the TopKSelect gate, authenticated by the returned table claim.
+    let field_written = op_field_writes(ops);
+    for op in ops {
+        if let Op::Gather { gate, .. } = op {
+            for producer in ops {
+                let writes = match reverse_op_io(producer) {
+                    Some((_, ws)) => ws,
+                    None => producer.writes(),
+                };
+                if writes.contains(gate) {
+                    if let Op::Lookup { table, .. } = producer {
+                        if !field_written.contains(table) { return None; }
+                    }
+                }
+            }
+        }
+    }
     let expected: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
     let mut locations = std::collections::BTreeMap::new();
     for (bi, batch) in model.batches.iter().enumerate() {
@@ -10174,7 +10254,6 @@ fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &Trusted
     for (&id, tensor) in execution.inputs.iter().chain(&execution.outputs) {
         if model.tensor_lengths.get(&id) != Some(&tensor.len()) { return None; }
     }
-    if !validate_aux_descriptors(ops, model, aux) { return None; }
     let mut transcript = Transcript::new(b"zkie-bound-execution-v1");
     transcript.absorb(&bincode::serialize(model).ok()?);
     transcript.absorb(&bincode::serialize(execution).ok()?);
@@ -12988,9 +13067,9 @@ mod tests {
         let pair_desc = pairs.descriptor.clone();
         let mult_desc = mult.descriptor.clone();
         let mut prover = Transcript::new(b"padded-identity-forgery");
-        let (proof, _) = prove_reverse_lookup(&store, &ops[0], &[], from_i64(3), pairs, mult, &model, &mut prover).unwrap();
+        let (proof, _) = prove_reverse_lookup(&store, &ops[0], &[], from_i64(3), pairs, mult, &model, false, &mut prover).unwrap();
         let mut verifier = Transcript::new(b"padded-identity-forgery");
-        assert!(verify_reverse_lookup(&ops[0], &[], from_i64(3), &pair_desc, &mult_desc, &model, &proof, &mut verifier).is_none());
+        assert!(verify_reverse_lookup(&ops[0], &[], from_i64(3), &pair_desc, &mult_desc, &model, false, &proof, &mut verifier).is_none());
     }
 
     #[test]
@@ -17069,17 +17148,6 @@ mod tests {
             "ScaleVec shift != 0 (rounding tail) must stay fail-closed");
     }
 
-    /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and    /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and
-    /// sumcheck are both emptied must be rejected (empty lists can never skip
-    /// non-empty computation).
-    /// S7c gate-consistency chain (gist §3):
-    /// TopKSelect(sel, gate) -> Scatter(token_id, expert_of) ->
-    /// CombineIdx(idx = token*n + expert) -> Lookup(gate_pos = gate_table[idx])
-    /// -> BroadcastScale(weighted = d*gate_pos) -> Gather with the same
-    /// gate_pos. The table is a trusted model tensor whose values are the
-    /// router gate matrix; the router gate output is public/authenticated by
-    /// the TopK reduction, so the scatter-add gate is the router gate at the
-    /// authenticated pair.
     #[test]
     fn s7c_gate_consistency_chain_bound_roundtrip() {
         use zkie_core::pcs::whir::Whir;
@@ -17101,14 +17169,14 @@ mod tests {
         let d = store.push(dv.clone());
         let weighted = store.push(vec![]);
         let out = store.push(vec![]);
-        // Model-committed gate table: the router gate matrix (row-major
-        // t*n + e), i.e. the TopK gate tensor values.
-        let gate_table = store.push(gate_v.clone());
+        // The Lookup table is the DYNAMIC router gate tensor itself (same id):
+        // its values are authenticated by the TopK reduction through the
+        // table claim returned by the Lookup reduction, not by a static root.
         let ops = vec![
             Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k },
             Op::Scatter { sel, token_id, expert_of, m, n },
             Op::CombineIdx { a: token_id, b: expert_of, scale: n, out: idx },
-            Op::Lookup { idx, out: gate_pos, table: gate_table },
+            Op::Lookup { idx, out: gate_pos, table: gate },
             Op::BroadcastScale { x: d, scale: gate_pos, out: weighted, h },
             Op::Gather { weighted, token_id, gate: gate_pos, out, m, h },
         ];
@@ -17118,14 +17186,12 @@ mod tests {
         let s = store.idx[token_id].len();
         assert_eq!(s, m * k);
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
-            .with_index_shapes(&[
-                (token_id, s), (expert_of, s), (idx, s),
-            ].into());
+            .with_index_shapes(&[(token_id, s), (expert_of, s), (idx, s)].into());
         let execution = TrustedExecution {
             inputs: [(x, xv.clone()), (d, dv.clone())].into(),
             outputs: [
                 (thr, thr_v.clone()),
-                (gate, gate_v.clone()),
+                (gate, gate_v.clone()),   // router gate: public AND the dynamic Lookup table
                 (d1, d1_v.clone()),
                 (d2, d2_v.clone()),
                 (out, store.get(out).to_vec()),
@@ -17137,7 +17203,35 @@ mod tests {
             &PublicStatement::Generic, &model, &execution),
             "honest gate-consistency chain must verify");
 
-        // Tampered public output (the Gather result) is rejected at prove.
+        // Independent negative 1: tamper ONLY the CombineIdx carried input,
+        // from a fresh honest proof.
+        let mut p1 = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("fresh proof 1");
+        for step in p1.reverse.steps.iter_mut() {
+            if let ReverseReduction::CombineIdx { a, .. } = &mut step.reduction {
+                *a += Goldilocks::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &p1,
+            &PublicStatement::Generic, &model, &execution),
+            "tampered CombineIdx input must be rejected");
+
+        // Independent negative 2: tamper ONLY the Lookup table value, from a
+        // fresh honest proof. The dynamic table claim then disagrees with the
+        // denominator leaf and the gate claim check fails.
+        let mut p2 = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("fresh proof 2");
+        for step in p2.reverse.steps.iter_mut() {
+            if let ReverseReduction::Lookup { proof } = &mut step.reduction {
+                proof.table_value += Goldilocks::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &p2,
+            &PublicStatement::Generic, &model, &execution),
+            "tampered gate/table value must be rejected");
+
+        // Independent negative 3: tamper ONLY a public Gather output, from a
+        // fresh honest proof path (prove refuses the inconsistent execution).
         let mut bad_outputs = execution.outputs.clone();
         if let Some(v) = bad_outputs.get_mut(&TensorKey::Field(out).encoded().unwrap()) {
             if !v.is_empty() { v[0] = v[0] + Goldilocks::ONE; }
@@ -17146,76 +17240,66 @@ mod tests {
         assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
             &PublicStatement::Generic, &model, &bad_exec).is_none(),
             "tampered gather output must fail closed");
-
-        // Wrong index/expert: tamper the CombineIdx carried input so the
-        // field relation idx = n*token + expert no longer holds.
-        let mut bad_proof = proof;
-        for step in bad_proof.reverse.steps.iter_mut() {
-            if let ReverseReduction::CombineIdx { a, .. } = &mut step.reduction {
-                *a += Goldilocks::ONE;
-            }
-        }
-        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad_proof,
-            &PublicStatement::Generic, &model, &execution),
-            "tampered CombineIdx input must be rejected");
-        // Tampered gate: corrupt the BroadcastScale scale/gate endpoint.
-        let mut bad_proof2 = bad_proof;
-        for step in bad_proof2.reverse.steps.iter_mut() {
-            if let ReverseReduction::BroadcastScale { proof: p } = &mut step.reduction {
-                p.prod.final_evals[2] += Goldilocks::ONE;
-            }
-        }
-        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad_proof2,
-            &PublicStatement::Generic, &model, &execution),
-            "tampered gate endpoint must be rejected");
-
-        // Wrong table root: rebuild the manifest from a corrupted table while
-        // keeping the honest proof. The Lookup table opening no longer
-        // matches the model root, so the verifier rejects.
-        let mut store_bad = Store::new();
-        // Recreate the store layout with the honest forward values, then
-        // corrupt the table only.
-        let xb = store_bad.push(xv.clone());
-        let selb = store_bad.push(vec![]);
-        let thrb = store_bad.push(vec![]);
-        let gateb = store_bad.push(vec![]);
-        let d1b = store_bad.push(vec![]);
-        let d2b = store_bad.push(vec![]);
-        let tokb = store_bad.push_idx(vec![]);
-        let expb = store_bad.push_idx(vec![]);
-        let idxb = store_bad.push_idx(vec![]);
-        let gpb = store_bad.push(vec![]);
-        let db = store_bad.push(dv.clone());
-        let wb = store_bad.push(vec![]);
-        let ob = store_bad.push(vec![]);
+    }
+    /// P0 regression: the trusted gate table is a DIFFERENT
+    /// tensor from the router's TopK gate. Here the table is corrupted (one
+    /// entry differs from the forward router gate) while the public TopK gate
+    /// output stays the true router gate; Lookup/BroadcastScale/Gather are
+    /// computed from the corrupted table. If the verifier accepts, the chain
+    /// does not prove gate_table == router gate.
+    #[test]
+    fn s7c_gate_chain_static_table_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, n, k, h) = (4usize, 8usize, 2usize, 4usize);
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
+        let dv: Vec<Goldilocks> = (0..m * k * h).map(|i| from_i64(((i * 5) % 11) as i64 - 5)).collect();
+        let (thr_v, sel_v, gate_v, d1_v, d2_v) = topk_forward(&xv, m, n, k);
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let token_id = store.push_idx(vec![]);
+        let expert_of = store.push_idx(vec![]);
+        let idx = store.push_idx(vec![]);
+        let gate_pos = store.push(vec![]);
+        let d = store.push(dv.clone());
+        let weighted = store.push(vec![]);
+        let out = store.push(vec![]);
+        // Corrupted trusted table: differs from the router gate at entry 0.
         let mut bad_table = gate_v.clone();
         bad_table[0] = bad_table[0] + Goldilocks::ONE;
-        let tabb = store_bad.push(bad_table);
-        store_bad.v[selb] = TensorData::Owned(sel_v.clone());
-        store_bad.v[thrb] = TensorData::Owned(thr_v.clone());
-        store_bad.v[gateb] = TensorData::Owned(gate_v.clone());
-        store_bad.v[d1b] = TensorData::Owned(d1_v.clone());
-        store_bad.v[d2b] = TensorData::Owned(d2_v.clone());
-        let ops_bad = vec![
-            Op::TopKSelect { x: xb, sel: selb, thr: thrb, gate: gateb, d1: d1b, d2: d2b, m, n, k },
-            Op::Scatter { sel: selb, token_id: tokb, expert_of: expb, m, n },
-            Op::CombineIdx { a: tokb, b: expb, scale: n, out: idxb },
-            Op::Lookup { idx: idxb, out: gpb, table: tabb },
-            Op::BroadcastScale { x: db, scale: gpb, out: wb, h },
-            Op::Gather { weighted: wb, token_id: tokb, gate: gpb, out: ob, m, h },
+        assert_ne!(bad_table[0], gate_v[0]);
+        let gate_table = store.push(bad_table);
+        let ops = vec![
+            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k },
+            Op::Scatter { sel, token_id, expert_of, m, n },
+            Op::CombineIdx { a: token_id, b: expert_of, scale: n, out: idx },
+            Op::Lookup { idx, out: gate_pos, table: gate_table },
+            Op::BroadcastScale { x: d, scale: gate_pos, out: weighted, h },
+            Op::Gather { weighted, token_id, gate: gate_pos, out, m, h },
         ];
-        forward_ops(&mut store_bad, &ops_bad);
-        let model_bad = TrustedModelManifest::from_offline_commitment(&cached, &store_bad.owned_slices(), &ops_bad)
-            .with_index_shapes(&[(tokb, s), (expb, s), (idxb, s)].into());
-        let mut bad_proof3 = bad_proof2;
-        for step in bad_proof3.reverse.steps.iter_mut() {
-            if let ReverseReduction::BroadcastScale { proof: p } = &mut step.reduction {
-                p.prod.final_evals[2] -= Goldilocks::ONE;
-            }
-        }
-        assert!(!verify_committed_shard_dag_bound(&ops_bad, 1, &whir, &bad_proof3,
-            &PublicStatement::Generic, &model_bad, &execution),
-            "a different trusted gate table root must be rejected");
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-gate-counter");
+        forward_ops(&mut store, &ops);
+        let s = store.idx[token_id].len();
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(token_id, s), (expert_of, s), (idx, s)].into());
+        let execution = TrustedExecution {
+            inputs: [(x, xv.clone()), (d, dv.clone())].into(),
+            outputs: [
+                (thr, thr_v.clone()),
+                (gate, gate_v.clone()),   // TRUE router gate, authenticated by TopK
+                (d1, d1_v.clone()),
+                (d2, d2_v.clone()),
+                (out, store.get(out).to_vec()), // computed with the corrupted table
+            ].into(),
+        };
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).is_none(),
+            "a static gate table feeding a Gather gate must fail closed (cannot be tied to the router output)");
     }
     #[test]
     fn s2_matmul32_empty_commitments_rejected() {

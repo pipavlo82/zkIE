@@ -192,7 +192,61 @@ order is rejected, Scatter remains fail-closed (commit 5df8e59). The formal
 pre-fix counterexample already reproduced: with m=n=2, sel all ones and the
 positions 0/2 swapped, the old bound verifier returned true.
 
-### 3. Gate consistency chain — IMPLEMENTED (bound paths; see tracker)
+### 2c. Tie-break formalization (topk_forward `then(a.cmp(b))`)
+
+Forward rule (verified against `topk_forward`): per row, sort by value
+descending and by ascending column index on ties; select the first k; thr is
+the k-th value. Consequence: among the tied set `T = {e : x[e] = thr}` the
+selected ones are exactly the smallest-column prefix of T.
+
+Definitions (per row r, column e; flat position pos = r*n + e):
+- `T[pos] = [x[pos] = thr_b[pos]]`. With the non-strict gap witnesses
+  `d1 = sel*(x - thr_b) >= 0` and `d2 = (1-sel)*(thr_b - x) >= 0`, this is
+  `T = sel*Z(d1) + (1-sel)*Z(d2)` where `Z(v) = prod_b (1 - bit_b(v))`
+  (the all-zero indicator of the 16-bit decomposition; ties are d1=0 for
+  selected and d2=0 for unselected).
+- 0-based tied rank: `P[pos] = #{e' < e : T[r,e'] = 1}` (the first tied
+  position has rank 0).
+- `c_r = sum_e T[r,e]*S[r,e]` = number of selected tied positions in row r;
+
+  committed as the flat broadcast column `t_b[pos] = c_r`.
+
+Corrected selection condition (off-by-one fixed):
+  `T[pos] * (S[pos] - less(P[pos], t_b[pos])) = 0`,
+  with `less(P,C)` the strict integer comparison over B = log2(n)+1 bits
+  (`P < C`). With 0-based P this selects exactly ranks 0..c_r-1, i.e. c_r
+  positions. Alternatives checked and rejected: 1-based P with strict
+  `P < c_r` selects only c_r-1 (off-by-one; exhaustive enumeration fails);
+  1-based needs `P <= c_r` or cutoff c_r+1 with strict less.
+
+Boundary cases (exhaustive enumeration n in {2,4,8}, all rows over {0,1,2}):
+- `c_r = 0`: selects no tied position. It cannot occur for k >= 1 with the
+  attainment relation (`att` marks a selected tied position), and if a
+  prover tried it the selection rule plus att would be contradictory; it is
+  rejected, not silently accepted.
+- `c_r = |T_r|`: all tied positions are selected; ranks 0..|T_r|-1 < c_r.
+- `c_r > |T_r|` is impossible because `c_r = sum T*S <= sum T`; a forged
+  t_b above the tied count fails the row-sum relation.
+- Verified: the 0-based strict-less rule matched `topk_forward` on 52,830
+  exhaustive cases (0 failures); the 1-based variant failed 52,812 cases.
+
+Rank reset and padding:
+- The flat position domain is exactly `m*n = 2^A` (TopK requires m,n powers
+  of two and m*n >= 32; `A = log2(m*n)`), so there are NO padding positions
+  and no padding rows in the tie gadget. `dom = 1 << arity == m*n` is
+  asserted; otherwise fail closed.
+- `E0[pos] = [e(pos) = 0]` (verifier computes `E0~(z) = prod_{b<log2 n}(1-z_b)`).
+  Recurrence: `E0 * P = 0`; `(1-E0) * (P - P_prev - T_prev) = 0`, where
+  `P_prev[pos] = P[pos-1]` and `T_prev[pos] = T[pos-1]` are cyclic shifts
+  bound by the same pair-multiset LogUp permutation used by ScatterOrder.
+  For e >= 1 the shift stays inside the row; the cyclic wrap (pos 0) is
+  overridden by `E0 * P = 0`, so ranks reset exactly at row starts and never
+  leak across rows.
+- `t_b` is a flat column; `c_r = sum_e T*S` is enforced by the eq-weighted
+  row-sum virtual with the row-broadcast kernel (exactly m rows, no padding
+  rows). The comparison uses the committed t_b bits per position.
+
+### 3. Gate consistency chain — IMPLEMENTED (dynamic router-gate table; see tracker)
 
 `idx_gate = token_id·n + expert_of` via `CombineIdx` (linear; already
 supported), `gate_pos = gate_table[idx_gate]` via `Lookup` (already
@@ -208,7 +262,9 @@ with `gate` from the same TopKSelect reduction.
 Implemented as exact-product eq-weighted virtuals with S4 same_poly output
 binding: BroadcastScale (out[i]=x[i]*scale[i/h]) and ScaleVec shift 0
 (out[i]=x[i]*scale[i%s]); ScaleVec shift>0 rounding remains fail-closed.
-The gate-consistency chain test is still blocked on the Scatter order proof.
+The gate-consistency chain uses the router gate itself as the dynamic Lookup table
+(same tensor id), authenticated through the returned table claim merged with the
+public gate output; static tables feeding a Gather gate fail closed.
 
 
 Needed for `weighted = d·gate_pos`. Reverse pattern: eq-weighted product
