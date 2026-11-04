@@ -2697,6 +2697,35 @@ struct ReverseGeluIndexProof {
     lower_at_output: Goldilocks,
     upper: ReverseReluProof,
     lower: ReverseReluProof,
+    /// Project ②: precommitted 25-bit x+2^24 range witness (bound before any
+    /// GeluIndex challenge; the bound transcript also absorbs the aux
+    /// descriptor via execution_seeds), its virtual range identity, the
+    /// opened bit values and the batch opening.
+    range_commitment: zkie_core::pcs::whir::Commitment,
+    x_range: VirtualProof,
+    range_aux_values: Vec<Goldilocks>,
+    range_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+}
+
+/// Identity for the 25-bit signed decomposition: eq(z)*(x + 2^24 - sum 2^b
+/// bits_b) == 0 plus gamma-weighted booleanity of every bit. mles = [eq, x,
+/// bits_0..bits_24].
+fn gelu_range_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let mut terms = vec![
+        (Goldilocks::ONE, vec![0usize, 1usize]),
+        (Goldilocks::from_u64(GELU_BOUND as u64), vec![0usize]),
+    ];
+    for b in 0..GELU_XRANGE_BITS {
+        terms.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 2 + b]));
+    }
+    let mut gp = gamma;
+    for b in 0..GELU_XRANGE_BITS {
+        terms.push((gp, vec![0usize, 2 + b]));
+        terms.push((-gp, vec![0usize, 2 + b, 2 + b]));
+        gp *= gamma;
+    }
+    terms
 }
 
 fn reverse_tensor_values(store: &Store, id: T) -> Option<Cow<'_, [Goldilocks]>> {
@@ -2707,52 +2736,134 @@ fn reverse_tensor_values(store: &Store, id: T) -> Option<Cow<'_, [Goldilocks]>> 
 }
 
 fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
-    point: &[Goldilocks], value: Goldilocks, transcript: &mut Transcript)
+    point: &[Goldilocks], value: Goldilocks, range_aux: PreparedAux, transcript: &mut Transcript)
     -> Option<(ReverseGeluIndexProof, Vec<(Vec<Goldilocks>, Goldilocks)>)>
 {
-    if table_len == 0 || table_len > RELU_BOUND as usize || offset.unsigned_abs() > RELU_BOUND as u64 || !input.len().is_power_of_two() { return None; }
+    // Project ② domain contract: table_len a power of two <= 2^24, offset
+    // |.| <= 2^24, input power-of-two with point length log2(input).
+    if table_len == 0 || !table_len.is_power_of_two() || table_len > GELU_BOUND as usize
+        || offset.unsigned_abs() > GELU_BOUND as u64 || !input.len().is_power_of_two()
+        || point.len() != input.len().trailing_zeros() as usize { return None; }
+    let input_arity = point.len();
+    let arity = input_arity.max(5);
+    let padded = 1usize.checked_shl(arity as u32)?;
+    if range_aux.descriptor.role != AuxRole::GeluIndexXRange
+        || range_aux.descriptor.len != input.len() || range_aux.descriptor.arity != arity
+        || range_aux.descriptor.columns != GELU_XRANGE_BITS
+        || range_aux.columns.len() != GELU_XRANGE_BITS
+        || range_aux.columns.iter().any(|c| c.len() != padded) { return None; }
+    // The committed bits must be the 25-bit decomposition of the zero-padded
+    // input x + 2^24; fail closed otherwise.
+    for i in 0..padded {
+        let signed = if i < input.len() { to_i64(input[i]) } else { 0 };
+        let v = signed.checked_add(GELU_BOUND)?;
+        if v < 0 || (v as u64) >= (1u64 << GELU_XRANGE_BITS) { return None; }
+        for b in 0..GELU_XRANGE_BITS {
+            if range_aux.columns[b][i] != Goldilocks::from_u64(((v as u64) >> b) & 1) { return None; }
+        }
+    }
     let limit = (table_len - 1) as i64;
     let mut shifted = Vec::with_capacity(input.len());
     let mut upper_input = Vec::with_capacity(input.len());
     let mut indices = Vec::with_capacity(input.len());
     for &x in input {
         let w = to_i64(x).checked_add(offset)?;
-        if !(-RELU_BOUND..RELU_BOUND).contains(&w) { return None; }
+        if !(-GELU_BOUND..GELU_BOUND).contains(&w) { return None; }
         let high = w.checked_sub(limit)?;
-        if !(-RELU_BOUND..RELU_BOUND).contains(&high) { return None; }
+        if !(-GELU_BOUND..GELU_BOUND).contains(&high) { return None; }
         shifted.push(from_i64(w));
         upper_input.push(from_i64(high));
         indices.push(from_i64(w.max(0) - high.max(0)));
     }
-    if point.len() != input.len().trailing_zeros() as usize || mle::eval(&indices, point) != value { return None; }
+    if mle::eval(&indices, point) != value { return None; }
     let lower_values: Vec<_> = shifted.iter().map(|&x| from_i64(to_i64(x).max(0))).collect();
     let lower_at_output = mle::eval(&lower_values, point);
     transcript.absorb_field(lower_at_output);
-    let (upper, upper_inputs) = prove_reverse_relu(&upper_input, point, lower_at_output - value, transcript)?;
+    // Precommitted 25-bit x range witness: the commitment is already in the
+    // bound transcript via execution_seeds; absorb it here as well so the same
+    // code path is sound on the plain path (proof-carried commitment).
+    transcript.absorb(b"zkie-gelu-range-v1");
+    transcript.absorb(&bincode::serialize(&range_aux.descriptor.commitment).ok()?);
+    let mut x_padded = input.to_vec(); x_padded.resize(padded, Goldilocks::ZERO);
+    let q = transcript.field_vec(arity);
+    let eq = mle::eq_evals(&q);
+    let gamma = transcript.field();
+    let mut mles: Vec<&[Goldilocks]> = vec![&eq, &x_padded];
+    mles.extend(range_aux.columns.iter().map(Vec::as_slice));
+    let terms = gelu_range_terms(gamma);
+    let (x_range, range_point) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    let idxs: Vec<usize> = (0..GELU_XRANGE_BITS).collect();
+    let points = vec![range_point.clone(); GELU_XRANGE_BITS];
+    let values = x_range.final_evals[2..].to_vec();
+    let tensors = range_aux.columns.clone();
+    let ctx = zkie_core::pcs::committed::BatchCtx {
+        commitment: range_aux.descriptor.commitment.clone(), prover_data: range_aux.prover_data,
+        protocol: range_aux.protocol, whir: range_aux.whir, num_tables: GELU_XRANGE_BITS,
+    };
+    let range_opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
+        ctx, &idxs, &tensors, &points, &values).ok()?;
+    let range_claim = unpad_relu_claim(&range_point, x_range.final_evals[1], input_arity)?;
+    let (upper, upper_inputs) = prove_reverse_relu(&upper_input, point, lower_at_output - value, GELU_BITS, transcript)?;
     let limit_f = from_i64(limit);
     transcript.absorb_u64(upper_inputs.len() as u64);
     for (p, v) in &upper_inputs { transcript.absorb_u64(p.len() as u64); transcript.absorb_fields(p); transcript.absorb_field(*v); }
-    let (lower, shifted_inputs) = prove_reverse_relu(&shifted, point, lower_at_output, transcript)?;
+    let (lower, shifted_inputs) = prove_reverse_relu(&shifted, point, lower_at_output, GELU_BITS, transcript)?;
     let offset_f = from_i64(offset);
     let mut inputs: Vec<_> = upper_inputs.into_iter().map(|(p, v)| (p, v + limit_f - offset_f)).collect();
     inputs.extend(shifted_inputs.into_iter().map(|(p, v)| (p, v - offset_f)));
-    Some((ReverseGeluIndexProof { lower_at_output, upper, lower }, inputs))
+    inputs.push(range_claim);
+    let range_commitment = range_aux.descriptor.commitment;
+    Some((ReverseGeluIndexProof { lower_at_output, upper, lower, range_commitment, x_range, range_aux_values: values, range_opening }, inputs))
 }
 
 fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Goldilocks], value: Goldilocks,
-    proof: &ReverseGeluIndexProof, transcript: &mut Transcript)
+    range_aux: Option<&AuxDescriptor>, proof: &ReverseGeluIndexProof, transcript: &mut Transcript)
     -> Option<Vec<(Vec<Goldilocks>, Goldilocks)>>
 {
-    if table_len == 0 || table_len > RELU_BOUND as usize || offset.unsigned_abs() > RELU_BOUND as u64 { return None; }
+    if table_len == 0 || !table_len.is_power_of_two() || table_len > GELU_BOUND as usize
+        || offset.unsigned_abs() > GELU_BOUND as u64 { return None; }
+    let input_arity = point.len();
+    let arity = input_arity.max(5);
+    let input_len = 1usize.checked_shl(input_arity as u32)?;
+    if proof.x_range.final_evals.len() != 2 + GELU_XRANGE_BITS
+        || proof.range_aux_values.len() != GELU_XRANGE_BITS { return None; }
+    if let Some(d) = range_aux {
+        if d.role != AuxRole::GeluIndexXRange || d.len != input_len || d.arity != arity
+            || d.columns != GELU_XRANGE_BITS
+            || bincode::serialize(&proof.range_commitment).ok()?
+                != bincode::serialize(&d.commitment).ok()? { return None; }
+    }
     let limit_f = from_i64((table_len - 1) as i64);
     transcript.absorb_field(proof.lower_at_output);
-    let upper_inputs = verify_reverse_relu(&proof.upper, point, proof.lower_at_output - value, transcript)?;
+    transcript.absorb(b"zkie-gelu-range-v1");
+    transcript.absorb(&bincode::serialize(&proof.range_commitment).ok()?);
+    let q = transcript.field_vec(arity);
+    let gamma = transcript.field();
+    let terms = gelu_range_terms(gamma);
+    let (ok, range_point, range_final) = verify_virtual(&proof.x_range, &terms, Goldilocks::ZERO, arity, transcript);
+    if !ok
+        || range_final != virtual_eval(&terms, &proof.x_range.final_evals)
+        || proof.x_range.final_evals[0] != mle::eq_poly(&q, &range_point) { return None; }
+    let local = AuxDescriptor {
+        op_index: 0, role: AuxRole::GeluIndexXRange, len: input_len, arity,
+        columns: GELU_XRANGE_BITS, commitment: proof.range_commitment.clone(),
+    };
+    let desc = range_aux.unwrap_or(&local);
+    let idxs: Vec<usize> = (0..GELU_XRANGE_BITS).collect();
+    let points = vec![range_point.clone(); GELU_XRANGE_BITS];
+    if !verify_aux_open(desc, &idxs, &points, &proof.range_aux_values, &proof.range_opening) { return None; }
+    for b in 0..GELU_XRANGE_BITS {
+        if proof.x_range.final_evals[2 + b] != proof.range_aux_values[b] { return None; }
+    }
+    let range_claim = unpad_relu_claim(&range_point, proof.x_range.final_evals[1], input_arity)?;
+    let upper_inputs = verify_reverse_relu(&proof.upper, point, proof.lower_at_output - value, GELU_BITS, transcript)?;
     transcript.absorb_u64(upper_inputs.len() as u64);
     for (p, v) in &upper_inputs { transcript.absorb_u64(p.len() as u64); transcript.absorb_fields(p); transcript.absorb_field(*v); }
-    let shifted_inputs = verify_reverse_relu(&proof.lower, point, proof.lower_at_output, transcript)?;
+    let shifted_inputs = verify_reverse_relu(&proof.lower, point, proof.lower_at_output, GELU_BITS, transcript)?;
     let offset_f = from_i64(offset);
     let mut inputs: Vec<_> = upper_inputs.into_iter().map(|(p, v)| (p, v + limit_f - offset_f)).collect();
     inputs.extend(shifted_inputs.into_iter().map(|(p, v)| (p, v - offset_f)));
+    inputs.push(range_claim);
     Some(inputs)
 }
 
@@ -3593,7 +3704,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -4097,6 +4208,67 @@ fn prepare_lookup_group_aux(store: &Store, ops: &[Op], model: &TrustedModelManif
     Some(prepared)
 }
 
+/// GeluIndex (project ②): one precommitted 25-bit range witness per op,
+/// decomposing `x + 2^24` (TopKSelectXRange pattern). The descriptor is
+/// absorbed by `execution_seeds` before any challenge; the GeluIndex reverse
+/// reduction replays the virtual range identity, opens these columns at its
+/// final point, and returns the x claim. This closes the field-wrap hole where
+/// `to_i64(x)` is outside [-2^24, 2^24) while `x + offset mod p` lands in the
+/// ReLU domain.
+fn gelu_range_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, usize, usize, usize)>>
+{
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::GeluIndex { x, .. } = op {
+            let key = TensorKey::Field(*x).encoded()?;
+            let len = *model.tensor_lengths.get(&key)?;
+            if len == 0 || !len.is_power_of_two() { return None; }
+            let arity = len.trailing_zeros().max(5) as usize;
+            specs.push((i, len, arity, GELU_XRANGE_BITS));
+        }
+    }
+    Some(specs)
+}
+
+fn build_gelu_range_aux(xs: &[Goldilocks], op_index: usize, len: usize, arity: usize)
+    -> Option<PreparedAux>
+{
+    if xs.len() != len || len == 0 || !len.is_power_of_two()
+        || arity != len.trailing_zeros().max(5) as usize { return None; }
+    let padded = 1usize.checked_shl(arity as u32)?;
+    let mut columns = vec![vec![Goldilocks::ZERO; padded]; GELU_XRANGE_BITS];
+    for i in 0..padded {
+        let signed = if i < len { to_i64(xs[i]) } else { 0 };
+        let v = signed.checked_add(GELU_BOUND)?;
+        if v < 0 || (v as u64) >= (1u64 << GELU_XRANGE_BITS) { return None; }
+        for b in 0..GELU_XRANGE_BITS {
+            columns[b][i] = Goldilocks::from_u64(((v as u64) >> b) & 1);
+        }
+    }
+    let vars = GELU_XRANGE_BITS.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+    let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+    let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+    let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+    Some(PreparedAux {
+        descriptor: AuxDescriptor { op_index, role: AuxRole::GeluIndexXRange, len, arity, columns: GELU_XRANGE_BITS, commitment },
+        columns, prover_data, protocol, whir,
+    })
+}
+
+fn prepare_gelu_range_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<PreparedAux>>
+{
+    let mut prepared = Vec::new();
+    for (op_index, len, arity, count) in gelu_range_aux_specs(ops, model)? {
+        if count != GELU_XRANGE_BITS { return None; }
+        let x = match &ops[op_index] { Op::GeluIndex { x, .. } => *x, _ => return None };
+        prepared.push(build_gelu_range_aux(store.get(x), op_index, len, arity)?);
+    }
+    Some(prepared)
+}
+
 fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[AuxDescriptor]) -> bool {
     let specs = match projection_aux_specs(ops) { Some(v) => v, None => return false };
     let mut all: Vec<_> = specs.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ProjectionBits, len, arity, cols)).collect();
@@ -4107,6 +4279,10 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match lookup_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
     match lookup_group_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::LookupMultiplicityAgg, len, arity, cols))),
+        None => return false,
+    };
+    match gelu_range_aux_specs(ops, model) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::GeluIndexXRange, len, arity, cols))),
         None => return false,
     };
     match argmax_aux_specs(ops) {
@@ -4126,7 +4302,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -4143,19 +4319,26 @@ struct ReverseReluProof {
 
 const RELU_BITS: usize = 23;
 const RELU_BOUND: i64 = 1 << 22;
+/// Project ②: GeluIndex uses the same ReLU reduction with a 25-bit signed
+/// domain [-2^24, 2^24). The Relu op itself stays at RELU_BITS/RELU_BOUND so
+/// its proof is unchanged.
+const GELU_BITS: usize = 25;
+const GELU_BOUND: i64 = 1 << 24;
+const GELU_XRANGE_BITS: usize = GELU_BITS;
 
-fn relu_range_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+fn relu_range_terms(gamma: Goldilocks, bits: usize) -> Vec<(Goldilocks, Vec<usize>)> {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let bound = 1i64 << (bits - 1);
     let mut terms = Vec::new();
     let mut power = Goldilocks::ONE;
-    for j in 0..RELU_BITS {
+    for j in 0..bits {
         terms.push((power, vec![0, j + 2, j + 2]));
         terms.push((neg * power, vec![0, j + 2]));
         power *= gamma;
     }
     terms.push((power, vec![0, 1]));
-    terms.push((power * Goldilocks::from_u64(RELU_BOUND as u64), vec![0]));
-    for j in 0..RELU_BITS {
+    terms.push((power * Goldilocks::from_u64(bound as u64), vec![0]));
+    for j in 0..bits {
         terms.push((neg * power * Goldilocks::from_u64(1u64 << j), vec![0, j + 2]));
     }
     terms
@@ -4799,62 +4982,68 @@ fn verify_reverse_projection(op: &Op, point: &[Goldilocks], value: Goldilocks, a
     Some(vec![EvalClaim { tensor_id: x, point: xp, value: proof.matmul.sumcheck.f_eval }, EvalClaim { tensor_id: w, point: wp, value: proof.matmul.sumcheck.h_eval }, EvalClaim { tensor_id: bias, point: point.to_vec(), value: proof.bias }])
 }
 
-fn prove_reverse_relu(input: &[Goldilocks], point: &[Goldilocks], value: Goldilocks, transcript: &mut Transcript)
+fn prove_reverse_relu(input: &[Goldilocks], point: &[Goldilocks], value: Goldilocks,
+    bits: usize, transcript: &mut Transcript)
     -> Option<(ReverseReluProof, Vec<(Vec<Goldilocks>, Goldilocks)>)>
 {
+    if bits < 2 || bits > 31 { return None; }
+    let bound = 1i64 << (bits - 1);
     if !input.len().is_power_of_two() || point.len() != input.len().trailing_zeros() as usize { return None; }
     let input_arity = point.len();
     let arity = input_arity.max(5);
     let len = 1usize.checked_shl(arity as u32)?;
     let mut x = input.to_vec(); x.resize(len, Goldilocks::ZERO);
     let mut output_values = Vec::with_capacity(input.len());
-    let mut bits = vec![vec![Goldilocks::ZERO; len]; RELU_BITS];
+    let mut bit_cols = vec![vec![Goldilocks::ZERO; len]; bits];
     for (i, &v) in x.iter().enumerate() {
         let signed = to_i64(v);
-        if !(-RELU_BOUND..RELU_BOUND).contains(&signed) { return None; }
+        if !(-bound..bound).contains(&signed) { return None; }
         if i < input.len() { output_values.push(from_i64(signed.max(0))); }
-        let encoded = (signed + RELU_BOUND) as u64;
-        for j in 0..RELU_BITS { bits[j][i] = Goldilocks::from_u64((encoded >> j) & 1); }
+        let encoded = (signed + bound) as u64;
+        for j in 0..bits { bit_cols[j][i] = Goldilocks::from_u64((encoded >> j) & 1); }
     }
     if mle::eval(&output_values, point) != value { return None; }
-    let num_vars = (RELU_BITS * len).next_power_of_two().trailing_zeros() as usize;
+    let num_vars = bits.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
     let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
     let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
-    let refs: Vec<&[Goldilocks]> = bits.iter().map(Vec::as_slice).collect();
+    let refs: Vec<&[Goldilocks]> = bit_cols.iter().map(Vec::as_slice).collect();
     let (commitment, prover_data, protocol, batch_whir) = whir.commit_batch(&refs);
     transcript.absorb(b"zkie-relu-bits-v1");
     transcript.absorb(&bincode::serialize(&commitment).ok()?);
     let mut padded_point = point.to_vec(); padded_point.resize(arity, Goldilocks::ZERO);
     let eq = mle::eq_evals(&padded_point);
     let terms_out = vec![(Goldilocks::ONE, vec![0, 1, 2])];
-    let (output, out_point) = prove_virtual(&[&eq, &x, &bits[RELU_BITS - 1]], &terms_out, value, transcript);
+    let (output, out_point) = prove_virtual(&[&eq, &x, &bit_cols[bits - 1]], &terms_out, value, transcript);
     transcript.absorb_fields(&output.final_evals);
     let q = transcript.field_vec(arity);
     let gamma = transcript.field();
     let eq_range = mle::eq_evals(&q);
     let mut mles: Vec<&[Goldilocks]> = vec![&eq_range, &x];
-    mles.extend(bits.iter().map(Vec::as_slice));
-    let terms_range = relu_range_terms(gamma);
+    mles.extend(bit_cols.iter().map(Vec::as_slice));
+    let terms_range = relu_range_terms(gamma, bits);
     let (range, range_point) = prove_virtual(&mles, &terms_range, Goldilocks::ZERO, transcript);
-    let mut idxs = vec![RELU_BITS - 1];
-    idxs.extend(0..RELU_BITS);
+    let mut idxs = vec![bits - 1];
+    idxs.extend(0..bits);
     let mut points = vec![out_point.clone()];
-    points.extend((0..RELU_BITS).map(|_| range_point.clone()));
+    points.extend((0..bits).map(|_| range_point.clone()));
     let mut values = vec![output.final_evals[2]];
     values.extend_from_slice(&range.final_evals[2..]);
-    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&j| bits[j].clone()).collect();
-    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: commitment.clone(), prover_data, protocol, whir: batch_whir, num_tables: RELU_BITS };
+    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&j| bit_cols[j].clone()).collect();
+    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: commitment.clone(), prover_data, protocol, whir: batch_whir, num_tables: bits };
     let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
     let claims = vec![unpad_relu_claim(&out_point, output.final_evals[1], input_arity)?, unpad_relu_claim(&range_point, range.final_evals[1], input_arity)?];
     Some((ReverseReluProof { arity, bit_commitment: commitment, output, range, bit_opening: opening }, claims))
 }
 
-fn verify_reverse_relu(proof: &ReverseReluProof, point: &[Goldilocks], value: Goldilocks, transcript: &mut Transcript)
+fn verify_reverse_relu(proof: &ReverseReluProof, point: &[Goldilocks], value: Goldilocks,
+    bits: usize, transcript: &mut Transcript)
     -> Option<Vec<(Vec<Goldilocks>, Goldilocks)>>
 {
+    if bits < 2 || bits > 31 { return None; }
+    let bound = 1i64 << (bits - 1);
     let input_arity = point.len();
     if proof.arity != input_arity.max(5) || proof.arity >= usize::BITS as usize
-        || proof.output.final_evals.len() != 3 || proof.range.final_evals.len() != RELU_BITS + 2 { return None; }
+        || proof.output.final_evals.len() != 3 || proof.range.final_evals.len() != bits + 2 { return None; }
     let len = 1usize.checked_shl(proof.arity as u32)?;
     transcript.absorb(b"zkie-relu-bits-v1");
     transcript.absorb(&bincode::serialize(&proof.bit_commitment).ok()?);
@@ -4865,20 +5054,20 @@ fn verify_reverse_relu(proof: &ReverseReluProof, point: &[Goldilocks], value: Go
     transcript.absorb_fields(&proof.output.final_evals);
     let q = transcript.field_vec(proof.arity);
     let gamma = transcript.field();
-    let terms_range = relu_range_terms(gamma);
+    let terms_range = relu_range_terms(gamma, bits);
     let (ok, range_point, final_range) = verify_virtual(&proof.range, &terms_range, Goldilocks::ZERO, proof.arity, transcript);
     if !ok { return None; }
     let mut evals = proof.range.final_evals.clone();
     evals[0] = mle::eq_poly(&q, &range_point);
     if final_range != virtual_eval(&terms_range, &evals) { return None; }
-    let num_vars = RELU_BITS.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let num_vars = bits.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
     let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
     let whir = zkie_core::pcs::whir::Whir::with_params(num_vars, 90, pow);
-    let protocol = whir.batch_opening_protocol(RELU_BITS, proof.arity);
-    let mut idxs = vec![RELU_BITS - 1]; idxs.extend(0..RELU_BITS);
-    let mut points = vec![out_point.clone()]; points.extend((0..RELU_BITS).map(|_| range_point.clone()));
+    let protocol = whir.batch_opening_protocol(bits, proof.arity);
+    let mut idxs = vec![bits - 1]; idxs.extend(0..bits);
+    let mut points = vec![out_point.clone()]; points.extend((0..bits).map(|_| range_point.clone()));
     let mut values = vec![proof.output.final_evals[2]]; values.extend_from_slice(&proof.range.final_evals[2..]);
-    if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &proof.bit_commitment, &protocol, RELU_BITS, &idxs, &points, &values, &proof.bit_opening) { return None; }
+    if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &proof.bit_commitment, &protocol, bits, &idxs, &points, &values, &proof.bit_opening) { return None; }
     Some(vec![unpad_relu_claim(&out_point, proof.output.final_evals[1], input_arity)?, unpad_relu_claim(&range_point, proof.range.final_evals[1], input_arity)?])
 }
 
@@ -4968,7 +5157,19 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::Transpose
             }
             Op::GeluIndex { x, offset, table_len, .. } => {
-                let (proof, incoming) = prove_reverse_gelu_index(store.get(*x), *offset, *table_len, &point, value, transcript)?;
+                let range_aux = match aux.remove(&(op_index, AuxRole::GeluIndexXRange)) {
+                    Some(a) => a,
+                    None => {
+                        // Bound path: the precommitted descriptor is mandatory
+                        // (execution_seeds validated it). Plain path: commit
+                        // the 25-bit witness inside the proof; the commitment
+                        // is absorbed before the range challenge.
+                        if model.is_some() { return None; }
+                        let xv = store.get(*x);
+                        build_gelu_range_aux(xv, op_index, xv.len(), xv.len().trailing_zeros().max(5) as usize)?
+                    }
+                };
+                let (proof, incoming) = prove_reverse_gelu_index(store.get(*x), *offset, *table_len, &point, value, range_aux, transcript)?;
                 for (p, v) in incoming {
                     absorb_reverse_claim(transcript, *x, &p, v);
                     claims.entry(*x).or_default().push((p, v));
@@ -5183,7 +5384,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::PadIdx { base: bv }
             }
             Op::Relu { x, .. } => {
-                let (proof, incoming) = prove_reverse_relu(store.get(*x), &point, value, transcript)?;
+                let (proof, incoming) = prove_reverse_relu(store.get(*x), &point, value, RELU_BITS, transcript)?;
                 for (p, v) in incoming {
                     absorb_reverse_claim(transcript, *x, &p, v);
                     claims.entry(*x).or_default().push((p, v));
@@ -5318,7 +5519,8 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 claims.entry(*x).or_default().push((input, value));
             }
             (Op::GeluIndex { x, offset, table_len, .. }, ReverseReduction::GeluIndex { proof }) => {
-                for (p, v) in verify_reverse_gelu_index(*offset, *table_len, &point, value, proof, transcript)? {
+                let range_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::GeluIndexXRange);
+                for (p, v) in verify_reverse_gelu_index(*offset, *table_len, &point, value, range_aux, proof, transcript)? {
                     absorb_reverse_claim(transcript, *x, &p, v);
                     claims.entry(*x).or_default().push((p, v));
                 }
@@ -5475,7 +5677,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 claims.entry(key).or_default().push((point[..lb].to_vec(), *bv));
             }
             (Op::Relu { x, .. }, ReverseReduction::Relu { proof }) => {
-                for (p, v) in verify_reverse_relu(proof, &point, value, transcript)? {
+                for (p, v) in verify_reverse_relu(proof, &point, value, RELU_BITS, transcript)? {
                     absorb_reverse_claim(transcript, *x, &p, v);
                     claims.entry(*x).or_default().push((p, v));
                 }
@@ -11963,6 +12165,7 @@ pub fn prove_committed_shard_dag_bound(
     prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
     prepared.extend(prepare_lookup_aux(store, ops, model)?);
     prepared.extend(prepare_lookup_group_aux(store, ops, model)?);
+    prepared.extend(prepare_gelu_range_aux(store, ops, model)?);
     prepared.extend(prepare_topk_aux(store, ops)?);
     prepared.extend(prepare_topk_range_aux(store, ops)?);
     prepared.extend(prepare_topk_thr_range_aux(store, ops)?);
@@ -14598,12 +14801,189 @@ mod tests {
         ] {
             let expected: Vec<_> = expected.into_iter().map(from_i64).collect();
             let value = mle::eval(&expected, &point);
+            let aux = build_gelu_range_aux(&input, 0, input.len(),
+                input.len().trailing_zeros().max(5) as usize).unwrap();
+            let aux_desc = aux.descriptor.clone();
             let mut tp = Transcript::new(b"gelu-boundaries");
-            let (proof, _) = prove_reverse_gelu_index(&input, offset, 4, &point, value, &mut tp).unwrap();
+            let (proof, _) = prove_reverse_gelu_index(&input, offset, 4, &point, value, aux, &mut tp).unwrap();
             let mut tv = Transcript::new(b"gelu-boundaries");
-            let leaves = verify_reverse_gelu_index(offset, 4, &point, value, &proof, &mut tv).unwrap();
+            let leaves = verify_reverse_gelu_index(offset, 4, &point, value, Some(&aux_desc), &proof, &mut tv).unwrap();
             assert!(leaves.iter().all(|(p, v)| mle::eval(&input, p) == *v));
         }
+    }
+
+    fn gelu_direct_point(arity: usize) -> Vec<Goldilocks> {
+        (0..arity).map(|b| Goldilocks::from_u64((5 * b + 2) as u64)).collect()
+    }
+
+    fn gelu_direct_expected(input: &[Goldilocks], offset: i64, table_len: usize) -> Vec<Goldilocks> {
+        let limit = (table_len - 1) as i64;
+        input.iter().map(|&x| {
+            let w = to_i64(x) + offset;
+            let high = w - limit;
+            from_i64(w.max(0) - high.max(0))
+        }).collect()
+    }
+
+    fn gelu_direct_roundtrip(input: &[Goldilocks], offset: i64, table_len: usize) -> bool {
+        let arity = input.len().trailing_zeros() as usize;
+        let point = gelu_direct_point(arity);
+        let expected = gelu_direct_expected(input, offset, table_len);
+        let value = mle::eval(&expected, &point);
+        let aux = build_gelu_range_aux(input, 0, input.len(),
+            input.len().trailing_zeros().max(5) as usize).unwrap();
+        let desc = aux.descriptor.clone();
+        let (proof, _) = prove_reverse_gelu_index(input, offset, table_len, &point, value, aux,
+            &mut Transcript::new(b"gelu-bounds")).unwrap();
+        let leaves = verify_reverse_gelu_index(offset, table_len, &point, value, Some(&desc), &proof,
+            &mut Transcript::new(b"gelu-bounds")).unwrap();
+        leaves.iter().all(|(p, v)| mle::eval(input, p) == *v)
+    }
+
+    /// Project ② step 1: the 25-bit signed domain [-2^24, 2^24) is accepted
+    /// at its inclusive edges, and the new table_len/offset contract allows
+    /// table_len = 2^24 with offset 0 or 2^24 on in-range inputs.
+    #[test]
+    fn gelu_index_signed_domain_boundaries_roundtrip() {
+        let bound = 1i64 << 24;
+        // table_len = 1: w = high = x, so the ±2^24 domain edges are direct.
+        let edge: Vec<_> = [-bound, -bound + 1, -1, 0, 1, 2, bound - 1, 3]
+            .into_iter().map(from_i64).collect();
+        assert!(gelu_direct_roundtrip(&edge, 0, 1), "±2^24 edges must prove");
+        // table_len = 2^24: w and high stay in range for these inputs.
+        let big_table: Vec<_> = [0, 1, 2, bound - 1, -1, 0, 1, 2]
+            .into_iter().map(from_i64).collect();
+        assert!(gelu_direct_roundtrip(&big_table, 0, 1usize << 24), "table_len=2^24");
+        // offset = 2^24 (contract edge): x < 0 keeps w = x + 2^24 in range.
+        let off_edge: Vec<_> = [-bound, -bound + 1, -3, -2, -1, -1, -2, -3]
+            .into_iter().map(from_i64).collect();
+        assert!(gelu_direct_roundtrip(&off_edge, bound, 1), "offset=2^24");
+        let both: Vec<_> = [-bound, -bound + 1, -3, -2, -1, -1, -2, -3]
+            .into_iter().map(from_i64).collect();
+        assert!(gelu_direct_roundtrip(&both, bound, 1usize << 24), "2^24 table + 2^24 offset");
+    }
+
+    /// Project ② step 1 negatives: domain wrap (to_i64(x) outside the signed
+    /// domain while x + offset mod p lands in the ReLU domain), out-of-domain
+    /// inputs, the table_len/offset contract, and a forged range x eval. The
+    /// prover fails closed on the 25-bit witness; the verifier rejects forged
+    /// range data through the precommitted aux opening and the x-range
+    /// virtual identity.
+    #[test]
+    fn gelu_index_domain_wrap_and_contract_rejected() {
+        let bound = 1i64 << 24;
+        let good: Vec<_> = (0..8).map(from_i64).collect();
+        let point = gelu_direct_point(3);
+        let value = mle::eval(&gelu_direct_expected(&good, 0, 1), &point);
+        let aux = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
+        let desc = aux.descriptor.clone();
+        let (proof, _) = prove_reverse_gelu_index(&good, 0, 1, &point, value, aux,
+            &mut Transcript::new(b"gelu-neg")).unwrap();
+        assert!(verify_reverse_gelu_index(0, 1, &point, value, Some(&desc), &proof,
+            &mut Transcript::new(b"gelu-neg")).is_some());
+
+        // Contract: non-power-of-two / > 2^24 table_len and |offset| > 2^24.
+        for (off, tl) in [(0i64, 3usize), (0, 1usize << 25), (bound + 1, 1)] {
+            let aux2 = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
+            assert!(prove_reverse_gelu_index(&good, off, tl, &point, value, aux2,
+                &mut Transcript::new(b"gelu-neg")).is_none(),
+                "prover must reject contract violation off={off} tl={tl}");
+            assert!(verify_reverse_gelu_index(off, tl, &point, value, Some(&desc), &proof,
+                &mut Transcript::new(b"gelu-neg")).is_none(),
+                "verifier must reject contract violation off={off} tl={tl}");
+        }
+
+        // Out-of-domain signed edges: -2^24 - 1 and 2^24 cannot be decomposed
+        // into 25 bits (x + 2^24 outside [0, 2^25)).
+        let mut low = good.clone(); low[0] = from_i64(-bound - 1);
+        assert!(build_gelu_range_aux(&low, 0, 8, 5).is_none());
+        let mut high = good.clone(); high[0] = from_i64(bound);
+        assert!(build_gelu_range_aux(&high, 0, 8, 5).is_none());
+        // With a 25-bit witness for a different input, the prover's bit
+        // consistency check still rejects.
+        let aux3 = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
+        assert!(prove_reverse_gelu_index(&low, 0, 1, &point, value, aux3,
+            &mut Transcript::new(b"gelu-neg")).is_none());
+
+        // Field-wrap attack: x = -(2^24+1) (to_i64 out of domain) but
+        // x + offset mod p = 0 with offset = 2^24+1, inside the ReLU domain.
+        let wrap = from_i64(-bound - 1);
+        let wrap_off = bound + 1;
+        assert_eq!(to_i64(wrap) + wrap_off, 0, "w lands in the ReLU domain");
+        let mut wrap_input = good.clone(); wrap_input[0] = wrap;
+        assert!(build_gelu_range_aux(&wrap_input, 0, 8, 5).is_none(),
+            "wrap input has no 25-bit x witness");
+        let aux4 = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
+        assert!(prove_reverse_gelu_index(&wrap_input, wrap_off, 1, &point, value, aux4,
+            &mut Transcript::new(b"gelu-neg")).is_none(),
+            "wrap attack must fail closed at the x-range witness");
+
+        // Verifier side: a forged x range eval is rejected by the aux-opening
+        // / range virtual binding (the precommitted bits cannot be re-pointed
+        // at a wrapped x).
+        let mut forged = proof;
+        forged.x_range.final_evals[1] += Goldilocks::ONE;
+        assert!(verify_reverse_gelu_index(0, 1, &point, value, Some(&desc), &forged,
+            &mut Transcript::new(b"gelu-neg")).is_none(),
+            "forged range x eval must be rejected");
+    }
+
+    /// Project ② step 1: a bound GeluIndex op with the real silu-domain
+    /// parameters (table_len = 2^24, offset = 2^23) proves and verifies, and
+    /// an out-of-domain input fails closed at the precommitted 25-bit x
+    /// witness.
+    #[test]
+    fn gelu_index_big_table_bound_roundtrip_and_oob_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = [0i64, (1 << 23) - 1, -(1 << 23), 1 << 22, -(1 << 22), 1, -1, 2]
+            .into_iter().map(from_i64).collect();
+        let x = store.push(xv.clone());
+        let idx = store.push_idx(vec![]);
+        let ops = vec![Op::GeluIndex { x, out: idx, offset: 1 << 23, table_len: 1 << 24 }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, 8usize)].into());
+        let idx_key = TensorKey::Index(idx).encoded().unwrap();
+        let idx_vals: Vec<Goldilocks> = store.idx[idx].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(x, xv.clone())].into(),
+            outputs: [(idx_key, idx_vals.clone())].into(),
+        };
+        let whir = Whir::with_params(5, 90, 17);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("2^24 GeluIndex bound proof");
+        assert!(proof.aux.iter().any(|a| a.role == AuxRole::GeluIndexXRange));
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+        // Byte determinism for the 25-bit GeluIndex proof path.
+        let bytes1 = bincode::serialize(&proof).unwrap();
+        let proof2 = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("repeat 2^24 GeluIndex proof");
+        assert_eq!(bytes1, bincode::serialize(&proof2).unwrap(),
+            "GeluIndex proof bytes must be deterministic");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof2,
+            &PublicStatement::Generic, &model, &execution));
+
+        // Out-of-domain input: -2^24-1 has no 25-bit x witness; the bound
+        // prover must fail closed before producing a proof.
+        let mut store2 = Store::new();
+        let mut bad_xv = xv.clone(); bad_xv[0] = from_i64(-(1 << 24) - 1);
+        let x2 = store2.push(bad_xv.clone());
+        let idx2 = store2.push_idx(vec![]);
+        let ops2 = vec![Op::GeluIndex { x: x2, out: idx2, offset: 1 << 23, table_len: 1 << 24 }];
+        forward_ops(&mut store2, &ops2);
+        let model2 = TrustedModelManifest::from_offline_commitment(&[], &store2.owned_slices(), &ops2)
+            .with_index_shapes(&[(idx2, 8usize)].into());
+        let idx2_key = TensorKey::Index(idx2).encoded().unwrap();
+        let idx2_vals: Vec<Goldilocks> = store2.idx[idx2].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution2 = TrustedExecution {
+            inputs: [(x2, bad_xv)].into(),
+            outputs: [(idx2_key, idx2_vals)].into(),
+        };
+        assert!(prove_committed_shard_dag_bound(&mut store2, &ops2, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model2, &execution2).is_none(),
+            "out-of-domain GeluIndex input must fail closed");
     }
 
     #[test]
@@ -14634,6 +15014,9 @@ mod tests {
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops).with_index_shapes(&[(idx, 4usize)].into());
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, vec![from_i64(-10), from_i64(-1), from_i64(8), from_i64(16)])].into() };
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 5, &whir, &cache, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
+        let gxr = proof.aux.iter().find(|a| a.op_index == 1 && a.role == AuxRole::GeluIndexXRange)
+            .expect("GeluIndexXRange aux must be precommitted");
+        assert_eq!((gxr.len, gxr.arity, gxr.columns), (4usize, 5usize, GELU_XRANGE_BITS));
         assert!(verify_committed_shard_dag_bound(&ops, 5, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 5, &whir, &PublicStatement::Generic, &model, &execution));

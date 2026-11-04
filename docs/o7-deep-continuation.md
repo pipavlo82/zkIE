@@ -306,4 +306,5 @@ and 90-bit security are unchanged.
 
 This closes the step (d) measurement deliverable. Deep O7 (a)/(b)/(c)/(d)
 is submitted for TL final acceptance; S7 remains unaccepted and S8/S9 are
-postponed. Project ② (GeluIndex big-table reduction) has not started.
+postponed. Project ② (GeluIndex big-table reduction) has started; its step 1
+record is `docs/gelu-big-continuation.md`. Project ② (GeluIndex big-table reduction) has not started.
