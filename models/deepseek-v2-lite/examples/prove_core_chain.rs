@@ -86,6 +86,15 @@ fn peak_rss_kb() -> u64 {
     0
 }
 
+fn fnv(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
 /// Real expert-gate weight slice: gather the requested real expert blocks
 /// from the 64-expert file. The full 2^28 matrix opening OOMs on the
 /// 495GB machine (reported separately); the slice keeps the SAME real
@@ -473,8 +482,86 @@ fn main() {
     let t_d = Instant::now();
     evaluate_ops(&mut sd, &ops_d);
     let d_v = sd.get(d_t).to_vec();
-    println!("D forward {:?} d_len={} (caller-computed; FFN proof blocked at GeluIndex 2^24 > 2^22)",
-        t_d.elapsed(), d_v.len());
+    // Project ② step 2 domain probe: the real gate projection is the input of
+    // GeluIndex(offset=2^23, table_len=2^24). Record its signed range and the
+    // derived w=x+2^23 / high=w-(2^24-1) ranges; the 25-bit contract needs
+    // all three inside [-2^24, 2^24).
+    let g_vals: Vec<i64> = sd.get(g_d).iter().map(|&v| to_i64(v)).collect();
+    let g_min = *g_vals.iter().min().unwrap();
+    let g_max = *g_vals.iter().max().unwrap();
+    let w_min = g_min + (1i64 << 23);
+    let w_max = g_max + (1i64 << 23);
+    let hi_min = w_min - ((1i64 << 24) - 1);
+    let hi_max = w_max - ((1i64 << 24) - 1);
+    println!("D gate range [{g_min},{g_max}] w=[{w_min},{w_max}] high=[{hi_min},{hi_max}]");
+    assert!(g_min >= -(1i64 << 24) && g_max < (1i64 << 24), "real g outside 25-bit x domain");
+    assert!(w_min >= -(1i64 << 24) && w_max < (1i64 << 24), "real w outside 25-bit ReLU domain");
+    assert!(hi_min >= -(1i64 << 24) && hi_max < (1i64 << 24), "real high outside 25-bit ReLU domain");
+    println!("D forward {:?} d_len={} (caller-computed; full FFN tail blocked at ScaleVec shift=16)", t_d.elapsed(), d_v.len());
+
+    // ---------------- Phase D (project ② step 2): real silu 2^24 table ------
+    // Trust boundary: g is the real gate projection produced by the model's
+    // forward path; here it is a caller-trusted public input (same convention
+    // as C's caller-trusted d). The caller statement binds it to B's proven g
+    // output item by item. The segment proves
+    //   GeluIndex(offset=2^23, table_len=2^24) -> Lookup(real silu 2^24 table)
+    // with the precommitted GeluIndexXRange witness and the O7 shared table
+    // commit. The remaining tail ScaleVec(shift=16) -> GatherMatMul(down) is
+    // NOT provable yet: the bound reverse ScaleVec supports shift 0 only and
+    // fails closed; this is reported to the TL as a scope blocker.
+    assert_eq!(sd.get(g_d), sb.get(g), "D gate input must equal B's proven g");
+    let mut sffn = Store::new();
+    let g_in = sffn.push(sd.get(g_d).to_vec());
+    let sidx = sffn.push_idx(vec![]);
+    let silu_out = sffn.push(vec![]);
+    let silu_tab = sffn.push(silu_v.clone());
+    let ops_ffn = vec![
+        Op::GeluIndex { x: g_in, out: sidx, offset: 1 << 23, table_len: 1 << 24 },
+        Op::Lookup { idx: sidx, out: silu_out, table: silu_tab },
+    ];
+    let t_ff_fwd = Instant::now();
+    evaluate_ops(&mut sffn, &ops_ffn);
+    let silu_out_v = sffn.get(silu_out).to_vec();
+    let sidx_len = sffn.idx[sidx].len();
+    println!("FFN forward {:?} sidx_len={} silu_len={}",
+        t_ff_fwd.elapsed(), sidx_len, silu_out_v.len());
+    let cache_ffn = format!("{cache}-ffn");
+    let cached_ffn = commit_model_weights(&sffn, &ops_ffn, &cache_ffn);
+    let model_ffn = TrustedModelManifest::from_offline_commitment(&cached_ffn, &sffn.owned_slices(), &ops_ffn)
+        .with_index_shapes(&[(sidx, sidx_len)].into());
+    let exec_ffn = TrustedExecution {
+        inputs: [(g_in, sffn.get(g_in).to_vec())].into(),
+        outputs: [(silu_out, silu_out_v.clone())].into(),
+    };
+    let t_ff = Instant::now();
+    let proof_ffn = prove_committed_shard_dag_bound(&mut sffn, &ops_ffn, 1, &whir, &cached_ffn, 0, 0,
+        &PublicStatement::Generic, &model_ffn, &exec_ffn)
+        .expect("phase D real silu 2^24 proof");
+    let bytes_ffn = bincode::serialize(&proof_ffn).expect("serialize FFN");
+    let ff_prove_t = t_ff.elapsed();
+    let t_ff_v = Instant::now();
+    assert!(verify_committed_shard_dag_bound_bytes(&bytes_ffn, &ops_ffn, 1, &whir,
+        &PublicStatement::Generic, &model_ffn, &exec_ffn), "phase D must verify");
+    println!("FFN commit+prove {:?} verify {:?} bytes {} hash={:016x} sidx_len={}",
+        ff_prove_t, t_ff_v.elapsed(), bytes_ffn.len(), fnv(&bytes_ffn), sidx_len);
+    let mut bad_ffn_out = exec_ffn.clone();
+    bad_ffn_out.outputs.get_mut(&silu_out).unwrap()[0] += Goldilocks::ONE;
+    assert!(!verify_committed_shard_dag_bound_bytes(&bytes_ffn, &ops_ffn, 1, &whir,
+        &PublicStatement::Generic, &model_ffn, &bad_ffn_out));
+    let mut bad_ffn_g = exec_ffn.clone();
+    bad_ffn_g.inputs.get_mut(&g_in).unwrap()[0] += Goldilocks::ONE;
+    assert!(!verify_committed_shard_dag_bound_bytes(&bytes_ffn, &ops_ffn, 1, &whir,
+        &PublicStatement::Generic, &model_ffn, &bad_ffn_g));
+    println!("negative rejected: FFN silu output / trusted g input tamper");
+    // Wrong real silu table root: mutate the real table and rebuild the
+    // trusted manifest (a fresh root over the same graph). The original
+    // proof's table opening cannot authenticate against the new root.
+    sffn.get_mut(silu_tab)[0] += Goldilocks::ONE;
+    let bad_model_ffn = TrustedModelManifest::from_offline_commitment(&cached_ffn, &sffn.owned_slices(), &ops_ffn)
+        .with_index_shapes(&[(sidx, sidx_len)].into());
+    assert!(!verify_committed_shard_dag_bound_bytes(&bytes_ffn, &ops_ffn, 1, &whir,
+        &PublicStatement::Generic, &bad_model_ffn, &exec_ffn));
+    println!("negative rejected: wrong real silu table root");
 
     // ---------------- Phase C: router-gate consistency chain + Gather ----------------
     // TopKSelect re-derives the router gate from the same real scores; the
@@ -837,7 +924,8 @@ fn main() {
         std::fs::write(format!("{prefix}-a.bin"), &bytes_a).expect("dump A bytes");
         std::fs::write(format!("{prefix}-b.bin"), &bytes_b).expect("dump B bytes");
         std::fs::write(format!("{prefix}-c.bin"), &bytes_c).expect("dump C bytes");
+        std::fs::write(format!("{prefix}-ffn.bin"), &bytes_ffn).expect("dump FFN bytes");
     }
-    println!("SEGMENT-OK layer={layer} (A routing + B gate projection + C router-gate/Gather over caller-trusted real d) A_bytes={} B_bytes={} C_bytes={}",
-        bytes_a.len(), bytes_b.len(), bytes_c.len());
+    println!("SEGMENT-OK layer={layer} (A routing + B gate projection + D gelu/silu 2^24 prefix + C router-gate/Gather over caller-trusted real d) A_bytes={} B_bytes={} C_bytes={} FFN_bytes={} FFN_hash={:016x}",
+        bytes_a.len(), bytes_b.len(), bytes_c.len(), bytes_ffn.len(), fnv(&bytes_ffn));
 }

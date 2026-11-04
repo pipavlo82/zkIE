@@ -105,9 +105,81 @@ value; the test tampers the range x eval and verifier rejects.
   forward-evaluated in step 1), and the 23-bit Relu path is byte-identical.
 - Deterministic PoW and 90-bit security unchanged.
 
+## Step 2 — real silu 2^24 table in the real-data D segment (partial)
+
+### What was integrated
+
+A new `FFN` (D) phase in `models/deepseek-v2-lite/examples/prove_core_chain.rs`:
+
+- real L10 data: `silu_table_i32.bin` (2^24 entries) and the real gate
+  projection `g` (the same value B proves; the example asserts `D.g == B.g`
+  item by item and supplies `g` as the caller-trusted public input, matching
+  the C/d trust convention);
+- ops: `GeluIndex(offset = 2^23, table_len = 2^24)` followed by
+  `Lookup(idx, real silu 2^24 static table)`;
+- the GeluIndexXRange witness is precommitted, and the static silu table uses
+  the deep-O7 shared commit/tree/opening path.
+
+### Real-data domain measurement
+
+L10 gate projection range: `g ∈ [-232482, 171093]`, `w = g + 2^23 ∈
+[8156126, 8559701]`, `high = w - (2^24-1) ∈ [-8621089, -8217514]`. All three
+are inside `[-2^24, 2^24)`, so the 25-bit contract holds for the real
+activations; the example asserts these ranges on every run.
+
+### Result
+
+| quantity | value |
+|---|---|
+| FFN forward | ~0.22 ms |
+| FFN commit + prove | ~7.53 s |
+| FFN verify | ~49.5 ms |
+| FFN proof bytes | 908,637 |
+| FFN proof hash (two runs) | `b2e058f3b527f805` both |
+| FFN proof dump SHA-256 (two runs) | `bc9763e6e08cb0cdc86de87f5d1cea09a35c033404a7ca55a8575cccfbd39472` both (`cmp` clean) |
+| sidx / silu length | 16,384 |
+
+Negatives: the example rejects a tampered silu output, a tampered trusted `g`
+input, and a wrong real silu-table root (the manifest is rebuilt from a
+mutated 2^24 table; the original proof cannot authenticate against the new
+root). New unit tests reject a wrong static silu-table root and a tampered
+GeluIndex index/range derivation (the latter mutates the GeluIndex step's
+derived output and the verifier rejects). Out-of-domain inputs remain
+fail-closed from step 1.
+
+### Blocking finding — ScaleVec(shift = 16)
+
+The approved project ② scope is the GeluIndex index reduction; the FFN tail
+uses `ScaleVec(shift = 16)`, and the **bound reverse ScaleVec supports shift
+0 only** (`prove_reverse_scale_vec` returns None for shift != 0). The real
+FFN chain `ScaleVec(shift 16) -> GatherMatMul(down)` therefore cannot be
+proven under the current reduction. This is pinned by
+`scale_vec_shift16_bound_fail_closed` (no silent acceptance).
+
+The legacy committed path contains the needed algebra
+(`rem = x*scale_b - out*2^shift + 2^(shift-1)`, identity-table lookup of the
+remainder), but it is not wired into the bound reverse path. A minimal
+extension would add a precommitted ScaleVec remainder aux (or the same
+identity-table lookup with a range/booleanity proof), bound in
+`execution_seeds` before challenges, and return x/scale/out claims. This is a
+reduction/transcript change outside the approved GeluIndex-only scope, so it
+is reported for TL approval rather than implemented here. Step 3 (full
+64-expert S7 retry) also depends on this tail.
+
+### Baselines
+
+- `zkie-ops --lib`: 169/0.
+- Real A/B/C and full64: unchanged from step 1 (A 241,874 / B 491,978 /
+  C 355,183; full64 B 540,239, `CORE-CHAIN-OK`).
+- The D/FFN proof is a new baseline: 908,637 bytes, deterministic across two
+  runs.
+- Logs: `/data/zkie-soundness-fix/logs/gelu2-ops.log`,
+  `gelu2-real-ffn-final{1,2}.log`, `gelu2-full64.log`.
+
 ## Remaining
 
-Step 2: wire the real silu 2^24 table (`silu_v` in the segmented example) into
-the proved FFN segment using the new reduction; Step 3: full 64-expert S7
-retry + negative suite + docs. S7 is not accepted; S8/S9 stay postponed.
-Deep O7 (a)–(d) is accepted; project ② step 1 is submitted for TL review.
+Step 2b (if approved): ScaleVec shift-16 rounding-tail reduction in the
+bound path, then the full FFN tail and step 3 (full 64-expert S7 retry +
+negatives + docs). S7 is not accepted; S8/S9 stay postponed. Deep O7
+(a)–(d) is accepted; project ② steps 1 and 2-prefix are submitted for TL
+review.

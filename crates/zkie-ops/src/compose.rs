@@ -14986,6 +14986,95 @@ mod tests {
             "out-of-domain GeluIndex input must fail closed");
     }
 
+    /// Project ② step 2 negatives: a wrong static silu-table root and a
+    /// tampered GeluIndex index derivation are rejected by the verifier. The
+    /// graph is the real FFN prefix shape: GeluIndex -> Lookup(static table).
+    #[test]
+    fn gelu_silu_lookup_wrong_root_and_index_tamper_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..32).map(|i| from_i64(i)).collect();
+        let x = store.push(xv.clone());
+        let sidx = store.push_idx(vec![]);
+        let table: Vec<Goldilocks> = (0..32).map(|i| from_i64(1000 + 3 * i as i64)).collect();
+        let t = store.push(table);
+        let out = store.push(vec![]);
+        let ops = vec![
+            Op::GeluIndex { x, out: sidx, offset: 0, table_len: 1 << 24 },
+            Op::Lookup { idx: sidx, out, table: t },
+        ];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops)
+            .with_index_shapes(&[(sidx, 32usize)].into());
+        let execution = TrustedExecution {
+            inputs: [(x, xv)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let whir = Whir::with_params(5, 90, 17);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("GeluIndex->silu proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+
+        // GeluIndex index/range tamper: mutate the derived lower output.
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::GeluIndex { proof } = &mut step.reduction {
+                proof.lower_at_output += Goldilocks::ONE;
+                hit = true;
+            }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged,
+            &PublicStatement::Generic, &model, &execution),
+            "GeluIndex index tamper must be rejected");
+
+        // Wrong silu table root: replace the trusted root for the static
+        // Lookup table with a well-formed commitment to a different column.
+        let mut wrong_model = model;
+        let zeros = vec![Goldilocks::ZERO; 32];
+        let wrong_whir = Whir::with_params(5, 90,
+            zkie_core::pcs::whir::Whir::required_pow_bits(5, 90));
+        let wrong = zkie_core::pcs::committed::commit(&wrong_whir, &zeros);
+        wrong_model.lookup_roots.insert(t, wrong.commitment);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &wrong_model, &execution),
+            "wrong silu table root must be rejected");
+    }
+
+    /// Project ② step 2 scope blocker: the bound reverse ScaleVec supports
+    /// shift 0 only. The real FFN tail uses ScaleVec(shift=16), so the full
+    /// FFN segment cannot be proven until a rounding-tail reduction is
+    /// approved and implemented. This test pins the current fail-closed
+    /// behavior (no silent acceptance).
+    #[test]
+    fn scale_vec_shift16_bound_fail_closed() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..32).map(|i| from_i64(i as i64 - 16)).collect();
+        let sv: Vec<Goldilocks> = vec![from_i64(3), from_i64(-2), from_i64(5), from_i64(7)];
+        let x = store.push(xv.clone());
+        let s = store.push(sv.clone());
+        let out = store.push(vec![]);
+        // from_offline_commitment resolves the identity tables a ScaleVec
+        // push arm references; the proof itself must still fail closed.
+        store.push((0..(1usize << 16)).map(|i| Goldilocks::from_u64(i as u64)).collect());
+        store.push((0..(1usize << 22)).map(|i| Goldilocks::from_u64(i as u64)).collect());
+        let ops = vec![Op::ScaleVec { x, scale: s, out, shift: 16 }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(x, xv), (s, sv)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let whir = Whir::with_params(5, 90, 17);
+        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).is_none(),
+            "bound ScaleVec shift=16 must stay fail-closed");
+    }
+
     #[test]
     fn committed_projection_gelu_lookup_projection_residual_chain() {
         let mut store = Store::new();
