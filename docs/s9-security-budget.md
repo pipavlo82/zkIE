@@ -290,6 +290,32 @@ acceptance path**: no verified relation depends on those bytes. It is recorded
 here so step 2/TL can decide whether to canonicalize/reject dead fields in a
 separate hardening item; it does not change the budget above.
 
+## 9b. Step 2a status — EF core layer (committed separately)
+
+The TL approved Option A and the step-2 hardening list. Step 2a introduces the
+extension-field outer layer without changing any existing proof/transcript
+bytes:
+
+- `crates/zkie-core/src/common/ef_outer.rs`: EF sum-check (degree-2 round
+  polynomials, `f·h` terminal), EF virtual sum-check (degree ≤3 terms,
+  `rounds: Vec<Vec<Ef>>`, `final_evals: Vec<Ef>`), EF `same_poly` (gamma and
+  merged point/value in EF), EF equality-polynomial helpers, and
+  `mle_eval_at_ef` (base-field MLE folded with EF weights).
+- `Transcript::absorb_ef` absorbs each EF element as its two base-field lanes;
+  `Transcript::ef_field` samples two independent base squeezes. The
+  `ChallengeSource` trait gained default `ef_field`/`ef_field_vec` so the test
+  PRNG remains usable.
+- EF `verify_virtual` now binds the carried `final_evals` against the
+  replayed final claim (`virtual_eval(terms, final_evals) == final_claim`),
+  closing the same dead-field malleability on the EF path.
+- Tests: 6/6 (`sumcheck_ef_roundtrip_and_tamper`,
+  `virtual_ef_roundtrip_and_tamper`, `same_poly_ef_roundtrip_and_tamper`,
+  `ef_mle_eval_matches_base_on_subfield_points`, `ef_wire_encoding_is_two_base_lanes`,
+  `transcript_ef_absorption_is_deterministic_and_bound`). Existing ops suite
+  175/0; core suite re-run for the step baseline.
+- Not yet wired into composers: the base-field sum-check/virtual/same_poly
+  remain the production path until step 2b/2c. No proof bytes changed.
+
 ## 10. Acceptance status
 
 Step 1 delivers only this inventory and budget. The S9 acceptance items

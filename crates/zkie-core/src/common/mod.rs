@@ -1,5 +1,6 @@
 pub mod claim;
 pub mod batched_matmul;
+pub mod ef_outer;
 pub mod field;
 pub mod fixed_point;
 pub mod logup_gkr;
