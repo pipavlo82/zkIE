@@ -446,58 +446,95 @@ zkie-core --release` 88 passed / 1 ignored, plus the `same_poly` suite
 90→96, all proof bytes change; the new baseline and EF cost measurements
 are step 2d.
 
-## 9g. Step 2d status — real A/B/D/C measurement (partial; blocked on the
-96-bit large-opening PoW cost)
+## 9g. Step 2d — large-weight sub-table split, final A/B/D/C baseline, and
+end-to-end budget
 
-Harness fix: the obsolete O2 route-A measurement hook in
-`models/deepseek-v2-lite/examples/prove_core_chain.rs` consumed weight-opening
-points/claimed values as base-field Goldilocks. Those fields are EF after
-2b-2b; the one-time measurement was removed (converting would have
-materialized an EF copy of the real table). All deepseek examples compile.
+**Why the split.** The first 96-bit full64 attempt showed that the cost is
+the WHIR **opening** grind, not commit/cache: B's 7,195.5 s proof time was
+7,180.3 s of `open_ms`, while the 6.4 GB cache commit took under 3 s and the
+restore 3.26 s. A single 2^28-slot opening at 96 bits is ~2 h wall on this
+machine, so D (two such openings) would be ~4 h and the run was terminated
+at 174.25 cumulative CPU-hours under the TL's 168-hour abort threshold. That
+measurement motivated the boss-approved split below.
 
-Measured on the S7 full64 real harness (DeepSeek-V2-Lite layer 10, seq=1,
-64 experts; same 495 GB / 64-core machine). "Before" is the recorded S7
-baseline (`docs/s7-full-continuation.md`: base-field outer challenges,
-WHIR 90). "After" is this branch (EF outer challenges, WHIR 96).
+**Split construction.** Every committed weight tensor longer than 2^24 is
+split into independent 2^24-element sub-tables, each with its own
+commitment/root and opening (chunk metadata `chunk_bits`/`chunk_index` in
+the manifest and cache). For a full claim at `r = (r_low, r_high)` the
+verifier reassembles
 
-| phase | before bytes | after bytes | before prove | after prove | before verify | after verify |
-|---|---|---|---|---|---|---|
-| A | 241,874 | **290,618** (+20.1%) | 0.15–0.18 s | 0.133 s | not separately timed | not separately timed |
-| B | 540,239 | **527,948** (−2.3%) | 241.4 s | **7,195.5 s** (open 7,180.3 s) | 159 ms | 160.3 ms |
-| D | 1,779,403 | **not completed** | 487.7 s | would be ~4 h (two 2^28 openings) | 339 ms | not measured |
-| C | 355,183 | **not reached** | 204 ms | not measured | 15.5 ms | not measured |
+```
+f(r) = Σ_h eq(r_high, bits(h)) · f_h(r_low)
+```
 
-B peak RSS grew 16.0 GB → 26.5 GB (EF copies of the folded weights).
+using weights it recomputes from the public claim point. Each `f_h(r_low)`
+is the PCS-authenticated opening value at the chunk point; the verifier
+checks both every opening and the weighted sum back to the original leaf.
+Unsplit claims keep the exact-value check. The prover materializes each
+parent tensor once per proof; the cache key still includes the WHIR
+security. `s9_weight_subtable_split_grouping_reassembles_mle` exercises the
+16-chunk math (including missing/duplicate-chunk rejection) without a large
+PCS run.
 
-**Cost finding (corrects the earlier commit-only PoW expectation).** B's
-weight cache commit wrote 6.4 GB in under 3 s; restore took 3.26 s; the
-7,180 s is the WHIR **opening** grind (`O5-phases ... open_ms=7180274.6`).
-Caching prover data does not amortize this PoW: every proof that opens a
-2^28-slot committed table at 96-bit pays ~2 h wall on this machine. D opens
-two such batches (up/down), so a full D proof is ~4 h, and a double-run of
-A/B/D/C is ~12 h plus aux work. Aux openings at small arity are cheap; A's
-prove time is unchanged. The 96-bit increment therefore lands almost
-entirely on large-weight openings (`required_pow_bits` at 2^28 grows from
-26 to 32, and the grind dominates wall time).
+Real full64 measurement (DeepSeek-V2-Lite layer 10, seq=1, 64 experts; same
+495 GB / 64-core machine). "Before" is the recorded S7 baseline
+(`docs/s7-full-continuation.md`: base-field outer challenges, WHIR 90).
+"After" is this branch (EF outer challenges, WHIR 96, split sub-tables).
+`K`/`W` are the verifier's `ProofBudget` values printed by the r3 run;
+`req` is `90 + ceil(log2 K)`.
 
-**Abort record.** Cumulative process CPU time reached 627,304 s =
-174.25 CPU-hours (> the 168 CPU-hour = 2× expected threshold set by the TL)
-while D's first 2^28 opening was still grinding; the process was terminated
-per instruction. A and B completed and verified; B's A/B negatives were all
-rejected before the abort. Determinism (two-run byte comparison) and D/C
-prove/verify/bytes could not be completed.
+| phase | before bytes | after bytes | before prove | after prove | before verify | after verify | K | W | req | after peak RSS |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A | 241,874 | 290,618 (+20.1%) | 0.15–0.18 s | 0.134 s | not separately timed | not separately timed | 7 | 2,936 | 93 | — |
+| B | 540,239 | 2,929,073 (+442%) | 241.4 s | **560.0 s** | 159 ms | 179.1 ms | 22 | 3,090 | 95 | 4.81 GB |
+| D | 1,779,403 | 6,641,018 (+273%) | 487.7 s | **1,170.3 s** | 339 ms | 400.3 ms | 48 | 9,102 | 96 | 10.92 GB |
+| C | 355,183 | 408,297 (+14.9%) | 204 ms | 276.8 ms | 15.5 ms | 17.3 ms | 11 | 3,676 | 94 | — |
 
-**End-to-end budget is unaffected by this performance result.** For accepted
-proofs: outer error ≤ W/2^128 ≤ 2^26/2^128 = 2^-102 (EF challenges, degree-3
-conservative charging, verifier-enforced W cap); PCS error ≤ K·2^-96 ≤ 2^-90
-for the provisioned K ≤ 64 (verifier rejects larger K); Fiat–Shamir/hash
-terms remain assumed as before. The blocker is proving cost, not soundness.
+The full A/B/D/C run takes ~29.5 min (B 560 s + D 1,170 s + A/C/negatives),
+versus >4 h for a single unsplit 96-bit D proof. The price is proof size:
+independent sub-table roots/openings grow B 5.4× and D 3.7× (A/C grow only
+from EF/96). Each nv24 opening grinds ~18 s; the remaining cost is the sum
+over 32 D sub-openings, not one huge grind. Peak RSS improves because each
+opening only holds a 2^24 table: B 16.0 GB → 4.81 GB and D 20.1 GB →
+10.92 GB (before values from `docs/s7-full-continuation.md`).
 
-Decision needed before S9 final acceptance: accept ~6 h per full64 prove and
-~12 h per determinism pair, or split large weight batches into smaller arity
-groups to reduce per-opening PoW (more openings K, lower pow each), or
-re-provision with an explicitly re-derived lower per-opening target. S9 is
-not accepted; 2d is incomplete.
+**Determinism.** Three clean runs — r1 (unoptimized parent materialization),
+r2 (parent cached once per proof), r3 (final code with budget logging) —
+produce byte-identical dumps for all four phases:
+
+| proof | bytes | SHA-256 (all three runs) |
+|---|---|---|
+| A | 290,618 | `a5257cae12316074763dea63e461b7d35bc87ba39d215d51b925ab68ee14de60` |
+| B | 2,929,073 | `c5c5b49d366b25d73e669bf21ed35a57181252d7fcba5dd54fa40431345b4313` |
+| D | 6,641,018 | `7015aa86d7f0d0d6e986ef9803308a687c05c198b9acc0b3139193a35d5e05fb` |
+| C | 408,297 | `03227ea90d5e1c8aa392c404ed3462defeab142d59f5b928b79cee823fd3f566` |
+
+All real-data negatives are rejected (tampered A gate/scores, B routing/g,
+wrong expert/activation roots, D out/g/mask/swapped/dropped/up-down/silu
+roots, C d/scores/out/gate), and the harness ends with `S7-CHAIN-OK`.
+
+**End-to-end ≥90-bit argument for accepted proofs.**
+
+- Outer reductions (sum-check, virtual, LogUp/fractional, tie/rank/range,
+  same-poly, batch-opening sumcheck) sample EF challenges: `|EF| ≈ 2^128`.
+  The verifier caps the conservative weighted budget `W = Σ(r·d + c)` at
+  `2^26`; therefore `ε_outer ≤ W/2^128 ≤ 2^-102`. The real chain is far
+  below the cap (D: W = 9,102 ≈ 2^13.2 → `ε_outer ≤ 2^-114.8`).
+- PCS: each opening is provisioned at 96 bits, and the verifier rejects a
+  proof unless `96 ≥ 90 + ceil(log2 K)` for its actual opening count K ≤ 64
+  (hard wire cap `K ≤ 2^12`; larger K fails closed rather than weakening the
+  bound). Thus `ε_PCS ≤ K·2^-96 ≤ 2^-90`. Real counts:
+  A 7 → 2^-93.2, B 22 → 2^-91.5, D 48 → 2^-90.4, C 11 → 2^-92.5.
+- Union: `ε_total ≤ 2^-102 + 2^-90 + ε_FS/hash < 2^-89.99`, i.e. at least
+  90 bits up to the Fiat–Shamir/hash assumption used throughout S1–S8.
+  Raising the provisioned constant to 102 would cover the full `2^12`
+  opening cap while keeping the same 2^-90 PCS bound.
+
+Verification: `cargo test -p zkie-ops --release` 177 passed / 0 failed (all
+S1–S8 negatives, S8 fuzz, the 2c budget test, and the new split-math test);
+`cargo test -p zkie-core --release` 88 passed / 1 ignored; `cargo check
+--workspace --release` clean. S9 is not accepted pending the TL's final
+review; this document does not declare acceptance.
 
 ## 10. Acceptance status
 

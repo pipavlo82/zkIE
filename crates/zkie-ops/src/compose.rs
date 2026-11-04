@@ -115,6 +115,12 @@ const MAX_PROOF_OPENINGS: usize = 1 << 12;
 /// S9 2c: aggregate outer-reduction budget `W = Σ(r·d + c) ≤ 2^26`; with EF
 /// challenges (|EF| ≈ 2^128) this bounds the outer error by 2^-102.
 const MAX_WEIGHTED_ROUNDS: u128 = 1u128 << 26;
+/// S9 2d: weight tensors longer than 2^24 are committed as independent
+/// sub-tables of 2^24 elements (separate roots/openings). This bounds the
+/// per-opening PoW at 96-bit security; the verifier reassembles each full
+/// claim with the public high-bit eq weights:
+/// `f(r) = Σ_h eq(r_high, bits(h)) · f_h(r_low)`.
+const WEIGHT_SUBTABLE_BITS: usize = 24;
 
 /// Bounded bincode decode with the legacy (fixint, trailing-bytes-allowed)
 /// format. The byte cap is checked before deserialization and enforced by
@@ -10047,6 +10053,12 @@ pub struct CachedWeightBatch {
     pub pow_bits: usize,
     pub table_ids: Vec<T>,
     pub tensor_lengths: Vec<usize>,
+    /// S9 2d: large weight tensors are split into sub-tables. `chunk_bits` is
+    /// the number of high index bits split off the original tensor (0 for an
+    /// unsplit batch); `chunk_index` selects the sub-table. The original
+    /// tensor length stays in `tensor_lengths`.
+    pub chunk_bits: usize,
+    pub chunk_index: usize,
     pub cache_path: std::path::PathBuf,
 }
 
@@ -10072,6 +10084,9 @@ struct TrustedWeightBatch {
     pow_bits: usize,
     table_ids: Vec<T>,
     tensor_lengths: Vec<usize>,
+    /// S9 2d split metadata; see `CachedWeightBatch`.
+    chunk_bits: usize,
+    chunk_index: usize,
 }
 
 impl TrustedModelManifest {
@@ -10172,6 +10187,7 @@ impl TrustedModelManifest {
             num_tables: b.num_tables, num_vars: b.num_vars,
             security: b.security, pow_bits: b.pow_bits,
             table_ids: b.table_ids.clone(), tensor_lengths: b.tensor_lengths.clone(),
+            chunk_bits: b.chunk_bits, chunk_index: b.chunk_index,
         }).collect(), graph: bincode::serialize(ops).expect("serialize op graph"), tensor_lengths, lookup_roots, lookup_lengths, identity_tables }
     }
 
@@ -10240,15 +10256,59 @@ impl TrustedModelManifest {
 /// Phase 1 (offline, once): commit every weight group and stream the Merkle
 /// prover data to a cache file. Returns only commitment + rebuild params; the
 /// heavy WHIR commitment (RS encoding + FFT + Merkle) is paid exactly once here.
+/// S9 2d: commit one weight batch (one or more tables of `arity` variables)
+/// and stream its Merkle prover data to the cache. `chunk_bits`/`chunk_index`
+/// describe a 2^24 sub-table split out of a larger tensor; both are zero for
+/// an unsplit batch.
+fn commit_weight_batch(
+    ids: &[(T, &[Goldilocks], usize)],
+    arity: usize,
+    chunk_bits: usize,
+    chunk_index: usize,
+    cache_dir: &str,
+    batch_index: usize,
+) -> CachedWeightBatch {
+    let num_tables = ids.len();
+    let total_slots = num_tables
+        .checked_mul(1usize << arity)
+        .expect("weight batch shape overflow");
+    let num_vars = total_slots.next_power_of_two().trailing_zeros() as usize;
+    let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
+    let refs: Vec<&[Goldilocks]> = ids.iter().map(|(_, v, _)| *v).collect();
+    let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow_bits);
+    let (commitment, prover_data, _protocol, batch_whir) = base_whir.commit_batch(&refs);
+    let num_vars = batch_whir.num_variables();
+    let table_ids: Vec<T> = ids.iter().map(|(t, _, _)| *t).collect();
+    let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
+        "weight-a{arity}-s{}-g{}.bin",
+        VERIFIER_SECURITY, batch_index
+    ));
+    let file = std::fs::File::create(&cache_path).expect("create weight cache");
+    let mut writer = std::io::BufWriter::new(file);
+    bincode::serialize_into(&mut writer, &commitment).expect("write cache commitment");
+    zkie_core::pcs::whir::Whir::serialize_batch_prover_data_into(prover_data, &mut writer)
+        .expect("write cache prover data");
+    std::io::Write::flush(&mut writer).expect("flush weight cache");
+    CachedWeightBatch {
+        commitment,
+        arity,
+        num_tables,
+        num_vars,
+        security: VERIFIER_SECURITY,
+        pow_bits,
+        table_ids,
+        tensor_lengths: ids.iter().map(|(_, _, l)| *l).collect(),
+        chunk_bits,
+        chunk_index,
+        cache_path,
+    }
+}
+
 pub fn commit_model_weights(
     store: &Store,
     ops: &[Op],
     cache_dir: &str,
 ) -> Vec<CachedWeightBatch> {
-    // Borrowed from feature/batch-pcs: 90-bit security + pow_bits=17 (enough for
-    // packed codewords up to 2^26), instead of the low-security testing params.
-    const SECURITY: usize = VERIFIER_SECURITY;
-
     let weight_tensors = collect_weight_tensors(ops);
     let mut by_size: std::collections::BTreeMap<usize, Vec<(T, Vec<Goldilocks>, usize)>> =
         std::collections::BTreeMap::new();
@@ -10268,52 +10328,42 @@ pub fn commit_model_weights(
     std::fs::create_dir_all(cache_dir).expect("create weight cache dir");
 
     let mut batches = Vec::new();
+    let chunk_len = 1usize << WEIGHT_SUBTABLE_BITS;
     for (len, group) in by_size {
+        if len > chunk_len {
+            // S9 2d: split every oversized tensor into independent 2^24
+            // sub-tables, each with its own root/opening. This keeps
+            // `required_pow_bits` at the chunk arity (24) instead of the
+            // original arity, so the 96-bit opening grind stays minutes.
+            let chunk_bits = (len / chunk_len).trailing_zeros() as usize;
+            for (t, padded, original_len) in group {
+                for chunk_index in 0..(1usize << chunk_bits) {
+                    let off = chunk_index * chunk_len;
+                    let chunk = &padded[off..off + chunk_len];
+                    let batch = commit_weight_batch(
+                        &[(t, chunk, original_len)],
+                        WEIGHT_SUBTABLE_BITS,
+                        chunk_bits,
+                        chunk_index,
+                        cache_dir,
+                        batches.len(),
+                    );
+                    batches.push(batch);
+                }
+            }
+            continue;
+        }
         let arity = len.trailing_zeros() as usize;
         // Horizontal merge: pack same-arity weights into groups that fit the
         // WHIR PoW budget (num_vars = arity + log2(group_size) <= 26).
-        let eff_group_size = if arity <= 26 {
-            (1usize << (26 - arity)).max(1)
-        } else {
-            1
-        };
+        let eff_group_size = (1usize << (26 - arity)).max(1);
         for ids in group.chunks(eff_group_size) {
-            let num_tables = ids.len();
-            let total_slots = num_tables * (1usize << arity);
-            let num_vars = total_slots.next_power_of_two().trailing_zeros() as usize;
-            // Per-group adaptive PoW budget: use the minimum pow_bits required at
-            // 90-bit security for this group's num_variables, so a large tensor
-            // (e.g. a 2^28 lm_head) gets a higher budget while small groups stay
-            // cheap. See Whir::required_pow_bits.
-            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, SECURITY);
-            let refs: Vec<&[Goldilocks]> = ids.iter().map(|(_, v, _)| v.as_slice()).collect();
-            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, SECURITY, pow_bits);
-            let (commitment, prover_data, _protocol, batch_whir) =
-                base_whir.commit_batch(&refs);
-            let num_vars = batch_whir.num_variables();
-            let table_ids: Vec<T> = ids.iter().map(|(t, _, _)| *t).collect();
-            let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
-                "weight-a{arity}-s{}-g{}.bin",
-                SECURITY,
-                batches.len()
-            ));
-            let file = std::fs::File::create(&cache_path).expect("create weight cache");
-            let mut writer = std::io::BufWriter::new(file);
-            bincode::serialize_into(&mut writer, &commitment).expect("write cache commitment");
-            zkie_core::pcs::whir::Whir::serialize_batch_prover_data_into(prover_data, &mut writer)
-                .expect("write cache prover data");
-            std::io::Write::flush(&mut writer).expect("flush weight cache");
-            batches.push(CachedWeightBatch {
-                commitment,
-                arity,
-                num_tables,
-                num_vars,
-                security: SECURITY,
-                pow_bits,
-                table_ids,
-                tensor_lengths: ids.iter().map(|(_, _, l)| *l).collect(),
-                cache_path,
-            });
+            let refs: Vec<(T, &[Goldilocks], usize)> =
+                ids.iter().map(|(t, v, l)| (*t, v.as_slice(), *l)).collect();
+            let batch = commit_weight_batch(
+                &refs, arity, 0, 0, cache_dir, batches.len(),
+            );
+            batches.push(batch);
         }
     }
     batches
@@ -12170,7 +12220,9 @@ fn reject_static_gate_on_weighted(
     Some(())
 }
 
-fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<std::collections::BTreeMap<T, (usize, usize)>> {
+/// S7/S9 shared graph/manifest shape checks; split from the location builder
+/// so the latter can add the 2d sub-table coverage rules.
+fn weight_scope_checks(model: &TrustedModelManifest, ops: &[Op]) -> Option<()> {
     if model.graph != bincode::serialize(ops).ok()? { return None; }
     graph_equal_shapes(ops, &model.tensor_lengths)?;
     // S7: every graph-derived exact length must match the manifest exactly
@@ -12248,33 +12300,106 @@ fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<
             reject_static_gate_on_weighted(ops, *weighted, &field_written)?;
         }
     }
+    Some(())
+}
+
+#[derive(Clone, Copy)]
+struct WeightLoc {
+    batch: usize,
+    table: usize,
+    chunk_index: usize,
+    chunk_bits: usize,
+}
+
+fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<std::collections::BTreeMap<T, Vec<WeightLoc>>> {
+    weight_scope_checks(model, ops)?;
     let expected: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
-    let mut locations = std::collections::BTreeMap::new();
+    let max_vars = zkie_core::pcs::whir::MAX_WHIR_NUM_VARIABLES;
+    let mut locations: std::collections::BTreeMap<T, Vec<WeightLoc>> =
+        std::collections::BTreeMap::new();
     for (bi, batch) in model.batches.iter().enumerate() {
         if batch.security < VERIFIER_SECURITY || batch.table_ids.len() != batch.num_tables || batch.tensor_lengths.len() != batch.num_tables { return None; }
+        if batch.chunk_bits > max_vars || batch.chunk_index >= (1usize << batch.chunk_bits) { return None; }
+        if batch.chunk_bits > 0 && batch.num_tables != 1 { return None; }
+        if batch.arity.checked_add(batch.chunk_bits)? > max_vars { return None; }
         for (ti, (&id, &len)) in batch.table_ids.iter().zip(&batch.tensor_lengths).enumerate() {
-            if model.tensor_lengths.get(&id) != Some(&len) || len == 0 || len.checked_next_power_of_two()?.max(32).trailing_zeros() as usize != batch.arity
-                || locations.insert(id, (bi, ti)).is_some() { return None; }
+            let parent_arity = len.checked_next_power_of_two()?.max(32).trailing_zeros() as usize;
+            if model.tensor_lengths.get(&id) != Some(&len) || len == 0
+                || parent_arity != batch.arity + batch.chunk_bits
+            { return None; }
+            locations.entry(id).or_default().push(WeightLoc {
+                batch: bi,
+                table: ti,
+                chunk_index: batch.chunk_index,
+                chunk_bits: batch.chunk_bits,
+            });
+        }
+    }
+    // Each weight tensor must be covered by exactly its chunk set: one entry
+    // for unsplit tensors, 2^chunk_bits distinct indices for split tensors.
+    for locs in locations.values() {
+        let bits = locs[0].chunk_bits;
+        if locs.iter().any(|l| l.chunk_bits != bits) { return None; }
+        let count = 1usize << bits;
+        if locs.len() != count { return None; }
+        let mut seen = vec![false; count];
+        for l in locs {
+            if l.chunk_index >= count || seen[l.chunk_index] { return None; }
+            seen[l.chunk_index] = true;
         }
     }
     if locations.keys().copied().collect::<std::collections::BTreeSet<_>>() != expected { return None; }
     Some(locations)
 }
 
+/// S9 2d grouping of reverse weight claims into per-batch opening entries.
+/// `Some(value)` entries are unsplit claims whose opened value must equal the
+/// leaf value exactly. `None` entries are split sub-claims whose opened value
+/// is proof-provided; `checks` records the public high-bit eq weights that
+/// must reassemble each original leaf: `Σ_h weight_h · opened_h == leaf`.
+struct WeightGrouping {
+    groups: Vec<Vec<(usize, Vec<Ef>, Option<Ef>)>>,
+    checks: Vec<(usize, Vec<(usize, usize, Ef)>)>,
+}
+
 fn group_reverse_weights(model: &TrustedModelManifest, ops: &[Op], leaves: &[EfClaim])
-    -> Option<Vec<Vec<(usize, Vec<Ef>, Ef)>>>
+    -> Option<WeightGrouping>
 {
     let locations = trusted_weight_locations(model, ops)?;
     let mut groups = vec![Vec::new(); model.batches.len()];
-    for c in leaves {
-        if let Some(&(bi, ti)) = locations.get(&c.tensor_id) {
-            let batch = &model.batches[bi];
-            if c.point.len() > batch.arity { return None; }
-            let mut point = c.point.clone(); point.resize(batch.arity, Ef::ZERO);
-            groups[bi].push((ti, point, c.value));
+    let mut checks: Vec<(usize, Vec<(usize, usize, Ef)>)> = Vec::new();
+    for (leaf_index, c) in leaves.iter().enumerate() {
+        let Some(locs) = locations.get(&c.tensor_id) else { continue };
+        let mut parts = Vec::new();
+        for loc in locs {
+            let batch = &model.batches[loc.batch];
+            let parent_arity = batch.arity + batch.chunk_bits;
+            if c.point.len() > parent_arity { return None; }
+            let mut full = c.point.clone();
+            full.resize(parent_arity, Ef::ZERO);
+            let (low, high) = full.split_at(batch.arity);
+            let point = low.to_vec();
+            let pos = groups[loc.batch].len();
+            if loc.chunk_bits == 0 {
+                groups[loc.batch].push((loc.table, point, Some(c.value)));
+            } else {
+                let mut weight = Ef::ONE;
+                for (b, &rb) in high.iter().enumerate() {
+                    weight = weight * if ((loc.chunk_index >> b) & 1) == 1 {
+                        rb
+                    } else {
+                        Ef::ONE - rb
+                    };
+                }
+                groups[loc.batch].push((loc.table, point, None));
+                parts.push((loc.batch, pos, weight));
+            }
+        }
+        if !parts.is_empty() {
+            checks.push((leaf_index, parts));
         }
     }
-    Some(groups)
+    Some(WeightGrouping { groups, checks })
 }
 
 fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &TrustedExecution, aux: &[AuxDescriptor])
@@ -12549,22 +12674,39 @@ pub fn prove_committed_shard_dag_bound(
     } else {
         prover_leaves
     };
-    let groups = group_reverse_weights(model, ops, &leaves)?;
-    let mut weight_openings = Vec::with_capacity(groups.len());
-    for (bi, entries) in groups.iter().enumerate() {
+    let grouping = group_reverse_weights(model, ops, &leaves)?;
+    let mut weight_openings = Vec::with_capacity(grouping.groups.len());
+    // S9 2d: split sub-tables share one parent tensor. Materialize each
+    // parent once per proof instead of once per chunk (16x less I/O for a
+    // 2^28 tensor); proof bytes are unaffected.
+    let mut weight_parents: std::collections::BTreeMap<T, Arc<Vec<Goldilocks>>> =
+        std::collections::BTreeMap::new();
+    for (bi, entries) in grouping.groups.iter().enumerate() {
         let table_idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
         let points: Vec<Vec<Ef>> = entries.iter().map(|e| e.1.clone()).collect();
-        let claimed: Vec<Ef> = entries.iter().map(|e| e.2).collect();
         if entries.is_empty() {
-            weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: None });
+            weight_openings.push(WeightBatchOpening { table_idxs, points, claimed: Vec::new(), proof: None });
             continue;
         }
         let cw = &cached[bi];
         let t_mat = std::time::Instant::now();
+        let chunk_len = 1usize << cw.arity;
+        let chunk_off = cw.chunk_index.checked_shl(cw.arity as u32)?;
         let mut tensors: Vec<Vec<Goldilocks>> = cw.table_ids.iter().map(|&id| {
-            let mut v = store.materialize(id).into_owned();
-            v.resize(1usize << cw.arity, Goldilocks::ZERO);
+            let full = weight_parents.entry(id)
+                .or_insert_with(|| Arc::new(store.materialize(id).into_owned()));
+            let mut v = vec![Goldilocks::ZERO; chunk_len];
+            if let Some(src) = full.get(chunk_off..) {
+                let n = src.len().min(chunk_len);
+                v[..n].copy_from_slice(&src[..n]);
+            }
             v
+        }).collect();
+        // Split sub-claims are opened at their proof-provided values; the
+        // verifier later checks the public weighted sum back to the leaf.
+        let claimed: Vec<Ef> = entries.iter().map(|e| match e.2 {
+            Some(v) => v,
+            None => ef_eval(&tensors[e.0], &e.1),
         }).collect();
         let refs: Vec<&[Goldilocks]> = tensors.iter().map(Vec::as_slice).collect();
         let mat_ms = t_mat.elapsed().as_secs_f64() * 1e3;
@@ -12816,6 +12958,11 @@ pub fn verify_committed_shard_dag_bound(
     // S9 2c: verifier-enforced opening/budget caps. Both are derived from the
     // verified proof structure, never from a proof-declared parameter.
     let budget = match proof_budget(proof) { Some(b) => b, None => return false };
+    if std::env::var("ZKIE_S9_BUDGET_LOG").ok().as_deref() == Some("1") {
+        eprintln!("S9-budget openings={} weighted={} security={} required={}",
+            budget.openings, budget.weighted, VERIFIER_SECURITY,
+            90 + ceil_log2(budget.openings.max(1)));
+    }
     if budget.weighted > MAX_WEIGHTED_ROUNDS || budget.openings > MAX_PROOF_OPENINGS {
         return false;
     }
@@ -12881,13 +13028,20 @@ pub fn verify_committed_shard_dag_bound(
             if ef_eval(&vals, &c.point) != c.value { return false; }
         }
     }
-    let groups = match group_reverse_weights(model, ops, &leaves) { Some(g) => g, None => return false };
-    if proof.weight_openings.len() != groups.len() { return false; }
-    for (bi, (opening, entries)) in proof.weight_openings.iter().zip(&groups).enumerate() {
+    let grouping = match group_reverse_weights(model, ops, &leaves) { Some(g) => g, None => return false };
+    if proof.weight_openings.len() != grouping.groups.len() { return false; }
+    for (bi, (opening, entries)) in proof.weight_openings.iter().zip(&grouping.groups).enumerate() {
         let idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
         let points: Vec<Vec<Ef>> = entries.iter().map(|e| e.1.clone()).collect();
-        let values: Vec<Ef> = entries.iter().map(|e| e.2).collect();
-        if opening.table_idxs != idxs || opening.points != points || opening.claimed != values { return false; }
+        if opening.table_idxs != idxs || opening.points != points || opening.claimed.len() != points.len() { return false; }
+        // Unsplit claims are verifier-derived and must match exactly. Split
+        // sub-claim values are proof-provided; they are authenticated by the
+        // PCS opening below and tied to the original leaf by `checks`.
+        for (pos, entry) in entries.iter().enumerate() {
+            if let Some(v) = entry.2 {
+                if opening.claimed[pos] != v { return false; }
+            }
+        }
         match (&opening.proof, entries.is_empty()) {
             (None, true) => {},
             (Some(p), false) => {
@@ -12896,10 +13050,20 @@ pub fn verify_committed_shard_dag_bound(
                     Some(w) => w, None => return false,
                 };
                 let protocol = whir.batch_opening_protocol(batch.num_tables, batch.arity);
-                if !verify_batch_open_committed_ef(&whir, &batch.commitment, &protocol, batch.num_tables, &idxs, &points, &values, p) { return false; }
+                if !verify_batch_open_committed_ef(&whir, &batch.commitment, &protocol, batch.num_tables, &idxs, &points, &opening.claimed, p) { return false; }
             }
             _ => return false,
         }
+    }
+    // S9 2d split reassembly: f(r) = Σ_h eq(r_high, bits(h))·f_h(r_low),
+    // where the f_h(r_low) are the PCS-authenticated sub-claim openings and
+    // the weights are recomputed here from the public claim point.
+    for (leaf_index, parts) in &grouping.checks {
+        let mut sum = Ef::ZERO;
+        for &(bi, pos, weight) in parts {
+            sum = sum + weight * proof.weight_openings[bi].claimed[pos];
+        }
+        if sum != leaves[*leaf_index].value { return false; }
     }
     // S6 (bound): per-Argmax individual selector openings at the
     // per-position points derived from the PUBLIC argmax outputs. The
@@ -21946,6 +22110,66 @@ mod tests {
         );
         assert!(verify_committed_shard_dag_bound_bytes(
             &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// S9 2d: the sub-table split math must reassemble the original MLE:
+    /// f(r) = Σ_h eq(r_high, h)·f_h(r_low). Uses 16 tiny (2^5) chunks with
+    /// chunk_bits = 4 standing in for 2^24 chunks of a 2^28 tensor; only the
+    /// grouping/weights are exercised (no PCS proving).
+    #[test]
+    fn s9_weight_subtable_split_grouping_reassembles_mle() {
+        let id = 1usize;
+        let ops = vec![Op::MatMul { a: 0, b: id, c: 2, m: 1, k: 1, n: 512 }];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 0);
+        let mut trusted = Vec::new();
+        for h in 0..16usize {
+            let data = vec![Goldilocks::ZERO; 32];
+            let refs: [&[Goldilocks]; 1] = [data.as_slice()];
+            let (commitment, _, _, _) = whir.commit_batch(&refs);
+            trusted.push(TrustedWeightBatch {
+                commitment, arity: 5, num_tables: 1, num_vars: 5,
+                security: VERIFIER_SECURITY, pow_bits: 0,
+                table_ids: vec![id], tensor_lengths: vec![512],
+                chunk_bits: 4, chunk_index: h,
+            });
+        }
+        let mut lengths = std::collections::BTreeMap::new();
+        lengths.insert(0usize, 1usize);
+        lengths.insert(id, 512usize);
+        lengths.insert(2usize, 512usize);
+        let model = TrustedModelManifest {
+            batches: trusted,
+            graph: bincode::serialize(&ops).unwrap(),
+            tensor_lengths: lengths,
+            lookup_roots: Default::default(),
+            lookup_lengths: Default::default(),
+            identity_tables: Default::default(),
+        };
+        let mut rng = XorShift64::new(0x5B17);
+        let f: Vec<Goldilocks> = (0..512).map(|_| rng.field()).collect();
+        let r: Vec<Ef> = (0..9).map(|_| rng.ef_field()).collect();
+        let value = ef_eval(&f, &r);
+        let leaves = vec![EfClaim { tensor_id: id, point: r.clone(), value }];
+        let grouping = group_reverse_weights(&model, &ops, &leaves).expect("16-chunk grouping");
+        assert_eq!(grouping.groups.len(), 16);
+        assert_eq!(grouping.checks.len(), 1);
+        let mut sum = Ef::ZERO;
+        for &(bi, pos, weight) in &grouping.checks[0].1 {
+            assert!(grouping.groups[bi][pos].2.is_none());
+            let low = &grouping.groups[bi][pos].1;
+            assert_eq!(low.as_slice(), &r[..5]);
+            let h = model.batches[bi].chunk_index;
+            let chunk = &f[h * 32..(h + 1) * 32];
+            sum = sum + weight * ef_eval(chunk, low);
+        }
+        assert_eq!(sum, value, "split reassembly must equal the full MLE");
+        // Missing / duplicate chunks are rejected by the manifest checks.
+        let mut missing = model.clone();
+        missing.batches.pop();
+        assert!(trusted_weight_locations(&missing, &ops).is_none());
+        let mut duplicate = model.clone();
+        duplicate.batches[1].chunk_index = 0;
+        assert!(trusted_weight_locations(&duplicate, &ops).is_none());
     }
 
     /// S8 fixture: the 25-bit GeluIndex path (GeluIndexXRange aux).
