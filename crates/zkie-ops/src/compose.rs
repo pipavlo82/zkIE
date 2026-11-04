@@ -103,7 +103,18 @@ const MAX_AUX_DESCRIPTORS: usize = 1 << 20;
 const MAX_REVERSE_STEP_OUTPUTS: usize = 64;
 /// Verifier policy: every WHIR instance reconstructed while checking a proof
 /// uses at least this security level, independent of any proof-supplied value.
-const VERIFIER_SECURITY: usize = 90;
+///
+/// S9 2c: the union bound over `K` openings requires per-opening security
+/// `90 + ceil(log2 K)`. The protocol provisions 96 bits, i.e. K ≤ 64 under
+/// the 90-bit whole-protocol target; `MAX_PROOF_OPENINGS` is the hard wire
+/// cap and the verifier additionally rejects any proof whose actual opening
+/// count exceeds what the provisioned security covers.
+const VERIFIER_SECURITY: usize = 96;
+/// S9 2c: hard cap on WHIR openings verified per proof.
+const MAX_PROOF_OPENINGS: usize = 1 << 12;
+/// S9 2c: aggregate outer-reduction budget `W = Σ(r·d + c) ≤ 2^26`; with EF
+/// challenges (|EF| ≈ 2^128) this bounds the outer error by 2^-102.
+const MAX_WEIGHTED_ROUNDS: u128 = 1u128 << 26;
 
 /// Bounded bincode decode with the legacy (fixint, trailing-bytes-allowed)
 /// format. The byte cap is checked before deserialization and enforced by
@@ -320,8 +331,8 @@ fn prepare_static_lookup_commits(
         }
         let values = pad_lookup_table(store.get(tid));
         let arity = values.len().trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let committed = zkie_core::pcs::committed::commit(&whir, &values);
         if bincode::serialize(&committed.commitment).ok()?
             != bincode::serialize(model.lookup_roots.get(&tid)?).ok()?
@@ -918,8 +929,8 @@ fn prepare_topk_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
             _ => return None,
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role, len, arity, columns: count, commitment };
@@ -956,8 +967,8 @@ fn prepare_topk_range_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>>
             }
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role, len, arity, columns: count, commitment };
@@ -997,8 +1008,8 @@ fn prepare_topk_thr_range_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedA
             }
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role, len, arity, columns: count, commitment };
@@ -1290,8 +1301,8 @@ fn prepare_topk_tie_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
             columns[tie_tb_prev_col(b_bits)][pos] = tb_col[(pos + padded - 1) % padded];
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role, len, arity, columns: count, commitment };
@@ -2425,8 +2436,8 @@ fn prepare_scatter_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
             _ => return None,
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role, len, arity, columns: count, commitment };
@@ -4046,8 +4057,8 @@ fn prepare_projection_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>>
             for j in 0..count { columns[j][i] = Goldilocks::from_u64(((n as u64) >> j) & 1); }
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role: AuxRole::ProjectionBits, len, arity, columns: count, commitment };
@@ -4093,8 +4104,8 @@ fn prepare_scale_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest) ->
             for j in 0..count { columns[j][i] = Goldilocks::from_u64(((rem as u64) >> j) & 1); }
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role: AuxRole::ScaleRemainder, len, arity, columns: count, commitment };
@@ -4167,8 +4178,8 @@ fn prepare_scale_vec_remainder_aux(store: &Store, ops: &[Op], model: &TrustedMod
             }
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor {
@@ -4271,8 +4282,8 @@ fn prepare_argmax_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
             }
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role: AuxRole::ArgmaxWitness, len, arity, columns: count, commitment };
@@ -4315,8 +4326,8 @@ fn prepare_expert_routing_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedA
             columns[e][pos] = Goldilocks::ONE;
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role: AuxRole::ExpertRouting, len, arity, columns: count, commitment };
@@ -4358,8 +4369,8 @@ fn prepare_gather_routing_aux(store: &Store, ops: &[Op], model: &TrustedModelMan
             columns[t][pos] = Goldilocks::ONE;
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role: AuxRole::GatherRouting, len, arity, columns: count, commitment };
@@ -4419,8 +4430,8 @@ fn prepare_lookup_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest) -
             _ => return None,
         }
         let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         prepared.push(PreparedAux { descriptor: AuxDescriptor { op_index, role, len, arity, columns: count, commitment }, columns, prover_data, protocol, whir });
@@ -4470,8 +4481,8 @@ fn prepare_lookup_group_aux(store: &Store, ops: &[Op], model: &TrustedModelManif
             }
         }
         let vars = padded.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: [&[Goldilocks]; 1] = [m.as_slice()];
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         prepared.push(PreparedAux {
@@ -4521,8 +4532,8 @@ fn build_gelu_range_aux(xs: &[Goldilocks], op_index: usize, len: usize, arity: u
         }
     }
     let vars = GELU_XRANGE_BITS.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-    let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+    let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
     let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
     let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
     Some(PreparedAux {
@@ -4787,13 +4798,13 @@ fn prove_lookup_groups(
             &[identity.final_evals[1], t_num])?;
         let (table_opening, opened) = match cached {
             Some((_, committed)) => {
-                let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90,
-                    zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90));
+                let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY,
+                    zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY));
                 whir.open_ef(committed.prover_data.clone(), &committed.protocol, &t_den_point)
             }
             None => {
-                let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
-                let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+                let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+                let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
                 let committed = zkie_core::pcs::committed::commit(&whir, table_values);
                 if bincode::serialize(&committed.commitment).ok()?
                     != bincode::serialize(model.lookup_roots.get(&tid)?).ok()? { return None; }
@@ -5051,8 +5062,8 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
         None
     } else if let Some((values, committed)) = store.static_table_commits.get(&table_id) {
         let arity = values.len().trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let (opening, opened) = whir.open_ef(committed.prover_data.clone(), &committed.protocol, &t_den_point);
         if opened != table_eval { return None; }
         Some(opening)
@@ -5062,8 +5073,8 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
         store.o7_table_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
         let arity = table_values.len().trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let committed = zkie_core::pcs::committed::commit(&whir, table_values);
         if bincode::serialize(model.lookup_roots.get(&table_id)?).ok()? != bincode::serialize(&committed.commitment).ok()? { return None; }
         let (opening, opened) = whir.open_ef(committed.prover_data, &committed.protocol, &t_den_point);
@@ -5291,8 +5302,8 @@ fn prove_reverse_relu(input: &[Goldilocks], point: &[Ef], value: Ef,
     }
     if ef_eval(&output_values, point) != value { return None; }
     let num_vars = bits.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
-    let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
+    let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
     let refs: Vec<&[Goldilocks]> = bit_cols.iter().map(Vec::as_slice).collect();
     let (commitment, prover_data, protocol, batch_whir) = whir.commit_batch(&refs);
     transcript.absorb(b"zkie-relu-bits-v1");
@@ -9916,7 +9927,7 @@ pub fn verify_committed_cross_bind(
     if proof.openings.len() != claims.len() {
         return false;
     }
-    let whir = match zkie_core::pcs::whir::Whir::try_with_params(committed.arity, 90, 17) {
+    let whir = match zkie_core::pcs::whir::Whir::try_with_params(committed.arity, VERIFIER_SECURITY, 17) {
         Some(w) => w, None => return false,
     };
     let protocol = whir.opening_protocol(committed.arity, 1);
@@ -10150,8 +10161,8 @@ impl TrustedModelManifest {
             } else {
                     let padded = pad_lookup_table(table);
                     let arity = padded.len().trailing_zeros() as usize;
-                    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
-                    let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+                    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+                    let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
                     lookup_roots.insert(id, zkie_core::pcs::committed::commit(&whir, &padded).commitment);
             }
         }
@@ -10208,7 +10219,7 @@ impl TrustedModelManifest {
         }
         let mut locations = std::collections::BTreeMap::new();
         for (bi, (trusted, supplied)) in self.batches.iter().zip(&proof.weight_batches).enumerate() {
-            if trusted.security < 90 || trusted.table_ids.len() != trusted.num_tables
+            if trusted.security < VERIFIER_SECURITY || trusted.table_ids.len() != trusted.num_tables
                 || trusted.tensor_lengths.len() != trusted.num_tables
                 || trusted.arity != supplied.arity || trusted.num_tables != supplied.num_tables
                 || trusted.num_vars != supplied.whir.num_variables
@@ -10236,7 +10247,7 @@ pub fn commit_model_weights(
 ) -> Vec<CachedWeightBatch> {
     // Borrowed from feature/batch-pcs: 90-bit security + pow_bits=17 (enough for
     // packed codewords up to 2^26), instead of the low-security testing params.
-    const SECURITY: usize = 90;
+    const SECURITY: usize = VERIFIER_SECURITY;
 
     let weight_tensors = collect_weight_tensors(ops);
     let mut by_size: std::collections::BTreeMap<usize, Vec<(T, Vec<Goldilocks>, usize)>> =
@@ -10282,7 +10293,8 @@ pub fn commit_model_weights(
             let num_vars = batch_whir.num_variables();
             let table_ids: Vec<T> = ids.iter().map(|(t, _, _)| *t).collect();
             let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
-                "weight-a{arity}-g{}.bin",
+                "weight-a{arity}-s{}-g{}.bin",
+                SECURITY,
                 batches.len()
             ));
             let file = std::fs::File::create(&cache_path).expect("create weight cache");
@@ -10549,7 +10561,7 @@ fn prove_committed_shard_dag_inner(
     let mut cross_binds = Vec::with_capacity(boundary_tensors.len());
     for &t in &boundary_tensors {
         let arity = store.get(t).len().trailing_zeros() as usize;
-        let bw = zkie_core::pcs::whir::Whir::with_params(arity, 90, 17);
+        let bw = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, 17);
         let committed = zkie_core::pcs::committed::commit(&bw, store.get(t));
         let mut claims = Vec::new();
         for shard_cs in &shard_claims {
@@ -10724,8 +10736,8 @@ fn prove_committed_shard_dag_inner(
                 }
                 let table_pad = pad_lookup_table(raw_table);
                 let arity = table_pad.len().trailing_zeros() as usize;
-                let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
-                let bw = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow_bits);
+                let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+                let bw = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow_bits);
                 global_table_commits.insert(
                     tc.table,
                     (arity, zkie_core::pcs::committed::commit(&bw, &table_pad)),
@@ -10763,8 +10775,8 @@ fn prove_committed_shard_dag_inner(
             }
             let total_slots = cols.len() * (1usize << arity);
             let num_vars = total_slots.next_power_of_two().trailing_zeros() as usize;
-            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
-            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow_bits);
+            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
+            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow_bits);
             let num_tables = cols.len();
             let (cx, px, prx, wx) = base_whir.commit_batch(&xs);
             let (cy, py, pry, wy) = base_whir.commit_batch(&ys);
@@ -10792,8 +10804,8 @@ fn prove_committed_shard_dag_inner(
             for (j, &v) in tc.m.iter().enumerate() {
                 m_pad[j] = Goldilocks::from_u64(v);
             }
-            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
-            let bw = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow_bits);
+            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+            let bw = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow_bits);
             t_arity.push(arity);
             t_cm.push(zkie_core::pcs::committed::commit(&bw, &m_pad));
         }
@@ -10880,24 +10892,24 @@ fn prove_committed_shard_dag_inner(
     for g in &witness_groups {
         let total_slots = g.cols.len() * (1usize << g.arity);
         let num_vars = total_slots.next_power_of_two().trailing_zeros() as usize;
-        let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
+        let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
         witness_batches.push(WitnessBatchCommit {
             commitment: g.x_ctx.commitment.clone(),
             arity: g.arity,
             num_tables: g.cols.len(),
-            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, 90, pow_bits),
+            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, VERIFIER_SECURITY, pow_bits),
         });
         witness_batches.push(WitnessBatchCommit {
             commitment: g.y_ctx.commitment.clone(),
             arity: g.arity,
             num_tables: g.cols.len(),
-            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, 90, pow_bits),
+            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, VERIFIER_SECURITY, pow_bits),
         });
         witness_batches.push(WitnessBatchCommit {
             commitment: g.num_ctx.commitment.clone(),
             arity: g.arity,
             num_tables: g.cols.len(),
-            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, 90, pow_bits),
+            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, VERIFIER_SECURITY, pow_bits),
         });
     }
 
@@ -11052,8 +11064,8 @@ fn prove_committed_shard_dag_inner(
     for (si, shard) in shards.iter_mut().enumerate() {
         for (i, tc) in shard.table_columns.iter_mut().enumerate() {
             let (point, num_leaf, den_point, _den_leaf) = fractional_leaf(&tc.proof);
-            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(t_arities[si][i], 90);
-            let bw = zkie_core::pcs::whir::Whir::with_params(t_arities[si][i], 90, pow_bits);
+            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(t_arities[si][i], VERIFIER_SECURITY);
+            let bw = zkie_core::pcs::whir::Whir::with_params(t_arities[si][i], VERIFIER_SECURITY, pow_bits);
             let (open, ev) = bw.open(t_cms[si][i].prover_data.clone(), &t_cms[si][i].protocol, &point);
             assert_eq!(ev, num_leaf);
             let is_ident = identity_tables.contains(&tc.table);
@@ -11063,8 +11075,8 @@ fn prove_committed_shard_dag_inner(
                 let (table_arity, table_committed) = &global_table_commits[&tc.table];
                 let table_bw = zkie_core::pcs::whir::Whir::with_params(
                     *table_arity,
-                    90,
-                    zkie_core::pcs::whir::Whir::required_pow_bits(*table_arity, 90),
+                    VERIFIER_SECURITY,
+                    zkie_core::pcs::whir::Whir::required_pow_bits(*table_arity, VERIFIER_SECURITY),
                 );
                 let (open_table, ev_table) = table_bw.open(
                     table_committed.prover_data.clone(),
@@ -11117,8 +11129,8 @@ fn prove_committed_shard_dag_inner(
                 let arity = total.trailing_zeros() as usize;
                 let mut sel_pad = vec![Goldilocks::ZERO; total];
                 sel_pad[..sel_vec.len()].copy_from_slice(sel_vec);
-                let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
-                let bw = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow_bits);
+                let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+                let bw = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow_bits);
                 let c = zkie_core::pcs::committed::commit(&bw, &sel_pad);
                 let out_vals = &store.idx[*out_t];
                 let mut points = Vec::new();
@@ -11235,8 +11247,8 @@ fn prove_committed_shard_dag_inner(
             }
             let num_tables = ops_.len();
             let num_vars = (num_tables * total).next_power_of_two().trailing_zeros() as usize;
-            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
-            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow_bits);
+            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
+            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow_bits);
             let a_refs: Vec<&[Goldilocks]> = a_cols.iter().map(|v| v.as_slice()).collect();
             let b_refs: Vec<&[Goldilocks]> = b_cols.iter().map(|v| v.as_slice()).collect();
             let num_refs: Vec<&[Goldilocks]> = num_cols.iter().map(|v| v.as_slice()).collect();
@@ -11280,13 +11292,13 @@ fn prove_committed_shard_dag_inner(
 
     for g in &perm_groups {
         let num_vars = (g.ops.len() * (1usize << g.arity)).next_power_of_two().trailing_zeros() as usize;
-        let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
+        let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
         for ctx in [&g.a_ctx, &g.b_ctx, &g.num_ctx] {
             perm_batches.push(ColumnBatchCommit {
                 commitment: ctx.commitment.clone(),
                 arity: g.arity,
                 num_tables: g.ops.len(),
-                whir: zkie_core::pcs::whir::WhirParams::new(num_vars, 90, pow_bits),
+                whir: zkie_core::pcs::whir::WhirParams::new(num_vars, VERIFIER_SECURITY, pow_bits),
             });
         }
     }
@@ -11452,8 +11464,8 @@ fn prove_committed_shard_dag_inner(
             }
             let num_tables = ops_.len();
             let num_vars = (num_tables * (1usize << arity)).next_power_of_two().trailing_zeros() as usize;
-            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
-            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow_bits);
+            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
+            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow_bits);
             let refs: Vec<&[Goldilocks]> = cols.iter().map(|v| v.as_slice()).collect();
             let (c, p, pr, w) = base_whir.commit_batch(&refs);
             gather_groups.push(GatherGroup { arity, ty, ops: ops_, cols, ctx: zkie_core::pcs::committed::BatchCtx { commitment: c, prover_data: p, protocol: pr, whir: w, num_tables } });
@@ -11541,8 +11553,8 @@ fn prove_committed_shard_dag_inner(
             }
             let num_tables = ops_.len();
             let num_vars = (num_tables * (1usize << arity)).next_power_of_two().trailing_zeros() as usize;
-            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
-            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow_bits);
+            let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
+            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow_bits);
             let refs: Vec<&[Goldilocks]> = cols.iter().map(|v| v.as_slice()).collect();
             let (c, p, pr, w) = base_whir.commit_batch(&refs);
             gather_groups.push(GatherGroup { arity, ty, ops: ops_, cols, ctx: zkie_core::pcs::committed::BatchCtx { commitment: c, prover_data: p, protocol: pr, whir: w, num_tables } });
@@ -11557,12 +11569,12 @@ fn prove_committed_shard_dag_inner(
     // Record verifier-side batches (8 groups, in the same order).
     for g in &gather_groups {
         let num_vars = (g.ops.len() * (1usize << g.arity)).next_power_of_two().trailing_zeros() as usize;
-        let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
+        let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
         gather_batches.push(ColumnBatchCommit {
             commitment: g.ctx.commitment.clone(),
             arity: g.arity,
             num_tables: g.ops.len(),
-            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, 90, pow_bits),
+            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, VERIFIER_SECURITY, pow_bits),
         });
     }
 
@@ -12239,7 +12251,7 @@ fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<
     let expected: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
     let mut locations = std::collections::BTreeMap::new();
     for (bi, batch) in model.batches.iter().enumerate() {
-        if batch.security < 90 || batch.table_ids.len() != batch.num_tables || batch.tensor_lengths.len() != batch.num_tables { return None; }
+        if batch.security < VERIFIER_SECURITY || batch.table_ids.len() != batch.num_tables || batch.tensor_lengths.len() != batch.num_tables { return None; }
         for (ti, (&id, &len)) in batch.table_ids.iter().zip(&batch.tensor_lengths).enumerate() {
             if model.tensor_lengths.get(&id) != Some(&len) || len == 0 || len.checked_next_power_of_two()?.max(32).trailing_zeros() as usize != batch.arity
                 || locations.insert(id, (bi, ti)).is_some() { return None; }
@@ -12353,10 +12365,10 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
     let aux_ctx = |auxp: &PreparedAux| -> Option<zkie_core::pcs::committed::BatchCtx> {
         let arity = auxp.descriptor.arity;
         let vars = auxp.descriptor.columns.checked_mul(1usize << arity)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
         // commit_batch returns a whir sized for the BATCH variable count
         // (vars); the opening must use the same sizing.
-        let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+        let whir = zkie_core::pcs::whir::Whir::with_params(vars, VERIFIER_SECURITY, pow);
         let protocol = whir.batch_opening_protocol(auxp.descriptor.columns, arity);
         Some(zkie_core::pcs::committed::BatchCtx {
             commitment: auxp.descriptor.commitment.clone(),
@@ -12391,7 +12403,12 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
             sel_openings.push(BoundSelOpening { points, claimed, opening });
         }
     }
-    let token_binding = (|| -> Option<BoundTokenBinding> {
+    // S9 2c: a Generic statement never consults the token binding, so the
+    // canonical Generic wire form omits it entirely (dead-field
+    // canonicalization); only LanguageModel statements produce one.
+    let token_binding = if !matches!(statement, PublicStatement::LanguageModel { .. }) {
+        None
+    } else { (|| -> Option<BoundTokenBinding> {
         let first_lookup = ops.iter().position(|op| matches!(op, Op::Lookup { .. }))?;
         let auxp = prepared.iter().find(|p| p.descriptor.op_index == first_lookup && p.descriptor.role == AuxRole::LookupPairs)?;
         let x_col = &auxp.columns[0];
@@ -12406,7 +12423,7 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
             &ctx.whir, &ctx.commitment, &ctx.protocol, ctx.num_tables, ctx.prover_data,
             &[0usize], vec![x_col.clone()], &[r.clone()], &[claimed]).ok()?;
         Some(BoundTokenBinding { point: r, claimed, opening })
-    })();
+    })() };
     Some((sel_openings, token_binding))
 }
 
@@ -12593,6 +12610,192 @@ pub fn prove_committed_shard_dag_bound(
     Some(BoundExecutionProof { aux, reverse, weight_openings, sel_openings, token_binding })
 }
 
+/// S9 2c verifier budget over the proof's randomized checks. Degrees are
+/// charged conservatively: every EF virtual/sumcheck round as degree 3,
+/// same_poly and batch sum-of-products as degree 2. `weighted` therefore
+/// upper-bounds `W = Σ(r·d + c)` for the whole proof; `openings` counts the
+/// WHIR openings the verifier will perform.
+#[derive(Default)]
+struct ProofBudget {
+    weighted: u128,
+    openings: usize,
+}
+
+impl ProofBudget {
+    fn add(&mut self, x: u128) -> Option<()> {
+        self.weighted = self.weighted.checked_add(x)?;
+        Some(())
+    }
+
+    fn virtual_proof(&mut self, p: &EfVirtualProof) -> Option<()> {
+        self.add(3u128.checked_mul(p.rounds.len() as u128)?)
+    }
+
+    fn sumcheck(&mut self, p: &efo::EfSumcheckProof) -> Option<()> {
+        self.add(2u128.checked_mul(p.rounds.len() as u128)?)
+    }
+
+    fn batch_sumcheck(&mut self, p: &zkie_core::common::ef_batch::EfSumcheckProofBatch) -> Option<()> {
+        self.add(2u128.checked_mul(p.rounds.len() as u128)?)
+    }
+
+    fn same_poly(&mut self, p: &EfSamePolyProof) -> Option<()> {
+        self.virtual_proof(&p.proof)?;
+        // Gamma batching of the claims carried by the merge (one MLE per
+        // final eval; the first is f itself).
+        self.add(p.proof.final_evals.len() as u128)
+    }
+
+    fn fractional(&mut self, f: &EfFractionalProof) -> Option<()> {
+        for layer in &f.layers {
+            self.virtual_proof(&layer.proof)?;
+            self.same_poly(&layer.num_merge)?;
+            self.same_poly(&layer.den_merge)?;
+            self.add(layer.s.len() as u128)?;
+            self.add(8)?;
+        }
+        Some(())
+    }
+
+    fn permutation(&mut self, p: &EfPermutationProof) -> Option<()> {
+        self.fractional(&p.a_side)?;
+        self.fractional(&p.b_side)?;
+        self.add((p.a.len() as u128).checked_add(p.b.len() as u128)?)
+    }
+
+    fn opening(&mut self, p: &EfBatchOpeningProof) -> Option<()> {
+        self.batch_sumcheck(&p.sumcheck)?;
+        self.openings = self.openings.checked_add(1)?;
+        Some(())
+    }
+
+    fn base_opening(&mut self) -> Option<()> {
+        self.openings = self.openings.checked_add(1)?;
+        Some(())
+    }
+}
+
+fn proof_budget(proof: &BoundExecutionProof) -> Option<ProofBudget> {
+    let mut b = ProofBudget::default();
+    for step in &proof.reverse.steps {
+        for out in &step.outputs {
+            if let Some(m) = &out.merge { b.same_poly(m)?; }
+        }
+        match &step.reduction {
+            ReverseReduction::MatMul { proof } => b.sumcheck(&proof.sumcheck)?,
+            ReverseReduction::Relu { proof } => {
+                b.virtual_proof(&proof.output)?;
+                b.virtual_proof(&proof.range)?;
+                b.opening(&proof.bit_opening)?;
+            }
+            ReverseReduction::Projection { proof } => {
+                b.sumcheck(&proof.matmul.sumcheck)?;
+                b.virtual_proof(&proof.booleanity)?;
+                b.opening(&proof.opening)?;
+            }
+            ReverseReduction::Lookup { proof } => {
+                b.fractional(&proof.witness)?;
+                b.fractional(&proof.table)?;
+                b.virtual_proof(&proof.padding)?;
+                b.opening(&proof.pairs_opening)?;
+                b.opening(&proof.multiplicity_opening)?;
+                if proof.table_opening.is_some() { b.base_opening()?; }
+            }
+            ReverseReduction::GeluIndex { proof } => {
+                for r in [&proof.upper, &proof.lower] {
+                    b.virtual_proof(&r.output)?;
+                    b.virtual_proof(&r.range)?;
+                    b.opening(&r.bit_opening)?;
+                }
+                b.virtual_proof(&proof.x_range)?;
+                b.opening(&proof.range_opening)?;
+            }
+            ReverseReduction::Scale { proof } => {
+                if let Some(v) = &proof.booleanity { b.virtual_proof(v)?; }
+                if let Some(o) = &proof.opening { b.opening(o)?; }
+            }
+            ReverseReduction::Argmax { proof } => {
+                for v in [&proof.sel_bool, &proof.bit_bool, &proof.row_sum, &proof.before_sum,
+                          &proof.out_sum, &proof.thr_sum, &proof.gate_rel, &proof.d1_rel,
+                          &proof.d2_rel] {
+                    b.virtual_proof(v)?;
+                }
+                b.opening(&proof.opening)?;
+            }
+            ReverseReduction::GatherMatMul { proof } => {
+                b.virtual_proof(&proof.matmul.sumcheck)?;
+                b.virtual_proof(&proof.routing)?;
+                b.opening(&proof.opening)?;
+            }
+            ReverseReduction::Gather { proof } => {
+                b.virtual_proof(&proof.routing)?;
+                b.virtual_proof(&proof.sum)?;
+                b.opening(&proof.opening)?;
+            }
+            ReverseReduction::TopKSelect { proof } => {
+                for v in [&proof.bools, &proof.row_sums, &proof.gate, &proof.d1, &proof.d2s,
+                          &proof.att_sel, &proof.att_gap, &proof.broadcast, &proof.x_range,
+                          &proof.thr_range, &proof.tie_zero, &proof.tie_bits, &proof.tie_rank,
+                          &proof.tie_row, &proof.tie_less] {
+                    b.virtual_proof(v)?;
+                }
+                for p in [&proof.perm_p, &proof.perm_t, &proof.perm_b] { b.permutation(p)?; }
+                b.opening(&proof.opening)?;
+                b.opening(&proof.thr_opening)?;
+                b.opening(&proof.range_opening)?;
+                b.opening(&proof.thr_range_opening)?;
+                b.opening(&proof.tie_opening)?;
+            }
+            ReverseReduction::Scatter { proof } => {
+                for v in [&proof.bools, &proof.mask_tok, &proof.mask_exp, &proof.counts,
+                          &proof.order_key_cons, &proof.order_key_bits, &proof.order_d_rel,
+                          &proof.order_asc] {
+                    b.virtual_proof(v)?;
+                }
+                b.permutation(&proof.perm)?;
+                b.opening(&proof.opening)?;
+                b.opening(&proof.order_opening)?;
+            }
+            ReverseReduction::BroadcastScale { proof } => {
+                b.virtual_proof(&proof.prod)?;
+                b.same_poly(&proof.bind)?;
+            }
+            ReverseReduction::ScaleVec { proof } => {
+                b.virtual_proof(&proof.prod)?;
+                b.same_poly(&proof.bind)?;
+            }
+            ReverseReduction::ScaleVecShifted { proof } => {
+                b.virtual_proof(&proof.prod)?;
+                b.same_poly(&proof.bind)?;
+                b.opening(&proof.opening)?;
+            }
+            ReverseReduction::LookupGroups { groups } => {
+                for g in groups {
+                    b.virtual_proof(&g.identity)?;
+                    b.opening(&g.aggregate_opening)?;
+                    b.fractional(&g.table)?;
+                    b.base_opening()?;
+                }
+            }
+            ReverseReduction::Add { .. }
+            | ReverseReduction::CombineIdx { .. }
+            | ReverseReduction::IdxBroadcast { .. }
+            | ReverseReduction::PadIdx { .. }
+            | ReverseReduction::Transpose => {}
+        }
+    }
+    for w in &proof.weight_openings {
+        if let Some(p) = &w.proof { b.opening(p)?; }
+    }
+    for s in &proof.sel_openings { b.opening(&s.opening)?; }
+    if let Some(t) = &proof.token_binding { b.opening(&t.opening)?; }
+    Some(b)
+}
+
+fn ceil_log2(n: usize) -> usize {
+    if n <= 1 { 0 } else { usize::BITS as usize - (n - 1).leading_zeros() as usize }
+}
+
 pub fn verify_committed_shard_dag_bound(
     ops: &[Op], ops_per_shard: usize,
     whir: &zkie_core::pcs::whir::Whir, proof: &BoundExecutionProof,
@@ -12610,6 +12813,22 @@ pub fn verify_committed_shard_dag_bound(
         return false;
     }
     if trusted_weight_locations(model, ops).is_none() { return false; }
+    // S9 2c: verifier-enforced opening/budget caps. Both are derived from the
+    // verified proof structure, never from a proof-declared parameter.
+    let budget = match proof_budget(proof) { Some(b) => b, None => return false };
+    if budget.weighted > MAX_WEIGHTED_ROUNDS || budget.openings > MAX_PROOF_OPENINGS {
+        return false;
+    }
+    // Union bound over K openings: each opening must carry at least
+    // 90 + ceil(log2 K) bits. The provisioned PCS security is fixed by the
+    // verifier policy, so a proof with more openings than it covers is
+    // rejected rather than silently degrading below the 90-bit target.
+    if VERIFIER_SECURITY < 90 + ceil_log2(budget.openings.max(1)) { return false; }
+    // Dead-field canonicalization: a Generic statement never consults the
+    // token binding, so a Generic proof must not carry one (S8 malleability).
+    if !matches!(statement, PublicStatement::LanguageModel { .. }) && proof.token_binding.is_some() {
+        return false;
+    }
     // S7b index-domain contract: every caller-authenticated index tensor holds
     // u32 values. The reverse relations for CombineIdx/IdxBroadcast are exact
     // over the Goldilocks field, so rejecting out-of-u32 public values keeps
@@ -13685,7 +13904,7 @@ mod tests {
         let x = store.push(vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)]);
         let out = store.push(vec![]);
         let ops = vec![Op::Scale { x, out, factor: 1, shift: 3 }];
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, vec![from_i64(-1), from_i64(0), from_i64(1), from_i64(2)])].into() };
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
@@ -13701,7 +13920,7 @@ mod tests {
         let x = store.push(vec![from_i64(-7), from_i64(-2), from_i64(3), from_i64(9)]);
         let out = store.push(vec![]);
         let ops = vec![Op::Scale { x, out, factor: 3, shift: 0 }];
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
         let expected: Vec<_> = [-21, -6, 9, 27].into_iter().map(from_i64).collect();
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
@@ -13721,7 +13940,7 @@ mod tests {
         let x = store.push(vec![from_i64(-13), from_i64(-12), from_i64(-4), from_i64(13)]);
         let out = store.push(vec![]);
         let ops = vec![Op::Scale { x, out, factor: 1, shift: 3 }];
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
         let expected: Vec<_> = [-2, -1, 0, 2].into_iter().map(from_i64).collect();
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
@@ -13752,7 +13971,7 @@ mod tests {
         let x = store.push(vec![from_i64(-5), from_i64(0), from_i64(7), from_i64(3)]);
         let out = store.push(vec![]);
         let ops = vec![Op::Scale { x, out, factor: 0, shift: 0 }];
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, vec![Goldilocks::ZERO; 4])].into() };
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
@@ -13786,8 +14005,8 @@ mod tests {
             let arity = 5usize;
             let count = columns.len();
             let vars = (count * 32).next_power_of_two().trailing_zeros() as usize;
-            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-            let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+            let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
             let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
             let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
             PreparedAux { descriptor: AuxDescriptor { op_index, role: AuxRole::ScaleRemainder, len, arity, columns: count, commitment }, columns, prover_data, protocol, whir }
@@ -13817,7 +14036,7 @@ mod tests {
         let x = store.push(vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)]);
         let out = store.push(vec![]);
         let ops = vec![Op::Scale { x, out, factor: -1, shift: 3 }];
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
         let expected: Vec<_> = [2, 1, 0, -1].into_iter().map(from_i64).collect();
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
@@ -14035,7 +14254,7 @@ mod tests {
         let d2 = store.push(vec![]);
         let out = store.push_idx(vec![]);
         let ops = vec![Op::Argmax { x, sel, thr, gate, d1, d2, out, m: 4, n: 8 }];
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let cache_dir = std::env::temp_dir().join("zkie-argmax-cache");
         let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         forward_ops(&mut store, &ops);
@@ -14193,7 +14412,7 @@ mod tests {
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
         let expected: Vec<_> = [0,4,1,5,2,6,3,7].into_iter().map(from_i64).collect();
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 2, &whir, &cache, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let mut bad = execution.clone();
@@ -14360,7 +14579,7 @@ mod tests {
             inputs: [(x, xv.clone())].into(),
             outputs: [(idx_key, idx_vals.clone())].into(),
         };
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
             &PublicStatement::Generic, &model, &execution).expect("2^24 GeluIndex bound proof");
         assert!(proof.aux.iter().any(|a| a.role == AuxRole::GeluIndexXRange));
@@ -14420,7 +14639,7 @@ mod tests {
             inputs: [(x, xv)].into(),
             outputs: [(out, store.get(out).to_vec())].into(),
         };
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
             &PublicStatement::Generic, &model, &execution).expect("GeluIndex->silu proof");
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
@@ -14445,8 +14664,8 @@ mod tests {
         // Lookup table with a well-formed commitment to a different column.
         let mut wrong_model = model;
         let zeros = vec![Goldilocks::ZERO; 32];
-        let wrong_whir = Whir::with_params(5, 90,
-            zkie_core::pcs::whir::Whir::required_pow_bits(5, 90));
+        let wrong_whir = Whir::with_params(5, VERIFIER_SECURITY,
+            zkie_core::pcs::whir::Whir::required_pow_bits(5, VERIFIER_SECURITY));
         let wrong = zkie_core::pcs::committed::commit(&wrong_whir, &zeros);
         wrong_model.lookup_roots.insert(t, wrong.commitment);
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
@@ -14478,7 +14697,7 @@ mod tests {
             inputs: [(x, xv), (s, sv)].into(),
             outputs: [(out, store.get(out).to_vec())].into(),
         };
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
             &PublicStatement::Generic, &model, &execution).expect("ScaleVec shift16 proof");
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
@@ -14580,7 +14799,7 @@ mod tests {
             Op::Projection { x: lookup, w, bias, out: p2, rem: r2, m: 2, k: 2, n: 2, shift: 1 },
             Op::Add { a: p2, b: x, c: out },
         ];
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let path = std::env::temp_dir().join("zkie-bound-gelu-chain");
         let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops).with_index_shapes(&[(idx, 4usize)].into());
@@ -14611,8 +14830,8 @@ mod tests {
             let arity = 5usize;
             let count = columns.len();
             let vars = (count * 32).next_power_of_two().trailing_zeros() as usize;
-            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-            let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+            let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
             let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
             let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
             PreparedAux { descriptor: AuxDescriptor { op_index, role, len, arity, columns: count, commitment }, columns, prover_data, protocol, whir }
@@ -14649,7 +14868,7 @@ mod tests {
             .with_index_shapes(&[(idx, 4usize)].into());
         let index_key = TensorKey::Index(idx).encoded().unwrap();
         let execution = TrustedExecution { inputs: [(index_key, vec![from_i64(1), from_i64(0), from_i64(3), from_i64(2)])].into(), outputs: [(out, vec![from_i64(3), from_i64(7), from_i64(5), from_i64(9)])].into() };
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let mut wrong_namespace = execution.clone();
@@ -14721,7 +14940,7 @@ mod tests {
         let ops = vec![Op::MatMul { a: x, b: w, c, m: 2, k: 2, n: 2 }];
         let token = store.push_idx(vec![]);
         let argmax = store.push_idx(vec![]);
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let cache_a_path = std::env::temp_dir().join("zkie-manifest-model-a");
         let cache_a = commit_model_weights(&store, &ops, cache_a_path.to_str().unwrap());
         let trusted_a = TrustedModelManifest::from_offline_commitment(&cache_a, &store.owned_slices(), &ops);
@@ -14754,7 +14973,7 @@ mod tests {
             let x = store.push(values.clone());
             let out = store.push(vec![]);
             let ops = vec![Op::Relu { x, out }];
-            let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+            let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
             let cache = Vec::new();
             let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
             let output: Vec<_> = values.iter().map(|&v| from_i64(to_i64(v).max(0))).collect();
@@ -14788,7 +15007,7 @@ mod tests {
         let out = store.push(vec![]);
         let rem = store.push(vec![]);
         let ops = vec![Op::Projection { x, w, bias, out, rem, m: 2, k: 2, n: 2, shift: 3 }];
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let path = std::env::temp_dir().join("zkie-bound-projection-rounding");
         let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
@@ -14816,7 +15035,7 @@ mod tests {
             Op::Lookup { idx: idx1, out: out1, table: t },
             Op::Lookup { idx: idx2, out: out2, table: t },
         ];
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let path = std::env::temp_dir().join("zkie-o7-same-table");
         let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops)
@@ -14882,8 +15101,8 @@ mod tests {
         let count = columns.len();
         let padded = 1usize << arity;
         let vars = count.checked_mul(padded).unwrap().checked_next_power_of_two().unwrap().trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         PreparedAux { descriptor: AuxDescriptor { op_index, role, len, arity, columns: count, commitment }, columns, prover_data, protocol, whir }
@@ -14914,7 +15133,7 @@ mod tests {
             inputs: [(k1, g1), (k2, g2)].into(),
             outputs: [(out1, store.get(out1).to_vec()), (out2, store.get(out2).to_vec())].into(),
         };
-        O7bFixture { store, ops, model, execution, whir: zkie_core::pcs::whir::Whir::with_params(5, 90, 17), cache }
+        O7bFixture { store, ops, model, execution, whir: zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17), cache }
     }
 
     fn o7b_prepared(f: &O7bFixture) -> Vec<PreparedAux> {
@@ -14967,8 +15186,8 @@ mod tests {
         // Well-formed commitment to an all-zero M column.
         let m_desc = proof.aux.iter().find(|a| a.role == AuxRole::LookupMultiplicityAgg).unwrap().clone();
         let padded = 1usize << m_desc.arity;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(m_desc.arity, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(m_desc.arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(m_desc.arity, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(m_desc.arity, VERIFIER_SECURITY, pow);
         let wrong = zkie_core::pcs::committed::commit(&whir, &vec![Goldilocks::ZERO; padded]);
         let mut swapped = proof;
         let agg = swapped.aux.iter_mut().find(|a| a.role == AuxRole::LookupMultiplicityAgg).unwrap();
@@ -15121,7 +15340,7 @@ mod tests {
         let out = store.push(vec![]);
         let rem = store.push(vec![]);
         let ops = vec![Op::Projection { x, w, bias, out, rem, m: 2, k: 2, n: 2, shift: 3 }];
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let path = std::env::temp_dir().join("zkie-o6-projection-cache");
         let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
@@ -15154,7 +15373,7 @@ mod tests {
         let ops = vec![Op::Projection { x, w, bias, out, rem, m: 2, k: 2, n: 2, shift: 3 }];
         let token = store.push_idx(vec![]);
         let argmax = store.push_idx(vec![]);
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let path = std::env::temp_dir().join("zkie-bound-projection");
         let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
@@ -15187,7 +15406,7 @@ mod tests {
         let ops = vec![Op::Add { a, b, c: z }, Op::MatMul { a: z, b: w, c: out, m: 2, k: 2, n: 2 }];
         let token = store.push_idx(vec![]);
         let argmax = store.push_idx(vec![]);
-        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
         let path = std::env::temp_dir().join("zkie-bound-chain");
         let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
         let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
@@ -15496,7 +15715,7 @@ mod tests {
         let out = store.push(vec![]);
         let rem = store.push(vec![]);
         let ops = vec![Op::Projection { x, w, bias: b, out, rem, m, k, n, shift }];
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let cache_dir = std::env::temp_dir().join("zkie-s2-cache");
         let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         assert!(!cached.is_empty());
@@ -15542,7 +15761,7 @@ mod tests {
             Op::Projection { x, w, bias: b, out, rem, m, k, n, shift },
             Op::Lookup { idx, out: act, table },
         ];
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let cache_dir = std::env::temp_dir().join("zkie-s2-cache2");
         let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         forward_ops(&mut store, &ops);
@@ -15602,7 +15821,7 @@ mod tests {
             Op::Projection { x, w, bias: b, out, rem, m, k, n, shift },
             Op::Lookup { idx, out: act, table },
         ];
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let cache_dir = std::env::temp_dir().join("zkie-s2-cache3");
         let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         forward_ops(&mut store, &ops);
@@ -15621,8 +15840,8 @@ mod tests {
         // itself, so the moved (internally consistent) opening must reject.
         let padded = pad_lookup_table(store.get(table));
         let arity = padded.len().trailing_zeros() as usize;
-        let pow = Whir::required_pow_bits(arity, 90);
-        let table_whir = Whir::with_params(arity, 90, pow);
+        let pow = Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+        let table_whir = Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let commitment = commit(&table_whir, &padded);
         let p_new: Vec<Ef> = (0..arity).map(|_| rng.ef_field()).collect();
         let (open_new, ev_new) = table_whir.open_ef(commitment.prover_data.clone(), &commitment.protocol, &p_new);
@@ -16690,12 +16909,19 @@ mod tests {
             &whir,
             &PublicStatement::Generic, &model, &execution
         ));
-        // Under Generic the token binding is not consulted: tampering its
-        // claimed value must NOT affect verification...
+        // S9 2c: a Generic proof canonically carries NO token binding, and an
+        // injected one is rejected outright (dead-field canonicalization),
+        // before any opening is examined.
         let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
-        forged.token_binding.as_mut().unwrap().claimed += Goldilocks::ONE;
+        assert!(forged.token_binding.is_none());
+        let dummy_opening = forged.sel_openings.first().map(|s| s.opening.clone())
+            .or_else(|| forged.weight_openings.iter().find_map(|w| w.proof.clone()));
+        let dummy_opening = match dummy_opening { Some(o) => o, None => return };
+        forged.token_binding = Some(BoundTokenBinding {
+            point: Vec::new(), claimed: Ef::ONE, opening: dummy_opening,
+        });
         let forged_bytes = bincode::serialize(&forged).unwrap();
-        assert!(verify_committed_shard_dag_bound_bytes(
+        assert!(!verify_committed_shard_dag_bound_bytes(
             &forged_bytes,
             &ops,
             1,
@@ -16739,7 +16965,7 @@ mod tests {
             Op::Projection { x, w, bias: b, out, rem, m, k, n, shift },
             Op::Lookup { idx, out: act, table },
         ];
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let cache_dir = std::env::temp_dir().join("zkie-s2-cache5");
         let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         forward_ops(&mut store, &ops);
@@ -16796,7 +17022,7 @@ mod tests {
             Op::Projection { x, w, bias: b, out, rem, m, k, n, shift },
             Op::Lookup { idx, out: act, table },
         ];
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let cache_dir = std::env::temp_dir().join("zkie-s2-cache9");
         let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         forward_ops(&mut store, &ops);
@@ -17948,8 +18174,8 @@ mod tests {
         let count = columns.len();
         let padded = 1usize << arity;
         let vars = (count * padded).next_power_of_two().trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         PreparedAux {
@@ -19895,7 +20121,7 @@ mod tests {
         let w = store.push((0..k * n).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
         let out = store.push(vec![]);
         let ops = vec![Op::MatMul { a: x, b: w, c: out, m, k, n }];
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let cache_dir = std::env::temp_dir().join("zkie-s2-cache7");
         let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         assert!(!cached.is_empty());
@@ -19951,7 +20177,7 @@ mod tests {
             Op::Projection { x, w: w1, bias: b1, out: mid, rem: rem1, m, k, n: 8, shift },
             Op::Projection { x: mid, w: w2, bias: b2, out, rem: rem2, m, k, n: 16, shift },
         ];
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let cache_dir = std::env::temp_dir().join("zkie-s2-cache8");
         let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         assert!(cached.len() >= 2);
@@ -21701,6 +21927,27 @@ mod tests {
         (ops, whir, model, execution, bytes)
     }
 
+    /// S9 2c: the honest fixture's proof is inside both verifier caps, and
+    /// its opening count is covered by the provisioned per-opening security.
+    #[test]
+    fn s9_budget_caps_cover_honest_fixture() {
+        assert_eq!(ceil_log2(1), 0);
+        assert_eq!(ceil_log2(64), 6);
+        assert_eq!(ceil_log2(65), 7);
+        let (ops, whir, model, execution, bytes) = s8_bound_fixture(0x5903);
+        let proof: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let b = proof_budget(&proof).expect("budget traversal");
+        assert!(b.weighted <= MAX_WEIGHTED_ROUNDS, "W={}", b.weighted);
+        assert!(b.openings > 0, "honest proof must perform openings");
+        assert!(
+            b.openings <= 1usize << (VERIFIER_SECURITY - 90),
+            "K={} exceeds the provisioned per-opening security",
+            b.openings
+        );
+        assert!(verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+    }
+
     /// S8 fixture: the 25-bit GeluIndex path (GeluIndexXRange aux).
     fn s8_gelu_fixture()
         -> (Vec<Op>, zkie_core::pcs::whir::Whir, TrustedModelManifest, TrustedExecution, Vec<u8>)
@@ -21722,7 +21969,7 @@ mod tests {
             inputs: [(x, xv)].into(),
             outputs: [(idx_key, idx_vals)].into(),
         };
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
             &PublicStatement::Generic, &model, &execution).expect("S8 Gelu fixture proof");
         let bytes = bincode::serialize(&proof).unwrap();
@@ -21750,7 +21997,7 @@ mod tests {
             inputs: [(x, xv), (s, sv)].into(),
             outputs: [(out, store.get(out).to_vec())].into(),
         };
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
             &PublicStatement::Generic, &model, &execution).expect("S8 ScaleVec fixture proof");
         let bytes = bincode::serialize(&proof).unwrap();
@@ -21834,7 +22081,7 @@ mod tests {
             Op::Projection { x: lookup, w, bias, out: p2, rem: r2, m: 2, k: 2, n: 2, shift: 1 },
             Op::Add { a: p2, b: x, c: out },
         ];
-        let whir = Whir::with_params(5, 90, 17);
+        let whir = Whir::with_params(5, VERIFIER_SECURITY, 17);
         let cached = commit_model_weights(&store, &ops,
             &format!("/tmp/zkie-s8-proj-chain-{}", std::process::id()));
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)

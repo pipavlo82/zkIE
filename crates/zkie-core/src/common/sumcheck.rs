@@ -724,7 +724,7 @@ pub fn prove_virtual(
     (VirtualProof { rounds, final_evals }, challenges)
 }
 
-fn interpolate(vals: &[Goldilocks], x: Goldilocks, d: usize) -> Goldilocks {
+pub(crate) fn interpolate(vals: &[Goldilocks], x: Goldilocks, d: usize) -> Goldilocks {
     let mut out = Goldilocks::ZERO;
     for k in 0..=d {
         let mut term = vals[k];

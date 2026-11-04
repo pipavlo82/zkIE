@@ -24,7 +24,7 @@
 
 use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
 use crate::common::fixed_point::from_i64;
-use crate::common::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
+use crate::common::same_poly::{merged_eval_from_proof, prove_same_poly, verify_same_poly, SamePolyProof};
 use crate::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
 use crate::common::transcript::Transcript;
 
@@ -417,14 +417,31 @@ pub fn fractional_leaf(
     proof: &FractionalProof,
 ) -> (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks) {
     match proof.layers.last() {
-        Some(layer) => (
-            layer.num_merge.merged_point.clone(),
-            // S4: prover-side — the merged value is the honest sumcheck's
-            // final eval of the tensor column (f(r*)), not a stored field.
-            layer.num_merge.proof.final_evals[0],
-            layer.den_merge.merged_point.clone(),
-            layer.den_merge.proof.final_evals[0],
-        ),
+        Some(layer) => {
+            let fe = &layer.proof.final_evals;
+            // S9 2c: merge final evals are canonically zero on the wire, so
+            // recover the merged leaf values from the merge sum-check and
+            // the recorded challenge vector (prover-side only).
+            let (num_leaf, den_leaf) = if fe.len() == 6 {
+                let mut p0 = layer.s.clone(); p0.push(Goldilocks::ZERO);
+                let mut p1 = layer.s.clone(); p1.push(Goldilocks::ONE);
+                let num = merged_eval_from_proof(
+                    &layer.num_merge, &[(p0.clone(), fe[2]), (p1.clone(), fe[3])],
+                ).unwrap_or(Goldilocks::ZERO);
+                let den = merged_eval_from_proof(
+                    &layer.den_merge, &[(p0, fe[4]), (p1, fe[5])],
+                ).unwrap_or(Goldilocks::ZERO);
+                (num, den)
+            } else {
+                (Goldilocks::ZERO, Goldilocks::ZERO)
+            };
+            (
+                layer.num_merge.merged_point.clone(),
+                num_leaf,
+                layer.den_merge.merged_point.clone(),
+                den_leaf,
+            )
+        }
         // Unreachable for valid proofs (S3: the domain has >= 2 entries).
         None => (Vec::new(), Goldilocks::ZERO, Vec::new(), Goldilocks::ZERO),
     }

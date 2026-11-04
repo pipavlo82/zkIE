@@ -67,9 +67,52 @@ pub fn prove_same_poly(
     for e in &eqs {
         mles.push(e.as_slice());
     }
-    let (proof, merged_point) = prove_virtual(&mles, &terms, claimed, transcript);
+    let (mut proof, merged_point) = prove_virtual(&mles, &terms, claimed, transcript);
     let merged_eval = proof.final_evals[0];
+    // S9 2c dead-field canonicalization: `verify_same_poly` derives the
+    // merged value from the sumcheck and the closed-form W(r*), never from
+    // these stored evaluations. Emit them as zero so the wire form has one
+    // valid encoding; the verifier rejects any non-zero value.
+    for fe in proof.final_evals.iter_mut() { *fe = Goldilocks::ZERO; }
     (SamePolyProof { gamma, proof, merged_point }, merged_eval)
+}
+
+/// S9 2c prover-side helper: recover the merged evaluation from a
+/// `SamePolyProof` whose stored final evaluations are canonically zero.
+/// Replays the virtual sum-check at the recorded challenge vector
+/// (`merged_point`) and applies the closed-form `W(r*)^{-1}` exactly like the
+/// verifier. The verifier itself must use [`verify_same_poly`]; this helper
+/// exists only because the LogUp prover consumes the merged leaf value after
+/// proving.
+pub fn merged_eval_from_proof(
+    proof: &SamePolyProof,
+    claims: &[(Vec<Goldilocks>, Goldilocks)],
+) -> Option<Goldilocks> {
+    if claims.is_empty() || proof.proof.rounds.len() != proof.merged_point.len() {
+        return None;
+    }
+    let mut coeffs = Vec::with_capacity(claims.len());
+    let mut acc = Goldilocks::ONE;
+    for _ in claims {
+        coeffs.push(acc);
+        acc = acc * proof.gamma;
+    }
+    let mut claimed = Goldilocks::ZERO;
+    for (i, (_, y_i)) in claims.iter().enumerate() {
+        claimed = claimed + coeffs[i] * *y_i;
+    }
+    let mut current = claimed;
+    for (pvals, &r) in proof.proof.rounds.iter().zip(&proof.merged_point) {
+        if pvals.len() != 3 || pvals[0] + pvals[1] != current {
+            return None;
+        }
+        current = crate::common::sumcheck::interpolate(pvals, r, 2);
+    }
+    let mut w = Goldilocks::ZERO;
+    for (i, (r_i, _)) in claims.iter().enumerate() {
+        w = w + coeffs[i] * crate::common::mle::eq_poly(r_i, &proof.merged_point);
+    }
+    if w == Goldilocks::ZERO { None } else { Some(current * w.inverse()) }
 }
 
 /// Verify the S4 merge argument and return the ONE authenticated output
@@ -103,6 +146,12 @@ pub fn verify_same_poly(
     }
     if gamma == Goldilocks::ZERO || gamma == Goldilocks::ONE {
         return None; // degenerate powers: the batch equation loses soundness
+    }
+    // S9 2c dead-field canonicalization: the stored final evaluations are
+    // not consulted by this verifier, so only the canonical all-zero form is
+    // accepted (S8 found they could otherwise be mutated freely).
+    if proof.proof.final_evals.iter().any(|&v| v != Goldilocks::ZERO) {
+        return None;
     }
     let mut coeffs = Vec::with_capacity(claims.len());
     let mut acc = Goldilocks::ONE;
@@ -384,5 +433,29 @@ mod tests {
         assert!(got.is_some());
         let (r_star, v) = got.unwrap();
         assert_eq!(v, crate::common::mle::eval(&f, &r_star));
+    }
+
+    /// S9 2c: the stored final evaluations are a dead field in this verifier,
+    /// so the prover emits the canonical all-zero form and any non-zero value
+    /// is rejected (S8 dead-field malleability).
+    #[test]
+    fn s9_nonzero_final_evals_rejected() {
+        let mut rng = XorShift64::new(0x5902);
+        let t = 6usize;
+        let n = 1usize << t;
+        let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let claims: Vec<(Vec<Goldilocks>, Goldilocks)> = (0..3)
+            .map(|_| {
+                let r_i: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
+                let y_i = crate::common::mle::eval(&f, &r_i);
+                (r_i, y_i)
+            })
+            .collect();
+        let mut tp = sp_transcript(0x5902);
+        let (mut proof, _merged_eval) = prove_same_poly(&f, &claims, &mut tp);
+        assert!(proof.proof.final_evals.iter().all(|&v| v == Goldilocks::ZERO));
+        proof.proof.final_evals[0] = Goldilocks::ONE;
+        let mut tv = sp_transcript(0x5902);
+        assert!(verify_same_poly(&proof, &claims, &mut tv).is_none());
     }
 }

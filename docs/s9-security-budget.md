@@ -402,6 +402,50 @@ Verification: `cargo test -p zkie-core --release` 88 passed / 1 ignored;
 canonicalization and the real A/B/D/C before/after measurements remain for
 2b-2c/2b-2d.
 
+## 9f. Step 2b-2c status — verifier caps and dead-field canonicalization
+
+Sub-step 2c makes the S9 budget verifier-enforced and removes the remaining
+wire malleability.
+
+- `ProofBudget` walks the verified proof structure and accumulates an upper
+  bound on `W = Σ(r·d + c)`: every EF virtual/sumcheck round is charged at
+  degree 3, same-poly and batch sum-of-products at degree 2, fractional trees
+  per layer (including both merges and their batching), permutations on both
+  sides, and each opening's sum-of-products rounds. `verify_committed_shard_
+  dag_bound` rejects `W > 2^26` and `openings > 2^12` before any challenging
+  or PCS work beyond the structural caps.
+- Per-opening security: the protocol's WHIR instances are provisioned at
+  `VERIFIER_SECURITY = 96` (= 90 + ceil(log2 64)); the verifier additionally
+  requires `security ≥ 90 + ceil(log2 K)` for the proof's actual opening
+  count `K`. A proof therefore needs `K ≤ 64` under the current provisioning;
+  the `2^12` hard cap bounds decoder/PCS work, and statements with more
+  openings fail closed instead of degrading below 90 bits. Raising the
+  provisioned constant to 102 would cover the full 2^12 cap at higher PoW.
+- All protocol-side WHIR constructions (aux, weight commit, table, selector,
+  token) use the same 96-bit constant; the weight-cache filename includes
+  the security so a 90-bit cache can never be reused with a 96-bit manifest.
+- Dead-field canonicalization:
+  - base `SamePolyProof` stored final evaluations are not consulted by the
+    verifier; the prover now emits them as zero and `verify_same_poly`
+    rejects any non-zero value. The prover-side `fractional_leaf` helper
+    recovers LogUp leaf values from the merge sum-check and the recorded
+    challenge vector instead of the dead field.
+  - under a `Generic` statement the token binding is never consulted; the
+    prover omits it and the verifier rejects any proof that carries one.
+  - EF `EfSamePolyProof` needs no change: `ef_outer::verify_virtual` already
+    binds `final_evals` into the checked virtual identity, so the field is
+    consumed rather than dead.
+
+Verification: `cargo test -p zkie-ops --release` 176 passed / 0 failed (all
+S1–S8 negatives and S8 fuzz included with the caps active; the new
+`s9_budget_caps_cover_honest_fixture` asserts the honest fixture is inside
+both caps and inside the provisioned security); `cargo test -p
+zkie-core --release` 88 passed / 1 ignored, plus the `same_poly` suite
+10/10 including the new `s9_nonzero_final_evals_rejected`;
+`cargo check --workspace --release` clean. Because WHIR security changed
+90→96, all proof bytes change; the new baseline and EF cost measurements
+are step 2d.
+
 ## 10. Acceptance status
 
 Step 1 delivers only this inventory and budget. The S9 acceptance items
