@@ -22629,6 +22629,311 @@ mod tests {
         (ops, whir, model, execution, bytes)
     }
 
+    /// S8 fixture: the 25-bit GeluIndex path (GeluIndexXRange aux).
+    fn s8_gelu_fixture()
+        -> (Vec<Op>, zkie_core::pcs::whir::Whir, TrustedModelManifest, TrustedExecution, Vec<u8>)
+    {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = [0i64, (1 << 23) - 1, -(1 << 23), 1 << 22, -(1 << 22), 1, -1, 2]
+            .into_iter().map(from_i64).collect();
+        let x = store.push(xv.clone());
+        let idx = store.push_idx(vec![]);
+        let ops = vec![Op::GeluIndex { x, out: idx, offset: 1 << 23, table_len: 1 << 24 }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, 8usize)].into());
+        let idx_key = TensorKey::Index(idx).encoded().unwrap();
+        let idx_vals: Vec<Goldilocks> = store.idx[idx].iter()
+            .map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(x, xv)].into(),
+            outputs: [(idx_key, idx_vals)].into(),
+        };
+        let whir = Whir::with_params(5, 90, 17);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("S8 Gelu fixture proof");
+        let bytes = bincode::serialize(&proof).unwrap();
+        (ops, whir, model, execution, bytes)
+    }
+
+    /// S8 fixture: the ScaleVec shift-16 path (ScaleVecRemainder aux).
+    fn s8_scalevec_fixture()
+        -> (Vec<Op>, zkie_core::pcs::whir::Whir, TrustedModelManifest, TrustedExecution, Vec<u8>)
+    {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let mut xv: Vec<i64> = (0..32).map(|i| i as i64 - 16).collect();
+        xv[1] = 1; // exact tie with scale[1] = 2^15
+        let xv: Vec<Goldilocks> = xv.into_iter().map(from_i64).collect();
+        let sv: Vec<Goldilocks> = vec![from_i64(65536), from_i64(32768), from_i64(1), from_i64(3)];
+        let x = store.push(xv.clone());
+        let s = store.push(sv.clone());
+        let out = store.push(vec![]);
+        store.push((0..(1usize << 16)).map(|i| Goldilocks::from_u64(i as u64)).collect());
+        let ops = vec![Op::ScaleVec { x, scale: s, out, shift: 16 }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(x, xv), (s, sv)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let whir = Whir::with_params(5, 90, 17);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("S8 ScaleVec fixture proof");
+        let bytes = bincode::serialize(&proof).unwrap();
+        (ops, whir, model, execution, bytes)
+    }
+
+    /// S8 fixture: TopKSelect/Scatter/CombineIdx/dynamic-Lookup/
+    /// BroadcastScale/Gather gate-consistency chain.
+    fn s8_gate_chain_fixture()
+        -> (Vec<Op>, zkie_core::pcs::whir::Whir, TrustedModelManifest, TrustedExecution, Vec<u8>)
+    {
+        use zkie_core::pcs::whir::Whir;
+        let (m, n, k, h) = (4usize, 8usize, 2usize, 4usize);
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
+        let dv: Vec<Goldilocks> = (0..m * k * h).map(|i| from_i64(((i * 5) % 11) as i64 - 5)).collect();
+        let (thr_v, _sel_v, gate_v, d1_v, d2_v) = topk_forward(&xv, m, n, k);
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let token_id = store.push_idx(vec![]);
+        let expert_of = store.push_idx(vec![]);
+        let idx = store.push_idx(vec![]);
+        let gate_pos = store.push(vec![]);
+        let d = store.push(dv.clone());
+        let weighted = store.push(vec![]);
+        let out = store.push(vec![]);
+        let ops = vec![
+            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k },
+            Op::Scatter { sel, token_id, expert_of, m, n },
+            Op::CombineIdx { a: token_id, b: expert_of, scale: n, out: idx },
+            Op::Lookup { idx, out: gate_pos, table: gate },
+            Op::BroadcastScale { x: d, scale: gate_pos, out: weighted, h },
+            Op::Gather { weighted, token_id, gate: gate_pos, out, m, h },
+        ];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops,
+            &format!("/tmp/zkie-s8-gate-chain-{}", std::process::id()));
+        forward_ops(&mut store, &ops);
+        let s = store.idx[token_id].len();
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(token_id, s), (expert_of, s), (idx, s)].into());
+        let execution = TrustedExecution {
+            inputs: [(x, xv), (d, dv)].into(),
+            outputs: [
+                (thr, thr_v), (gate, gate_v), (d1, d1_v), (d2, d2_v),
+                (out, store.get(out).to_vec()),
+            ].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("S8 gate-chain fixture proof");
+        let bytes = bincode::serialize(&proof).unwrap();
+        (ops, whir, model, execution, bytes)
+    }
+
+    /// S8 fixture: Projection -> GeluIndex(small) -> Lookup -> Projection -> Add.
+    fn s8_projection_gelu_fixture()
+        -> (Vec<Op>, zkie_core::pcs::whir::Whir, TrustedModelManifest, TrustedExecution, Vec<u8>)
+    {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let xv = vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)];
+        let x = store.push(xv.clone());
+        let w = store.push(vec![from_i64(1), from_i64(0), from_i64(0), from_i64(1)]);
+        let bias = store.push(vec![Goldilocks::ZERO; 4]);
+        let p1 = store.push(vec![]);
+        let r1 = store.push(vec![]);
+        let table = store.push(vec![from_i64(1), from_i64(3), from_i64(5), from_i64(7)]);
+        let lookup = store.push(vec![]);
+        let p2 = store.push(vec![]);
+        let r2 = store.push(vec![]);
+        let out = store.push(vec![]);
+        let idx = store.push_idx(vec![]);
+        let ops = vec![
+            Op::Projection { x, w, bias, out: p1, rem: r1, m: 2, k: 2, n: 2, shift: 3 },
+            Op::GeluIndex { x: p1, out: idx, offset: 2, table_len: 4 },
+            Op::Lookup { idx, out: lookup, table },
+            Op::Projection { x: lookup, w, bias, out: p2, rem: r2, m: 2, k: 2, n: 2, shift: 1 },
+            Op::Add { a: p2, b: x, c: out },
+        ];
+        let whir = Whir::with_params(5, 90, 17);
+        let cached = commit_model_weights(&store, &ops,
+            &format!("/tmp/zkie-s8-proj-chain-{}", std::process::id()));
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, 4usize)].into());
+        let execution = TrustedExecution {
+            inputs: [(x, xv)].into(),
+            outputs: [(out, vec![from_i64(-10), from_i64(-1), from_i64(8), from_i64(16)])].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("S8 projection/gelu fixture proof");
+        let bytes = bincode::serialize(&proof).unwrap();
+        (ops, whir, model, execution, bytes)
+    }
+
+    /// S8 basic fuzz: sampled byte overwrites and truncations of honest
+    /// proofs. Some mutations are harmless (e.g. unused trailing bytes) and
+    /// may still verify; the property under test is that no input panics.
+    /// Returns `(decodable_mutations, accepted_mutations)` so the test can
+    /// prove the corpus actually reaches the verifier rather than only the
+    /// decoder's error path.
+    fn s8_fuzz_bytes<F: Fn(&[u8]) -> bool>(
+        label: &str,
+        bytes: &[u8],
+        decodes: impl Fn(&[u8]) -> bool,
+        verify: F,
+    ) -> (usize, usize) {
+        let mut decodable = 0usize;
+        let mut accepted = 0usize;
+        let step = (bytes.len() / 256).max(1);
+        let mut off = 0;
+        while off < bytes.len() {
+            for v in [1u8, 0x80, 0xff] {
+                let mut b = bytes.to_vec();
+                b[off] ^= v; // always changes the byte (no no-op mutations)
+                if decodes(&b) { decodable += 1; }
+                let ok = s8_catch_verify(
+                    &format!("{label} byte {off} ^= {v:#x}"), || verify(&b));
+                if ok { accepted += 1; }
+            }
+            off += step;
+        }
+        for k in 0..=16 {
+            let cut = bytes.len() * k / 16;
+            let b = &bytes[..cut];
+            if decodes(b) { decodable += 1; }
+            let ok = s8_catch_verify(
+                &format!("{label} truncated at {cut}"), || verify(b));
+            if ok { accepted += 1; }
+        }
+        (decodable, accepted)
+    }
+
+    fn s8_decodes_bound(b: &[u8]) -> bool {
+        decode_proof_limited::<BoundExecutionProof>(b).is_some()
+    }
+
+    fn s8_fuzz_bound_fixture(
+        label: &str,
+        bytes: &[u8],
+        ops: &[Op],
+        whir: &zkie_core::pcs::whir::Whir,
+        model: &TrustedModelManifest,
+        execution: &TrustedExecution,
+    ) -> (usize, usize) {
+        s8_fuzz_bytes(label, bytes, s8_decodes_bound, |b| {
+            verify_committed_shard_dag_bound_bytes(
+                b, ops, 1, whir, &PublicStatement::Generic, model, execution)
+        })
+    }
+
+    #[test]
+    fn s8_sampled_byte_mutations_do_not_panic() {
+        let mut total_decodable = 0usize;
+        let mut run = |label: &str, bytes: &[u8], ops: &[Op],
+                       whir: &zkie_core::pcs::whir::Whir,
+                       model: &TrustedModelManifest, execution: &TrustedExecution| {
+            let (d, a) = s8_fuzz_bound_fixture(label, bytes, ops, whir, model, execution);
+            eprintln!("S8 fuzz {label}: decodable={d} accepted={a}");
+            assert!(d > 0, "{label}: fuzz corpus never reached the verifier");
+            total_decodable += d;
+        };
+        let (ops, whir, model, execution, bytes) = s8_bound_fixture(0x5803);
+        run("gather-matmul", &bytes, &ops, &whir, &model, &execution);
+        let (ops, whir, model, execution, bytes) = s8_gelu_fixture();
+        run("gelu-xrange", &bytes, &ops, &whir, &model, &execution);
+        let (ops, whir, model, execution, bytes) = s8_scalevec_fixture();
+        run("scalevec-remainder", &bytes, &ops, &whir, &model, &execution);
+        let mut f = o7b_two_lookup_fixture("s8-fuzz");
+        let proof = o7b_bound_proof(&mut f);
+        let bytes = bincode::serialize(&proof).unwrap();
+        run("lookup-groups", &bytes, &f.ops, &f.whir, &f.model, &f.execution);
+        let (ops, whir, model, execution, bytes) = s8_gate_chain_fixture();
+        run("gate-chain", &bytes, &ops, &whir, &model, &execution);
+        let (ops, whir, model, execution, bytes) = s8_projection_gelu_fixture();
+        run("projection-gelu", &bytes, &ops, &whir, &model, &execution);
+        assert!(total_decodable > 0);
+    }
+
+    #[test]
+    fn s8_gelu_and_scalevec_aux_mutations_reject_without_panic() {
+        let (ops, whir, model, execution, bytes) = s8_gelu_fixture();
+        let check_gelu = |what: &str, p: &BoundExecutionProof| {
+            let b = bincode::serialize(p).unwrap();
+            let ok = s8_catch_verify(what, || {
+                verify_committed_shard_dag_bound_bytes(
+                    &b, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution)
+            });
+            assert!(!ok, "{what} must be rejected");
+        };
+        let decode = || bincode::deserialize::<BoundExecutionProof>(&bytes).unwrap();
+        let mut p = decode();
+        for step in &mut p.reverse.steps {
+            if let ReverseReduction::GeluIndex { proof } = &mut step.reduction {
+                proof.x_range.final_evals.clear();
+            }
+        }
+        check_gelu("empty GeluIndex x-range evals", &p);
+        let mut p = decode();
+        for step in &mut p.reverse.steps {
+            if let ReverseReduction::GeluIndex { proof } = &mut step.reduction {
+                proof.range_aux_values.clear();
+            }
+        }
+        check_gelu("empty GeluIndex range aux values", &p);
+        let mut p = decode();
+        for a in &mut p.aux {
+            if a.role == AuxRole::GeluIndexXRange { a.columns = 0; }
+        }
+        check_gelu("zero GeluIndex range columns", &p);
+        let mut p = decode();
+        for a in &mut p.aux {
+            if a.role == AuxRole::GeluIndexXRange { a.arity = usize::MAX; }
+        }
+        check_gelu("overflowing GeluIndex range arity", &p);
+
+        let (ops, whir, model, execution, bytes) = s8_scalevec_fixture();
+        let check_sv = |what: &str, p: &BoundExecutionProof| {
+            let b = bincode::serialize(p).unwrap();
+            let ok = s8_catch_verify(what, || {
+                verify_committed_shard_dag_bound_bytes(
+                    &b, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution)
+            });
+            assert!(!ok, "{what} must be rejected");
+        };
+        let decode = || bincode::deserialize::<BoundExecutionProof>(&bytes).unwrap();
+        let mut p = decode();
+        for step in &mut p.reverse.steps {
+            if let ReverseReduction::ScaleVecShifted { proof } = &mut step.reduction {
+                proof.remainder_bits.clear();
+            }
+        }
+        check_sv("empty ScaleVec remainder bits", &p);
+        let mut p = decode();
+        for step in &mut p.reverse.steps {
+            if let ReverseReduction::ScaleVecShifted { proof } = &mut step.reduction {
+                proof.prod.final_evals.clear();
+            }
+        }
+        check_sv("empty ScaleVec product evals", &p);
+        let mut p = decode();
+        for a in &mut p.aux {
+            if a.role == AuxRole::ScaleVecRemainder { a.columns = 0; }
+        }
+        check_sv("zero ScaleVec remainder columns", &p);
+        let mut p = decode();
+        for a in &mut p.aux {
+            if a.role == AuxRole::ScaleVecRemainder { a.arity = usize::MAX; }
+        }
+        check_sv("overflowing ScaleVec remainder arity", &p);
+    }
+
     #[test]
     fn s8_bound_bytes_truncation_and_oversized_headers_reject_without_panic() {
         let (ops, whir, model, execution, bytes) = s8_bound_fixture(0x5801);
