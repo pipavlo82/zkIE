@@ -2684,6 +2684,11 @@ enum ReverseReduction {
     /// S7c: out = x * scale[i % s] (shift 0 only).
     ScaleVec { proof: ReverseScaleVecProof },
     Transpose,
+    /// Deep O7 (b): trailing sentinel step (empty outputs) carrying the shared
+    /// static-lookup group proofs. It is materialized only when a static
+    /// lookup group exists, so no-static-group proofs keep their exact
+    /// pre-(b) wire bytes.
+    LookupGroups { groups: Vec<LookupGroupProof> },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3587,7 +3592,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -3602,16 +3607,93 @@ struct AuxDescriptor {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseLookupProof {
     witness: FractionalProof,
+    /// Per-op table-side fractional proof (ungrouped paths). Grouped static
+    /// lookups share one table-side tree at the group level; their per-op
+    /// value is an empty placeholder (`layers.is_empty()`), kept as a plain
+    /// field so ungrouped lookup bytes are unchanged by step (b).
     table: FractionalProof,
     output_index: Goldilocks,
     witness_index: Goldilocks,
     witness_value: Goldilocks,
+    /// Ungrouped: the table-side numerator leaf. Grouped: this op's
+    /// multiplicity evaluation at the group identity challenge point.
     multiplicity: Goldilocks,
     table_value: Goldilocks,
     padding: VirtualProof,
     pairs_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    /// Ungrouped: opens the per-op multiplicity at [table num leaf, padding].
+    /// Grouped: opens this op's multiplicity at [group identity point,
+    /// padding].
     multiplicity_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
     table_opening: Option<zkie_core::pcs::whir::Proof>,
+}
+
+/// Deep O7 (b): per-group shared proof data, in ascending trusted-id order.
+/// The group `identity` is the virtual eq*(M - sum_i m_i) = 0 sumcheck; the
+/// `aggregate_opening` opens the committed M column at the identity point and
+/// at the shared table-side numerator leaf point; `table` is the one table
+/// fraction tree of the group (numerator M, common alpha/beta). Per-op
+/// witness trees remain in each Lookup reverse step.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LookupGroupProof {
+    table_id: T,
+    members: Vec<usize>,
+    identity: VirtualProof,
+    aggregate_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    table: FractionalProof,
+}
+
+/// Prover-side group context: the per-op proofs need the common alpha/beta,
+/// the identity challenge point and each member's multiplicity eval there,
+/// plus the shared table leaf point/eval and the (step (b)) per-member copy of
+/// the group table opening. Step (c) collapses the latter to one opening.
+struct LookupGroupProveCtx {
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    members: Vec<usize>,
+    identity_point: Vec<Goldilocks>,
+    member_evals: Vec<Goldilocks>,
+    table_den_point: Vec<Goldilocks>,
+    table_den: Goldilocks,
+    table_eval: Goldilocks,
+    table_final_num: Goldilocks,
+    table_final_den: Goldilocks,
+    table_opening: zkie_core::pcs::whir::Proof,
+}
+
+/// Verifier-side group context. `table_eval` is filled from the per-op table
+/// openings (all members must agree) and `table_den` is checked against the
+/// group table leaf once it is known.
+struct LookupGroupVerifyCtx {
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    members: Vec<usize>,
+    identity_point: Vec<Goldilocks>,
+    member_evals: Vec<Goldilocks>,
+    table_den_point: Vec<Goldilocks>,
+    table_den: Goldilocks,
+    table_final_num: Goldilocks,
+    table_final_den: Goldilocks,
+    arity: usize,
+}
+
+struct LookupGroupMemberProve<'a> {
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    identity_point: &'a [Goldilocks],
+    member_eval: Goldilocks,
+    table_den_point: &'a [Goldilocks],
+    table_eval: Goldilocks,
+    table_opening: &'a zkie_core::pcs::whir::Proof,
+}
+
+struct LookupGroupMemberVerify<'a> {
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    identity_point: &'a [Goldilocks],
+    member_eval: Goldilocks,
+    table_den_point: &'a [Goldilocks],
+    arity: usize,
 }
 
 struct PreparedAux {
@@ -3964,6 +4046,60 @@ fn prepare_lookup_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest) -
     Some(prepared)
 }
 
+/// Deep O7 (b): structural spec of the aggregated multiplicity column of each
+/// static lookup group. One column per trusted table id, over the same padded
+/// table domain as the per-op multiplicity columns. It is an aux descriptor,
+/// so its commitment is absorbed by `execution_seeds` BEFORE the group alpha/
+/// beta and the reverse DAG (the M identity below is derived from it later).
+fn lookup_group_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, usize, usize, usize)>>
+{
+    let groups = static_lookup_groups(ops, model)?;
+    let mut specs = Vec::new();
+    for (tid, members) in groups {
+        let len = *model.lookup_lengths.get(&tid)?;
+        if len == 0 { return None; }
+        let padded = len.checked_next_power_of_two()?.max(32);
+        specs.push((members[0], len, padded.trailing_zeros() as usize, 1));
+    }
+    Some(specs)
+}
+
+fn prepare_lookup_group_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<PreparedAux>>
+{
+    let groups = static_lookup_groups(ops, model)?;
+    let written = op_field_writes(ops);
+    let mut prepared = Vec::new();
+    for (tid, members) in groups {
+        if written.contains(&tid) || model.identity_tables.contains_key(&tid) { return None; }
+        let table_len = *model.lookup_lengths.get(&tid)?;
+        if table_len == 0 { return None; }
+        let padded = table_len.checked_next_power_of_two()?.max(32);
+        let arity = padded.trailing_zeros() as usize;
+        let mut m = vec![Goldilocks::ZERO; padded];
+        for &oi in &members {
+            let idx = match &ops[oi] { Op::Lookup { idx, .. } => *idx, _ => return None };
+            let xs = store.idx.get(idx)?;
+            if !xs.len().is_power_of_two() { return None; }
+            for &x in xs {
+                if (x as usize) >= table_len { return None; }
+                m[x as usize] += Goldilocks::ONE;
+            }
+        }
+        let vars = padded.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let refs: [&[Goldilocks]; 1] = [m.as_slice()];
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        prepared.push(PreparedAux {
+            descriptor: AuxDescriptor { op_index: members[0], role: AuxRole::LookupMultiplicityAgg, len: table_len, arity, columns: 1, commitment },
+            columns: vec![m], prover_data, protocol, whir,
+        });
+    }
+    Some(prepared)
+}
+
 fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[AuxDescriptor]) -> bool {
     let specs = match projection_aux_specs(ops) { Some(v) => v, None => return false };
     let mut all: Vec<_> = specs.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ProjectionBits, len, arity, cols)).collect();
@@ -3972,6 +4108,10 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         None => return false,
     };
     match lookup_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
+    match lookup_group_aux_specs(ops, model) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::LookupMultiplicityAgg, len, arity, cols))),
+        None => return false,
+    };
     match argmax_aux_specs(ops) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ArgmaxWitness, len, arity, cols))),
         None => return false,
@@ -3989,7 +4129,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -4066,6 +4206,235 @@ fn lookup_index_eval(point: &[Goldilocks]) -> Goldilocks {
     point.iter().enumerate().fold(Goldilocks::ZERO, |v, (j, &p)| v + Goldilocks::from_u64(1u64 << j) * p)
 }
 
+/// Prover-side fraction-tree root (the same addition tree `prove_fractional`
+/// builds). Used only for local fail-closed consistency checks; the verifier
+/// always derives roots by replaying the proof.
+fn fraction_root(mut num: Vec<Goldilocks>, mut den: Vec<Goldilocks>) -> Option<(Goldilocks, Goldilocks)> {
+    if num.len() != den.len() || !num.len().is_power_of_two() || num.len() < 2 { return None; }
+    while num.len() > 1 {
+        let half = num.len() / 2;
+        let (nl, nh) = num.split_at(half);
+        let (dl, dh) = den.split_at(half);
+        let next_n: Vec<Goldilocks> = (0..half).map(|i| nl[i] * dh[i] + nh[i] * dl[i]).collect();
+        let next_d: Vec<Goldilocks> = (0..half).map(|i| dl[i] * dh[i]).collect();
+        num = next_n;
+        den = next_d;
+    }
+    Some((num[0], den[0]))
+}
+
+/// Virtual identity `eq(z,x) * (M(x) - sum_i m_i(x)) == 0` over the padded
+/// table domain. mles = [eq, M, m_0, ..., m_{k-1}].
+fn lookup_identity_terms(members: usize) -> Vec<(Goldilocks, Vec<usize>)> {
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let mut terms = vec![(Goldilocks::ONE, vec![0usize, 1])];
+    for i in 0..members { terms.push((neg, vec![0, i + 2])); }
+    terms
+}
+
+/// Deep O7 (b): group-side prover. Runs after `reverse_setup` and before the
+/// reverse op loop (the group alpha/beta were already derived before the DAG).
+/// Per group, in ascending trusted-id order:
+///   tag/id/members, z = field_vec(arity), identity virtual sumcheck,
+///   table tag, shared table fraction tree (numerator M, common alpha/beta),
+///   opening of M at [identity point, table numerator leaf].
+/// Returns the serialized group proofs plus the per-member context used by the
+/// Lookup steps (shared alpha/beta, identity point/eval, table leaf point/eval,
+/// and the step-(b) per-member table opening).
+fn prove_lookup_groups(
+    store: &Store,
+    ops: &[Op],
+    model: &TrustedModelManifest,
+    transcript: &mut Transcript,
+    aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>,
+    lookup_groups: &std::collections::BTreeMap<T, (Goldilocks, Goldilocks)>,
+) -> Option<(Vec<LookupGroupProof>, std::collections::BTreeMap<T, LookupGroupProveCtx>)> {
+    let groups = static_lookup_groups(ops, model)?;
+    if groups.len() != lookup_groups.len()
+        || groups.keys().zip(lookup_groups.keys()).any(|(a, b)| a != b) { return None; }
+    let mut proofs = Vec::new();
+    let mut ctxs = std::collections::BTreeMap::new();
+    for (tid, members) in groups {
+        let (alpha, beta) = *lookup_groups.get(&tid)?;
+        let m_aux = aux.remove(&(members[0], AuxRole::LookupMultiplicityAgg))?;
+        let table_len = *model.lookup_lengths.get(&tid)?;
+        let arity = m_aux.descriptor.arity;
+        let padded = 1usize.checked_shl(arity as u32)?;
+        if m_aux.descriptor.len != table_len || m_aux.descriptor.columns != 1
+            || m_aux.columns.len() != 1 || m_aux.columns[0].len() != padded { return None; }
+        if table_len == 0 || table_len.checked_next_power_of_two()?.max(32) != padded { return None; }
+        // Shared table values: the once-per-proof static commit when present,
+        // else the padded store table (root checked). The opening is produced
+        // once; step (b) copies it into every member's Lookup proof, step (c)
+        // will keep a single group-level copy.
+        let cached = store.static_table_commits.get(&tid);
+        let owned: Option<Vec<Goldilocks>>;
+        let table_values: &[Goldilocks];
+        if let Some((values, _committed)) = cached {
+            table_values = values.as_slice();
+            if table_values.len() != padded { return None; }
+        } else {
+            owned = Some(pad_lookup_table(store.get(tid)));
+            table_values = owned.as_deref().unwrap();
+            if table_values.len() != padded { return None; }
+        }
+        transcript.absorb(b"zkie-lookup-group-m-v1");
+        transcript.absorb_u64(tid as u64);
+        transcript.absorb_u64(members.len() as u64);
+        for &oi in &members { transcript.absorb_u64(oi as u64); }
+        let z = transcript.field_vec(arity);
+        let eq = mle::eq_evals(&z);
+        let mut mles: Vec<&[Goldilocks]> = vec![&eq, &m_aux.columns[0]];
+        for &oi in &members {
+            let ma = aux.get(&(oi, AuxRole::LookupMultiplicity))?;
+            if ma.descriptor.len != table_len || ma.descriptor.arity != arity || ma.columns.len() != 1
+                || ma.columns[0].len() != padded { return None; }
+            mles.push(&ma.columns[0]);
+        }
+        let terms = lookup_identity_terms(members.len());
+        let (identity, identity_point) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+        if identity.final_evals.len() != members.len() + 2
+            || identity.final_evals[0] != mle::eq_poly(&z, &identity_point)
+            || virtual_eval(&terms, &identity.final_evals) != Goldilocks::ZERO { return None; }
+        for (i, mle_col) in mles[1..].iter().enumerate() {
+            if identity.final_evals[1 + i] != mle::eval(mle_col, &identity_point) { return None; }
+        }
+        transcript.absorb(b"zkie-lookup-group-table-v1");
+        let m_agg: Vec<u64> = m_aux.columns[0].iter().map(|&v| to_i64(v) as u64).collect();
+        let table_proof = prove_lookup_table(&m_agg, table_values, alpha, beta, transcript);
+        let (t_num_point, t_num, t_den_point, t_den) = fractional_leaf(&table_proof);
+        if t_num != mle::eval(&m_aux.columns[0], &t_num_point) { return None; }
+        let table_eval = mle::eval(table_values, &t_den_point);
+        if t_den != alpha + lookup_index_eval(&t_den_point) + beta * table_eval { return None; }
+        let (table_num_tree, table_den_tree) = build_lookup_table_num_den(&m_agg, table_values, alpha, beta);
+        let (table_final_num, table_final_den) = fraction_root(table_num_tree, table_den_tree)?;
+        if table_final_den == Goldilocks::ZERO { return None; }
+        let aggregate_opening = open_aux(m_aux, &[0, 0],
+            &[identity_point.clone(), t_num_point.clone()],
+            &[identity.final_evals[1], t_num])?;
+        let (table_opening, opened) = match cached {
+            Some((_, committed)) => {
+                let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90,
+                    zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90));
+                whir.open(committed.prover_data.clone(), &committed.protocol, &t_den_point)
+            }
+            None => {
+                let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
+                let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+                let committed = zkie_core::pcs::committed::commit(&whir, table_values);
+                if bincode::serialize(&committed.commitment).ok()?
+                    != bincode::serialize(model.lookup_roots.get(&tid)?).ok()? { return None; }
+                store.o7_table_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                whir.open(committed.prover_data, &committed.protocol, &t_den_point)
+            }
+        };
+        if opened != table_eval { return None; }
+        proofs.push(LookupGroupProof {
+            table_id: tid,
+            members: members.clone(),
+            identity,
+            aggregate_opening,
+            table: table_proof,
+        });
+        ctxs.insert(tid, LookupGroupProveCtx {
+            alpha, beta,
+            members,
+            identity_point,
+            member_evals: proofs.last().unwrap().identity.final_evals[2..].to_vec(),
+            table_den_point: t_den_point,
+            table_den: t_den,
+            table_eval,
+            table_final_num,
+            table_final_den,
+            table_opening,
+        });
+    }
+    Some((proofs, ctxs))
+}
+
+/// Deep O7 (b): verifier-side group phase. Replays the same transcript and
+/// checks the M identity, the shared table tree (root derived by replay, S3),
+/// and the aggregated M opening. The table leaf relation and the group
+/// relation are checked after the reverse op loop, once every member's witness
+/// tree and table opening has been verified.
+fn verify_lookup_groups(
+    ops: &[Op],
+    model: &TrustedModelManifest,
+    transcript: &mut Transcript,
+    aux: &[AuxDescriptor],
+    lookup_groups: &std::collections::BTreeMap<T, (Goldilocks, Goldilocks)>,
+    proofs: &[LookupGroupProof],
+) -> Option<std::collections::BTreeMap<T, LookupGroupVerifyCtx>> {
+    let groups = static_lookup_groups(ops, model)?;
+    if groups.len() != lookup_groups.len()
+        || groups.keys().zip(lookup_groups.keys()).any(|(a, b)| a != b)
+        || proofs.len() != groups.len() { return None; }
+    let mut ctxs = std::collections::BTreeMap::new();
+    for ((tid, members), gp) in groups.into_iter().zip(proofs) {
+        let (alpha, beta) = *lookup_groups.get(&tid)?;
+        if gp.table_id != tid || gp.members != members { return None; }
+        let table_len = *model.lookup_lengths.get(&tid)?;
+        if table_len == 0 { return None; }
+        let m_desc = aux.iter().find(|a| a.op_index == members[0]
+            && a.role == AuxRole::LookupMultiplicityAgg)?;
+        let arity = m_desc.arity;
+        let padded = 1usize.checked_shl(arity as u32)?;
+        if m_desc.len != table_len || m_desc.columns != 1
+            || table_len.checked_next_power_of_two()?.max(32) != padded { return None; }
+        transcript.absorb(b"zkie-lookup-group-m-v1");
+        transcript.absorb_u64(tid as u64);
+        transcript.absorb_u64(members.len() as u64);
+        for &oi in &members { transcript.absorb_u64(oi as u64); }
+        let z = transcript.field_vec(arity);
+        let terms = lookup_identity_terms(members.len());
+        let evals_len = members.len() + 2;
+        if gp.identity.final_evals.len() != evals_len { return None; }
+        let (ok, identity_point, final_value) = verify_virtual(&gp.identity, &terms, Goldilocks::ZERO, arity, transcript);
+        if !ok || final_value != Goldilocks::ZERO { return None; }
+        if gp.identity.final_evals[0] != mle::eq_poly(&z, &identity_point)
+            || final_value != virtual_eval(&terms, &gp.identity.final_evals) { return None; }
+        transcript.absorb(b"zkie-lookup-group-table-v1");
+        let tc = verify_fractional_chain_core(&gp.table, arity, transcript)?;
+        if tc.final_den == Goldilocks::ZERO { return None; }
+        let (whir, protocol) = aux_batch_whir(m_desc)?;
+        if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &m_desc.commitment,
+            &protocol, 1, &[0, 0], &[identity_point.clone(), tc.q_num.clone()],
+            &[gp.identity.final_evals[1], tc.num_leaf], &gp.aggregate_opening) { return None; }
+        ctxs.insert(tid, LookupGroupVerifyCtx {
+            alpha, beta, members,
+            identity_point,
+            member_evals: gp.identity.final_evals[2..].to_vec(),
+            table_den_point: tc.q_den,
+            table_den: tc.den_leaf,
+            table_final_num: tc.final_num,
+            table_final_den: tc.final_den,
+            arity,
+        });
+    }
+    Some(ctxs)
+}
+
+/// Group relation, division-free: sum_i (w_i.final_num * prod_{j != i}
+/// w_j.final_den) * t_den == t_num * prod_j w_j.final_den. This is the
+/// aggregated LogUp identity sum_i S_i == T (each witness tree root is
+/// w_i.final_num / w_i.final_den and the shared table tree root is
+/// t_num / t_den). For one member it reduces to the per-lookup cross-product.
+fn lookup_group_relation(roots: &[(Goldilocks, Goldilocks)], table_num: Goldilocks, table_den: Goldilocks) -> bool {
+    if roots.is_empty() { return false; }
+    if roots.iter().any(|&(_, d)| d == Goldilocks::ZERO) || table_den == Goldilocks::ZERO { return false; }
+    let mut den_prod = Goldilocks::ONE;
+    for &(_, d) in roots { den_prod *= d; }
+    let mut num_sum = Goldilocks::ZERO;
+    for i in 0..roots.len() {
+        let mut term = roots[i].0;
+        for (j, &(_, d)) in roots.iter().enumerate() {
+            if j != i { term *= d; }
+        }
+        num_sum += term;
+    }
+    num_sum * table_den == table_num * den_prod
+}
+
 fn lookup_prefix_eval(len: usize, point: &[Goldilocks]) -> Goldilocks {
     if point.len() >= usize::BITS as usize { return Goldilocks::ZERO; }
     if len >= (1usize << point.len()) { return Goldilocks::ONE; }
@@ -4084,8 +4453,8 @@ fn lookup_prefix_eval(len: usize, point: &[Goldilocks]) -> Goldilocks {
 
 fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
     pairs: PreparedAux, multiplicity: PreparedAux, model: &TrustedModelManifest, dynamic_table: bool,
-    group_ab: Option<(Goldilocks, Goldilocks)>, transcript: &mut Transcript)
-    -> Option<(ReverseLookupProof, Vec<EvalClaim>)>
+    group: Option<LookupGroupMemberProve<'_>>, transcript: &mut Transcript)
+    -> Option<(ReverseLookupProof, Vec<EvalClaim>, (Goldilocks, Goldilocks))>
 {
     let (idx, out, table_id) = match op { Op::Lookup { idx, out, table } => (*idx, *out, *table), _ => return None };
     let xs = store.idx.get(idx)?;
@@ -4098,11 +4467,63 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
     // Deep O7 (a): grouped static-lookup ops share the group (α, β) derived
     // before the reverse DAG; dynamic/identity/plain paths keep the per-op
     // squeeze (two field() calls at this position).
-    let (alpha, beta) = match group_ab {
-        Some(ab) => ab,
+    let (alpha, beta) = match &group {
+        Some(g) => (g.alpha, g.beta),
         None => (transcript.field(), transcript.field()),
     };
-    let (witness, _, _, _, _) = prove_lookup_witness_batch_columns(&[xs.as_slice()], &[ys], alpha, beta, transcript);
+    let (witness, _, _, w_num_col, w_den_col) =
+        prove_lookup_witness_batch_columns(&[xs.as_slice()], &[ys], alpha, beta, transcript);
+    let (w_final_num, w_final_den) = fraction_root(w_num_col, w_den_col)?;
+    if w_final_den == Goldilocks::ZERO { return None; }
+    let (w_num_point, w_num, w_den_point, w_den) = fractional_leaf(&witness);
+    if w_num != lookup_prefix_eval(xs.len(), &w_num_point) { return None; }
+    let witness_index = mle::eval(&pairs.columns[0], &w_den_point);
+    let witness_value = mle::eval(&pairs.columns[1], &w_den_point);
+    if w_den != alpha + witness_index + beta * witness_value { return None; }
+
+    // Deep O7 (b): grouped static lookup. The table-side fraction tree and
+    // the multiplicity numerator live at the group level; this op keeps its
+    // witness tree, padding proof and pairs opening, and opens its own
+    // multiplicity column at the shared identity point. Step (b) still
+    // carries a per-member copy of the group table opening; step (c) will
+    // collapse it to one group-level opening.
+    if let Some(g) = &group {
+        if multiplicity.descriptor.columns != 1 || multiplicity.descriptor.arity != g.identity_point.len()
+            || g.table_den_point.len() != multiplicity.descriptor.arity { return None; }
+        transcript.absorb_fields(&[witness_index, witness_value, g.member_eval]);
+        let q = transcript.field_vec(multiplicity.descriptor.arity);
+        let eq = mle::eq_evals(&q);
+        let mut padding_mask = vec![Goldilocks::ZERO; multiplicity.columns[0].len()];
+        for v in padding_mask.iter_mut().skip(multiplicity.descriptor.len) { *v = Goldilocks::ONE; }
+        let padding_terms = vec![(Goldilocks::ONE, vec![0, 1, 2])];
+        let (padding, padding_point) = prove_virtual(&[&eq, &multiplicity.columns[0], &padding_mask], &padding_terms, Goldilocks::ZERO, transcript);
+        let padding_value = padding.final_evals[1];
+        let pair_idxs = [0, 1, 0, 1];
+        let pair_points = vec![output_point.clone(), output_point.clone(), w_den_point.clone(), w_den_point];
+        let pair_values = [output_index, value, witness_index, witness_value];
+        let pairs_opening = open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?;
+        let multiplicity_opening = open_aux(multiplicity, &[0, 0],
+            &[g.identity_point.to_vec(), padding_point],
+            &[g.member_eval, padding_value])?;
+        let mut claims = vec![EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index }];
+        let proof = ReverseLookupProof {
+            witness,
+            table: FractionalProof { layers: Vec::new() },
+            output_index,
+            witness_index,
+            witness_value,
+            multiplicity: g.member_eval,
+            table_value: g.table_eval,
+            padding,
+            pairs_opening,
+            multiplicity_opening,
+            table_opening: Some(g.table_opening.clone()),
+        };
+        return Some((proof, claims, (w_final_num, w_final_den)));
+    }
+
+    // Ungrouped path (dynamic table, identity table, or plain path): keep the
+    // per-op table-side fraction tree and its own table opening.
     // O7: reuse the once-per-proof static table commit (same trusted id);
     // otherwise fall back to the per-lookup padded table.
     let cached_values = store
@@ -4118,14 +4539,10 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
         .unwrap_or_else(|| table_values_owned.as_deref().unwrap());
     let m: Vec<u64> = multiplicity.columns[0].iter().map(|&v| to_i64(v) as u64).collect();
     let table = prove_lookup_table(&m, &table_values, alpha, beta, transcript);
-    let (w_num_point, w_num, w_den_point, w_den) = fractional_leaf(&witness);
     let (t_num_point, t_num, t_den_point, t_den) = fractional_leaf(&table);
-    if w_num != lookup_prefix_eval(xs.len(), &w_num_point) { return None; }
-    let witness_index = mle::eval(&pairs.columns[0], &w_den_point);
-    let witness_value = mle::eval(&pairs.columns[1], &w_den_point);
     let mult_eval = mle::eval(&multiplicity.columns[0], &t_num_point);
     let table_eval = mle::eval(&table_values, &t_den_point);
-    if w_den != alpha + witness_index + beta * witness_value || t_num != mult_eval
+    if t_num != mult_eval
         || t_den != alpha + lookup_index_eval(&t_den_point) + beta * table_eval { return None; }
     transcript.absorb_fields(&[witness_index, witness_value, mult_eval, table_eval]);
     let q = transcript.field_vec(multiplicity.descriptor.arity);
@@ -4173,29 +4590,65 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
     if dynamic_table {
         claims.push(EvalClaim { tensor_id: TensorKey::Field(table_id).encoded()?, point: t_den_point, value: table_eval });
     }
-    Some((ReverseLookupProof { witness, table, output_index, witness_index, witness_value, multiplicity: mult_eval, table_value: table_eval, padding, pairs_opening, multiplicity_opening, table_opening }, claims))
+    Some((ReverseLookupProof { witness, table, output_index, witness_index, witness_value, multiplicity: mult_eval, table_value: table_eval, padding, pairs_opening, multiplicity_opening, table_opening }, claims, (w_final_num, w_final_den)))
 }
 
 fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs: &AuxDescriptor,
     multiplicity: &AuxDescriptor, model: &TrustedModelManifest, dynamic_table: bool,
-    group_ab: Option<(Goldilocks, Goldilocks)>,
-    proof: &ReverseLookupProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+    group: Option<LookupGroupMemberVerify<'_>>,
+    proof: &ReverseLookupProof, transcript: &mut Transcript)
+    -> Option<(Vec<EvalClaim>, (Goldilocks, Goldilocks), Option<Goldilocks>)>
 {
     let (idx, table_id) = match op { Op::Lookup { idx, table, .. } => (*idx, *table), _ => return None };
     if point.len() != pairs.len.trailing_zeros() as usize { return None; }
     transcript.absorb_field(proof.output_index);
     // Must match the prover: grouped static lookups use the pre-derived
     // group (α, β); other paths keep the per-op squeeze.
-    let (alpha, beta) = match group_ab {
-        Some(ab) => ab,
+    let (alpha, beta) = match &group {
+        Some(g) => (g.alpha, g.beta),
         None => (transcript.field(), transcript.field()),
     };
     let witness = verify_fractional_chain_core(&proof.witness, pairs.arity, transcript)?;
-    let table = verify_fractional_chain_core(&proof.table, multiplicity.arity, transcript)?;
-    if witness.final_den == Goldilocks::ZERO || table.final_den == Goldilocks::ZERO
-        || witness.final_num * table.final_den != table.final_num * witness.final_den
+    if witness.final_den == Goldilocks::ZERO
         || witness.num_leaf != lookup_prefix_eval(pairs.len, &witness.q_num)
-        || witness.den_leaf != alpha + proof.witness_index + beta * proof.witness_value
+        || witness.den_leaf != alpha + proof.witness_index + beta * proof.witness_value { return None; }
+    let roots = (witness.final_num, witness.final_den);
+    let mut output_point = point.to_vec(); output_point.resize(pairs.arity, Goldilocks::ZERO);
+
+    if let Some(g) = &group {
+        // Deep O7 (b): grouped op. The table-side tree is group-level, so the
+        // per-op proof must not carry one. This op's multiplicity column is
+        // opened at the shared identity point (binding M and sum m_i) and at
+        // its own padding point (existing padding-zero discipline).
+        if !proof.table.layers.is_empty() || multiplicity.columns != 1
+            || multiplicity.arity != g.identity_point.len() || multiplicity.arity != g.arity
+            || proof.multiplicity != g.member_eval { return None; }
+        transcript.absorb_fields(&[proof.witness_index, proof.witness_value, proof.multiplicity]);
+        if proof.padding.final_evals.len() != 3 { return None; }
+        let q = transcript.field_vec(multiplicity.arity);
+        let padding_terms = vec![(Goldilocks::ONE, vec![0, 1, 2])];
+        let (ok, padding_point, padding_final) = verify_virtual(&proof.padding, &padding_terms, Goldilocks::ZERO, multiplicity.arity, transcript);
+        if !ok || padding_final != mle::eq_poly(&q, &padding_point) * proof.padding.final_evals[1]
+            * (Goldilocks::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) { return None; }
+        let points = vec![output_point.clone(), output_point, witness.q_den.clone(), witness.q_den];
+        let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
+        if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
+            || !verify_aux_open(multiplicity, &[0, 0],
+                &[g.identity_point.to_vec(), padding_point],
+                &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) { return None; }
+        let root = model.lookup_roots.get(&table_id)?;
+        let opening = proof.table_opening.as_ref()?;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(g.arity, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(g.arity, 90, pow);
+        let protocol = whir.opening_protocol(g.arity, 1);
+        if whir.verify(root, opening, &protocol, g.table_den_point).ok() != Some(proof.table_value) { return None; }
+        let claims = vec![EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: proof.output_index }];
+        return Some((claims, roots, Some(proof.table_value)));
+    }
+
+    let table = verify_fractional_chain_core(&proof.table, multiplicity.arity, transcript)?;
+    if table.final_den == Goldilocks::ZERO
+        || witness.final_num * table.final_den != table.final_num * witness.final_den
         || table.num_leaf != proof.multiplicity
         || table.den_leaf != alpha + lookup_index_eval(&table.q_den) + beta * proof.table_value { return None; }
     transcript.absorb_fields(&[proof.witness_index, proof.witness_value, proof.multiplicity, proof.table_value]);
@@ -4205,7 +4658,6 @@ fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs
     let (ok, padding_point, padding_final) = verify_virtual(&proof.padding, &padding_terms, Goldilocks::ZERO, multiplicity.arity, transcript);
     if !ok || padding_final != mle::eq_poly(&q, &padding_point) * proof.padding.final_evals[1]
         * (Goldilocks::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) { return None; }
-    let mut output_point = point.to_vec(); output_point.resize(pairs.arity, Goldilocks::ZERO);
     let points = vec![output_point.clone(), output_point, witness.q_den.clone(), witness.q_den];
     let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
     if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
@@ -4227,7 +4679,7 @@ fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs
     if dynamic_table {
         claims.push(EvalClaim { tensor_id: TensorKey::Field(table_id).encoded()?, point: table.q_den.clone(), value: proof.table_value });
     }
-    Some(claims)
+    Some((claims, roots, None))
 }
 
 fn prove_reverse_projection(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
@@ -4464,6 +4916,17 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
     let replayed = execution.and_then(|e| replay_index_columns(ops, e));
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
+    // Deep O7 (b): group phase. The group alpha/beta were derived before this
+    // function on the bound transcript; the aggregated multiplicity identity
+    // and the shared table fraction trees are absorbed here, before the
+    // reverse op loop. Plain/dynamic/identity paths have no groups.
+    let (group_proofs, group_ctxs) = if lookup_groups.is_empty() {
+        (Vec::new(), std::collections::BTreeMap::new())
+    } else {
+        prove_lookup_groups(store, ops, model?, transcript, aux, lookup_groups)?
+    };
+    let mut group_roots: std::collections::BTreeMap<T, Vec<(Goldilocks, Goldilocks)>> =
+        std::collections::BTreeMap::new();
     let mut steps = Vec::new();
     for (op_index, op) in ops.iter().enumerate().rev() {
         let mut out_claims = Vec::new();
@@ -4503,11 +4966,29 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
             Op::Lookup { .. } => {
                 let table_id = match op { Op::Lookup { table, .. } => *table, _ => return None };
                 let dynamic_table = op_field_writes(ops).contains(&table_id);
+                let group_member = match group_ctxs.get(&table_id) {
+                    Some(ctx) => {
+                        if dynamic_table { return None; }
+                        let pos = ctx.members.iter().position(|&m| m == op_index)?;
+                        Some(LookupGroupMemberProve {
+                            alpha: ctx.alpha,
+                            beta: ctx.beta,
+                            identity_point: &ctx.identity_point,
+                            member_eval: *ctx.member_evals.get(pos)?,
+                            table_den_point: &ctx.table_den_point,
+                            table_eval: ctx.table_eval,
+                            table_opening: &ctx.table_opening,
+                        })
+                    }
+                    None => None,
+                };
+                let grouped = group_member.is_some();
                 let r = prove_reverse_lookup(store, op, &point, value,
                     aux.remove(&(op_index, AuxRole::LookupPairs))?,
                     aux.remove(&(op_index, AuxRole::LookupMultiplicity))?, model?, dynamic_table,
-                    lookup_groups.get(&table_id).copied(), transcript);
-                let (proof, incoming) = r?;
+                    group_member, transcript);
+                let (proof, incoming, roots) = r?;
+                if grouped { group_roots.entry(table_id).or_default().push(roots); }
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -4730,6 +5211,24 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
         };
         steps.push(ReverseStep { outputs: out_claims, reduction });
     }
+    // Deep O7 (b): the shared table leaf and the group relation. Every static
+    // group member must have produced exactly one witness tree root; the
+    // aggregated identity is sum_i w_i.final_num/w_i.final_den == t_num/t_den
+    // (division-free in `lookup_group_relation`). Table leaf:
+    // t_den == alpha + index(t_den_point) + beta * table_value.
+    for (tid, ctx) in &group_ctxs {
+        let roots = group_roots.get(tid)?;
+        if roots.len() != ctx.members.len() { return None; }
+        if ctx.table_den != ctx.alpha + lookup_index_eval(&ctx.table_den_point) + ctx.beta * ctx.table_eval { return None; }
+        if !lookup_group_relation(roots, ctx.table_final_num, ctx.table_final_den) { return None; }
+    }
+    if group_roots.len() != group_ctxs.len() { return None; }
+    if !group_proofs.is_empty() {
+        steps.push(ReverseStep {
+            outputs: Vec::new(),
+            reduction: ReverseReduction::LookupGroups { groups: group_proofs },
+        });
+    }
     // O2 (TL Q3): return the residual claims directly. The verifier derives
     // the same leaves by replaying the proof; the honest prover no longer
     // needs that replay just to collect them. No transcript or proof bytes
@@ -4748,7 +5247,35 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
     let replayed = execution.and_then(|e| replay_index_columns(ops, e));
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
-    let mut steps = proof.steps.iter();
+    // Deep O7 (b): replay the group phase before the reverse op loop. The
+    // verifier re-derives z, the shared table leaf points and the group
+    // relation inputs from its own transcript replay; proof-carried values
+    // are checked against aux openings and the trusted table root. The group
+    // proofs travel in a trailing sentinel step with no outputs, so proofs
+    // without static groups keep their exact pre-(b) bytes.
+    let trailing_groups = match proof.steps.last() {
+        Some(ReverseStep { outputs, reduction: ReverseReduction::LookupGroups { groups } }) if outputs.is_empty() => {
+            Some(groups.as_slice())
+        }
+        _ => None,
+    };
+    let step_slice = if trailing_groups.is_some() {
+        &proof.steps[..proof.steps.len() - 1]
+    } else {
+        proof.steps.as_slice()
+    };
+    let group_proofs = trailing_groups.unwrap_or(&[]);
+    let group_ctxs = if lookup_groups.is_empty() {
+        if trailing_groups.is_some() { return None; }
+        std::collections::BTreeMap::new()
+    } else {
+        verify_lookup_groups(ops, model?, transcript, aux, lookup_groups, group_proofs)?
+    };
+    let mut group_roots: std::collections::BTreeMap<T, Vec<(Goldilocks, Goldilocks)>> =
+        std::collections::BTreeMap::new();
+    let mut group_table_evals: std::collections::BTreeMap<T, Goldilocks> =
+        std::collections::BTreeMap::new();
+    let mut steps = step_slice.iter();
     for (op_index, op) in ops.iter().enumerate().rev() {
         let mut local = Vec::new();
         for id in reverse_op_io(op)?.1 {
@@ -4794,8 +5321,34 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 let multiplicity = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::LookupMultiplicity)?;
                 let table_id = match op { Op::Lookup { table, .. } => *table, _ => return None };
                 let dynamic_table = op_field_writes(ops).contains(&table_id);
-                for c in verify_reverse_lookup(op, &point, value, pairs, multiplicity, model?, dynamic_table,
-                    lookup_groups.get(&table_id).copied(), proof, transcript)? {
+                let group_member = match group_ctxs.get(&table_id) {
+                    Some(ctx) => {
+                        if dynamic_table { return None; }
+                        let pos = ctx.members.iter().position(|&m| m == op_index)?;
+                        Some(LookupGroupMemberVerify {
+                            alpha: ctx.alpha,
+                            beta: ctx.beta,
+                            identity_point: &ctx.identity_point,
+                            member_eval: *ctx.member_evals.get(pos)?,
+                            table_den_point: &ctx.table_den_point,
+                            arity: ctx.arity,
+                        })
+                    }
+                    None => None,
+                };
+                let grouped = group_member.is_some();
+                let (incoming, roots, table_eval) = verify_reverse_lookup(op, &point, value, pairs, multiplicity, model?, dynamic_table,
+                    group_member, proof, transcript)?;
+                if grouped {
+                    let te = table_eval?;
+                    match group_table_evals.get(&table_id) {
+                        Some(&prev) if prev != te => return None,
+                        Some(_) => {}
+                        None => { group_table_evals.insert(table_id, te); }
+                    }
+                    group_roots.entry(table_id).or_default().push(roots);
+                } else if table_eval.is_some() { return None; }
+                for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -4952,6 +5505,18 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
         }
     }
     if steps.next().is_some() { return None; }
+    // Deep O7 (b): after all reverse steps, every static group member must
+    // have contributed exactly one witness-tree root. Bind the shared table
+    // leaf to the (member-agreed) table value and check the aggregated LogUp
+    // relation sum_i w_i.final_num/w_i.final_den == t_num/t_den.
+    for (tid, ctx) in &group_ctxs {
+        let roots = group_roots.get(tid)?;
+        if roots.len() != ctx.members.len() { return None; }
+        let table_eval = *group_table_evals.get(tid)?;
+        if ctx.table_den != ctx.alpha + lookup_index_eval(&ctx.table_den_point) + ctx.beta * table_eval { return None; }
+        if !lookup_group_relation(roots, ctx.table_final_num, ctx.table_final_den) { return None; }
+    }
+    if group_roots.len() != group_ctxs.len() || group_table_evals.len() != group_ctxs.len() { return None; }
     Some(claims.into_iter().flat_map(|(tensor_id, cs)| cs.into_iter().map(move |(point, value)| EvalClaim { tensor_id, point, value })).collect())
 }
 
@@ -11378,6 +11943,7 @@ pub fn prove_committed_shard_dag_bound(
     prepared.extend(prepare_expert_routing_aux(store, ops)?);
     prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
     prepared.extend(prepare_lookup_aux(store, ops, model)?);
+    prepared.extend(prepare_lookup_group_aux(store, ops, model)?);
     prepared.extend(prepare_topk_aux(store, ops)?);
     prepared.extend(prepare_topk_range_aux(store, ops)?);
     prepared.extend(prepare_topk_thr_range_aux(store, ops)?);
@@ -14092,7 +14658,7 @@ mod tests {
         let pair_desc = pairs.descriptor.clone();
         let mult_desc = mult.descriptor.clone();
         let mut prover = Transcript::new(b"padded-identity-forgery");
-        let (proof, _) = prove_reverse_lookup(&store, &ops[0], &[], from_i64(3), pairs, mult, &model, false, None, &mut prover).unwrap();
+        let (proof, _, _) = prove_reverse_lookup(&store, &ops[0], &[], from_i64(3), pairs, mult, &model, false, None, &mut prover).unwrap();
         let mut verifier = Transcript::new(b"padded-identity-forgery");
         assert!(verify_reverse_lookup(&ops[0], &[], from_i64(3), &pair_desc, &mult_desc, &model, false, None, &proof, &mut verifier).is_none());
     }
@@ -14258,9 +14824,11 @@ mod tests {
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
     }
 
-    /// O7: two Lookups into the SAME static table share one per-proof table
-    /// commitment/Merkle tree (o7_table_commits == 1), while the per-lookup
-    /// table-side fractional proofs remain (two Lookup reverse steps).
+    /// O7 deep (b): two Lookups into the SAME static table share one table
+    /// commitment AND one group-level table-side fraction tree (multiplicity
+    /// M = m1 + m2, common alpha/beta). The per-op witness trees remain (two
+    /// Lookup reverse steps); the group relation binds them to the shared
+    /// table root.
     #[test]
     fn o7_same_table_lookups_share_table_commit() {
         let mut store = Store::new();
@@ -14296,9 +14864,275 @@ mod tests {
             &PublicStatement::Generic, &model, &execution));
         assert_eq!(store.o7_table_commits(), 1,
             "one table Merkle tree for two same-id lookups");
-        let lookups = proof.reverse.steps.iter()
-            .filter(|s| matches!(&s.reduction, ReverseReduction::Lookup { .. })).count();
-        assert_eq!(lookups, 2, "per-lookup table-side fractions still run");
+        assert_eq!(proof.reverse.steps.iter()
+            .filter(|s| matches!(&s.reduction, ReverseReduction::Lookup { .. })).count(), 2,
+            "per-op witness-side fractional proofs remain");
+        let groups = match &proof.reverse.steps.last().unwrap().reduction {
+            ReverseReduction::LookupGroups { groups } => groups,
+            _ => panic!("missing trailing group step"),
+        };
+        assert_eq!(groups.len(), 1, "one shared group table tree");
+        assert_eq!(groups[0].members, vec![0, 1]);
+        for step in &proof.reverse.steps {
+            if let ReverseReduction::Lookup { proof: p } = &step.reduction {
+                assert!(p.table.layers.is_empty(), "grouped lookups carry no per-op table tree");
+                assert!(p.table_opening.is_some(), "step (b) keeps the per-member table opening");
+            }
+        }
+        // Deterministic bytes: the grouped path (shared table tree, group
+        // identity, copied table opening) must reproduce byte-identically.
+        let bytes1 = bincode::serialize(&proof).unwrap();
+        let proof2 = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0,
+            &PublicStatement::Generic, &model, &execution)
+            .expect("repeat deep O7 proof");
+        assert_eq!(bytes1, bincode::serialize(&proof2).unwrap(),
+            "grouped proof bytes must be deterministic");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof2,
+            &PublicStatement::Generic, &model, &execution));
+    }
+
+    // ---- Deep O7 (b) negatives ----
+
+    struct O7bFixture {
+        store: Store,
+        ops: Vec<Op>,
+        model: TrustedModelManifest,
+        execution: TrustedExecution,
+        whir: zkie_core::pcs::whir::Whir,
+        cache: Vec<CachedWeightBatch>,
+    }
+
+    fn o7b_commit_aux(op_index: usize, role: AuxRole, len: usize, arity: usize,
+        columns: Vec<Vec<Goldilocks>>) -> PreparedAux
+    {
+        let count = columns.len();
+        let padded = 1usize << arity;
+        let vars = count.checked_mul(padded).unwrap().checked_next_power_of_two().unwrap().trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        PreparedAux { descriptor: AuxDescriptor { op_index, role, len, arity, columns: count, commitment }, columns, prover_data, protocol, whir }
+    }
+
+    fn o7b_two_lookup_fixture(tag: &str) -> O7bFixture {
+        let mut store = Store::new();
+        let table: Vec<Goldilocks> = (0..32).map(|i| from_i64(100 + i)).collect();
+        let t = store.push(table);
+        let idx1 = store.push_idx((0..32u32).map(|i| (i * 7) % 32).collect());
+        let idx2 = store.push_idx((0..32u32).map(|i| (i * 11 + 3) % 32).collect());
+        let out1 = store.push(vec![]);
+        let out2 = store.push(vec![]);
+        let ops = vec![
+            Op::Lookup { idx: idx1, out: out1, table: t },
+            Op::Lookup { idx: idx2, out: out2, table: t },
+        ];
+        let path = std::env::temp_dir().join(format!("zkie-o7b-{}-{}", tag, std::process::id()));
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx1, 32usize), (idx2, 32usize)].into());
+        forward_ops(&mut store, &ops);
+        let k1 = TensorKey::Index(idx1).encoded().unwrap();
+        let k2 = TensorKey::Index(idx2).encoded().unwrap();
+        let g1: Vec<Goldilocks> = store.idx[idx1].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let g2: Vec<Goldilocks> = store.idx[idx2].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(k1, g1), (k2, g2)].into(),
+            outputs: [(out1, store.get(out1).to_vec()), (out2, store.get(out2).to_vec())].into(),
+        };
+        O7bFixture { store, ops, model, execution, whir: zkie_core::pcs::whir::Whir::with_params(5, 90, 17), cache }
+    }
+
+    fn o7b_prepared(f: &O7bFixture) -> Vec<PreparedAux> {
+        let mut prepared = prepare_lookup_aux(&f.store, &f.ops, &f.model).unwrap();
+        prepared.extend(prepare_lookup_group_aux(&f.store, &f.ops, &f.model).unwrap());
+        prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
+        prepared
+    }
+
+    fn o7b_groups(proof: &ReverseDagProof) -> &[LookupGroupProof] {
+        match &proof.steps.last().expect("steps").reduction {
+            ReverseReduction::LookupGroups { groups } => groups,
+            _ => panic!("missing trailing group step"),
+        }
+    }
+
+    fn o7b_bound_proof(f: &mut O7bFixture) -> BoundExecutionProof {
+        let proof = prove_committed_shard_dag_bound(&mut f.store, &f.ops, 1, &f.whir, &f.cache, 0, 0,
+            &PublicStatement::Generic, &f.model, &f.execution).expect("O7 deep (b) honest proof");
+        assert!(verify_committed_shard_dag_bound(&f.ops, 1, &f.whir, &proof,
+            &PublicStatement::Generic, &f.model, &f.execution), "honest deep O7 proof verifies");
+        assert_eq!(o7b_groups(&proof.reverse).len(), 1);
+        proof
+    }
+
+    /// Deep O7 (b) negative 1: a forged aggregate multiplicity is rejected.
+    /// (i) the prover side fails closed when M != sum m_i (identity sumcheck
+    /// is not zero); (ii) the verifier rejects a proof whose M commitment is
+    /// swapped for a well-formed commitment to a different column; (iii) the
+    /// verifier rejects a forged M identity eval.
+    #[test]
+    fn o7b_forged_aggregate_multiplicity_rejected() {
+        let mut f = o7b_two_lookup_fixture("forged-m");
+        let mut prepared = o7b_prepared(&f);
+        let pos = prepared.iter().position(|p| p.descriptor.role == AuxRole::LookupMultiplicityAgg).unwrap();
+        let d = prepared[pos].descriptor.clone();
+        let mut col = prepared[pos].columns[0].clone();
+        let active = col.iter().position(|&v| v != Goldilocks::ZERO).unwrap();
+        col[active] = Goldilocks::ZERO;
+        let forged = o7b_commit_aux(d.op_index, AuxRole::LookupMultiplicityAgg, d.len, d.arity, vec![col]);
+        prepared[pos] = forged;
+        let mut map: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> =
+            prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
+        let mut ts = Transcript::new(b"o7b-forged-m");
+        let groups = derive_lookup_group_ab(&mut ts, &f.ops, &f.model).unwrap();
+        assert!(prove_lookup_groups(&f.store, &f.ops, &f.model, &mut ts, &mut map, &groups).is_none(),
+            "forged M (sum violation) must not produce a group proof");
+
+        let proof = o7b_bound_proof(&mut f);
+        // Well-formed commitment to an all-zero M column.
+        let m_desc = proof.aux.iter().find(|a| a.role == AuxRole::LookupMultiplicityAgg).unwrap().clone();
+        let padded = 1usize << m_desc.arity;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(m_desc.arity, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(m_desc.arity, 90, pow);
+        let wrong = zkie_core::pcs::committed::commit(&whir, &vec![Goldilocks::ZERO; padded]);
+        let mut swapped = proof;
+        let agg = swapped.aux.iter_mut().find(|a| a.role == AuxRole::LookupMultiplicityAgg).unwrap();
+        agg.commitment = wrong.commitment;
+        assert!(!verify_committed_shard_dag_bound(&f.ops, 1, &f.whir, &swapped,
+            &PublicStatement::Generic, &f.model, &f.execution),
+            "swapped M commitment must be rejected");
+
+        // Tamper only the replay-visible identity eval: the aux opening no
+        // longer matches.
+        let mut f2 = o7b_two_lookup_fixture("forged-m2");
+        let proof2 = o7b_bound_proof(&mut f2);
+        let mut forged_eval = proof2;
+        match &mut forged_eval.reverse.steps.last_mut().unwrap().reduction {
+            ReverseReduction::LookupGroups { groups } => groups[0].identity.final_evals[1] += Goldilocks::ONE,
+            _ => panic!("missing trailing group step"),
+        }
+        assert!(!verify_committed_shard_dag_bound(&f2.ops, 1, &f2.whir, &forged_eval,
+            &PublicStatement::Generic, &f2.model, &f2.execution),
+            "forged M identity eval must be rejected");
+    }
+
+    /// Deep O7 (b) negative 2: zeroing an active multiplicity entry is
+    /// rejected. The prover's identity check fails closed when one m_i column
+    /// is altered while M stays honest; the verifier rejects a forged
+    /// per-op multiplicity claim at the group identity point.
+    #[test]
+    fn o7b_zeroed_active_multiplicity_rejected() {
+        let mut f = o7b_two_lookup_fixture("zeroed-m");
+        let mut prepared = o7b_prepared(&f);
+        let pos = prepared.iter().position(|p| p.descriptor.role == AuxRole::LookupMultiplicity
+            && p.descriptor.op_index == 0).unwrap();
+        let d = prepared[pos].descriptor.clone();
+        let mut col = prepared[pos].columns[0].clone();
+        let active = col.iter().position(|&v| v != Goldilocks::ZERO).unwrap();
+        col[active] = Goldilocks::ZERO;
+        prepared[pos] = o7b_commit_aux(d.op_index, AuxRole::LookupMultiplicity, d.len, d.arity, vec![col]);
+        let mut map: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> =
+            prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
+        let mut ts = Transcript::new(b"o7b-zeroed-m");
+        let groups = derive_lookup_group_ab(&mut ts, &f.ops, &f.model).unwrap();
+        assert!(prove_lookup_groups(&f.store, &f.ops, &f.model, &mut ts, &mut map, &groups).is_none(),
+            "zeroing an active multiplicity entry must fail closed");
+
+        let mut proof = o7b_bound_proof(&mut f);
+        let mut tampered = false;
+        for step in &mut proof.reverse.steps {
+            if let ReverseReduction::Lookup { proof: p } = &mut step.reduction { p.multiplicity += Goldilocks::ONE; tampered = true; }
+        }
+        assert!(tampered);
+        assert!(!verify_committed_shard_dag_bound(&f.ops, 1, &f.whir, &proof,
+            &PublicStatement::Generic, &f.model, &f.execution),
+            "forged per-op multiplicity claim must be rejected");
+    }
+
+    /// Deep O7 (b) negative 3: different trusted table ids are never merged,
+    /// even with equal lengths. A single merged aggregate descriptor for two
+    /// groups is structurally invalid.
+    #[test]
+    fn o7b_cross_table_merge_rejected() {
+        let mut store = Store::new();
+        let t1 = store.push((0..8).map(|i| from_i64(100 + i)).collect());
+        let t2 = store.push((0..8).map(|i| from_i64(200 + i)).collect());
+        let idx1 = store.push_idx((0..8u32).collect());
+        let idx2 = store.push_idx((0..8u32).map(|i| 7 - i).collect());
+        let out1 = store.push(vec![]);
+        let out2 = store.push(vec![]);
+        let ops = vec![
+            Op::Lookup { idx: idx1, out: out1, table: t1 },
+            Op::Lookup { idx: idx2, out: out2, table: t2 },
+        ];
+        let path = std::env::temp_dir().join(format!("zkie-o7b-cross-{}", std::process::id()));
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx1, 8usize), (idx2, 8usize)].into());
+        forward_ops(&mut store, &ops);
+        let groups = static_lookup_groups(&ops, &model).unwrap();
+        assert_eq!(groups.len(), 2, "different trusted ids form distinct groups");
+        assert!(groups.contains_key(&t1) && groups.contains_key(&t2));
+        let mut ts = Transcript::new(b"o7b-cross-table");
+        let ab = derive_lookup_group_ab(&mut ts, &ops, &model).unwrap();
+        assert_ne!(ab[&t1], ab[&t2], "distinct groups get distinct alpha/beta");
+        let mut prepared = prepare_lookup_aux(&store, &ops, &model).unwrap();
+        prepared.extend(prepare_lookup_group_aux(&store, &ops, &model).unwrap());
+        prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
+        let mut aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
+        assert!(validate_aux_descriptors(&ops, &model, &aux), "well-formed group descriptors validate");
+        let drop_pos = aux.iter().position(|a| a.role == AuxRole::LookupMultiplicityAgg && a.op_index == 1).unwrap();
+        aux.remove(drop_pos);
+        assert!(!validate_aux_descriptors(&ops, &model, &aux),
+            "merging two table groups into one aggregate descriptor must be rejected");
+    }
+
+    /// Deep O7 (b) negative 4: an op-written (dynamic) table is never grouped
+    /// and cannot carry a group aggregate descriptor.
+    #[test]
+    fn o7b_dynamic_table_not_grouped() {
+        let mut store = Store::new();
+        let t = store.push((0..8).map(|i| from_i64(100 + i)).collect());
+        let a = store.push((0..8).map(|i| from_i64(i as i64)).collect());
+        let b = store.push((0..8).map(|i| from_i64((i * 2) as i64)).collect());
+        let dyn_t = store.push(vec![]);
+        let idx1 = store.push_idx((0..8u32).collect());
+        let idx2 = store.push_idx((0..8u32).map(|i| 7 - i).collect());
+        let out1 = store.push(vec![]);
+        let out2 = store.push(vec![]);
+        let ops = vec![
+            Op::Add { a, b, c: dyn_t },
+            Op::Lookup { idx: idx1, out: out1, table: t },
+            Op::Lookup { idx: idx2, out: out2, table: dyn_t },
+        ];
+        // Fill the dynamic table (and the Lookup outputs) before building the
+        // manifest: the test manifest builder requires every lookup-table id
+        // to be a non-empty store tensor.
+        forward_ops(&mut store, &ops);
+        let path = std::env::temp_dir().join(format!("zkie-o7b-dyn-{}", std::process::id()));
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx1, 8usize), (idx2, 8usize)].into());
+        let groups = static_lookup_groups(&ops, &model).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups.contains_key(&t));
+        assert!(!groups.contains_key(&dyn_t), "dynamic table must be excluded");
+        assert_eq!(lookup_group_aux_specs(&ops, &model).unwrap().len(), 1);
+        let mut prepared = prepare_lookup_aux(&store, &ops, &model).unwrap();
+        prepared.extend(prepare_lookup_group_aux(&store, &ops, &model).unwrap());
+        prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
+        let mut aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
+        assert!(validate_aux_descriptors(&ops, &model, &aux));
+        // A group descriptor for the dynamic-table lookup (op index 2) is not
+        // in the structural spec set: reject.
+        let dyn_len = *model.tensor_lengths.get(&TensorKey::Field(dyn_t).encoded().unwrap()).unwrap();
+        let dyn_padded = dyn_len.checked_next_power_of_two().unwrap().max(32);
+        let fake = o7b_commit_aux(2, AuxRole::LookupMultiplicityAgg, dyn_len,
+            dyn_padded.trailing_zeros() as usize, vec![vec![Goldilocks::ZERO; dyn_padded]]);
+        aux.push(fake.descriptor);
+        assert!(!validate_aux_descriptors(&ops, &model, &aux),
+            "dynamic table mixed into a group must be rejected");
     }
 
     /// O6: the bound prover forwards once (one Projection matmul) and the
