@@ -177,7 +177,48 @@ is intentional: dropping it would let its multiplicity contribute to M while
 its witness rows were unchecked. Real A/B/C/full64 have no dead static
 lookups.
 
+## Step (c) — one group-level table opening
+
+State: `b80e079` + step (c) on `fix/soundness-repair`.
+
+### Change
+
+`LookupGroupProof` now carries the group's single `table_opening`. Member
+`ReverseLookupProof`s set `table_opening = None`; their `table_value` remains
+the group table eval (canonical bytes) and the verifier requires it to equal
+the group-authenticated value. The verifier checks the opening exactly once
+in the group phase, at the shared table denominator leaf `tc.q_den`, against
+the trusted model root with the M descriptor arity, and checks the leaf
+relation `tc.den_leaf == alpha + index(tc.q_den) + beta * table_eval` there.
+The per-member opening and the member-agreement map are removed; the group
+relation after the reverse loop uses only the member witness-tree roots.
+
+Fiat–Shamir order is unchanged: WHIR opening proofs use their own transcript,
+and all main-transcript absorptions (group identity, shared table fraction
+tree, per-op witness/padding/multiplicity) are untouched.
+
+### Regression and baseline
+
+- `zkie-ops --lib`: 164/0. The O7 test now asserts per-member
+  `table_opening == None` and the single group opening.
+- Real A/B/C: A 241,874, B 491,978, C 355,183 — unchanged from (b). B and the
+  full64 chain have exactly ONE static lookup (singleton group), so they had
+  no duplicate opening to remove; step (c) is byte-neutral for them.
+- Full64: B 540,239 B; `CORE-CHAIN-OK`; verify 161.1 ms (prove 236.2 s).
+- 2^18 two-member group (`o7_lookup`): 858,517 -> **764,925 B** (-93,592 B,
+  exactly one duplicated opening), hash `ac2d8bb3075b392b`, ~0.55 s, one
+  table commit, identical in both `ZKIE_O7_TABLE_CACHE` modes. This is now
+  below the pre-(b) per-op 793,525 B for the same two-lookup shape.
+- All four deep-O7 negatives and the existing suites stay green; deterministic
+  PoW and 90-bit security unchanged.
+
+### Scope
+
+Step (c) only removes the duplicated opening; it is byte-neutral for the real
+singleton groups. Step (d) remains: synthetic ≥2 same-table example at real
+scale, full before/after table-tree/opening/proof-byte/scan-byte/time
+measurements, and the final record.
+
 ## Remaining
 
-Steps (c) shared table opening; (d) measurements + docs. S7 is not accepted;
-S8/S9 postponed.
+Step (d) measurements + docs. S7 is not accepted; S8/S9 postponed.

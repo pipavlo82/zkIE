@@ -1,9 +1,9 @@
 //! O7 measurement: two Lookups into the SAME trusted static table. Per-proof
-//! table commitment sharing landed first; deep O7 (b) now also aggregates the
-//! multiplicity (M = m1 + m2), shares one table-side fraction tree with a
-//! common alpha/beta, and binds the group relation. Step (c) will share the
-//! table opening and step (d) reworks this harness into the before/after
-//! measurement; until then its counter shows the current commit count.
+//! table commitment sharing landed first; deep O7 (b) aggregated the
+//! multiplicity (M = m1 + m2) and shared one table-side fraction tree with a
+//! common alpha/beta; (c) reduced the table opening to one group-level copy.
+//! Step (d) reworks this harness into the full before/after measurement;
+//! until then its counter shows the current commit count.
 //!
 //! Run with `ZKIE_O7_TABLE_CACHE=0` and with the default cache. Proof bytes
 //! must be identical.
