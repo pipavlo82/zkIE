@@ -18,7 +18,8 @@
 
 use std::borrow::Cow;
 
-use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
+use crate::common::field::{Ef, Goldilocks, PrimeCharacteristicRing};
+use crate::common::ef_outer;
 use crate::common::mle;
 use crate::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
 use crate::common::transcript::Transcript;
@@ -358,6 +359,85 @@ impl StreamedWeights {
         }
         Some(out)
     }
+}
+
+/// S9 EF version of [`StreamedWeights`]: `v` is an EF point, `row_dots` and
+/// `w_v` are EF, and the per-expert table terminals are recovered at an EF
+/// `ch_d` point.
+pub struct StreamedWeightsEf {
+    pub w_v: Vec<Ef>,
+    row_dots: Vec<Ef>,
+    experts_read: Vec<bool>,
+    n_experts: usize,
+    k: usize,
+}
+
+impl StreamedWeightsEf {
+    pub fn table_evals(&self, ch_d: &[Ef]) -> Option<Vec<Ef>> {
+        if ch_d.len() != self.k.trailing_zeros() as usize {
+            return None;
+        }
+        if self.experts_read.iter().any(|&r| !r) {
+            return None;
+        }
+        let eq_d = ef_outer::eq_evals(ch_d);
+        let mut out = Vec::with_capacity(self.n_experts);
+        for e in 0..self.n_experts {
+            let mut acc = Ef::ZERO;
+            for d in 0..self.k {
+                acc = acc + eq_d[d] * self.row_dots[e * self.k + d];
+            }
+            out.push(acc);
+        }
+        Some(out)
+    }
+}
+
+/// EF streaming pass: identical block traversal to [`stream_weights`], with
+/// the `v` fold and all derived values in EF.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_weights_ef(
+    expert_of: &[u32],
+    weights: &WeightBlocks<'_>,
+    s: usize,
+    n_experts: usize,
+    k: usize,
+    n: usize,
+    v: &[Ef],
+    all_experts: bool,
+) -> StreamedWeightsEf {
+    assert_eq!(expert_of.len(), s);
+    assert_eq!(weights.len(), n_experts * k * n, "expert weight shape mismatch");
+    assert_eq!(v.len(), n.trailing_zeros() as usize, "seq point arity mismatch");
+    let eq_v = ef_outer::eq_evals(v);
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n_experts];
+    for (pos, &e) in expert_of.iter().enumerate() {
+        assert!((e as usize) < n_experts, "expert id out of range");
+        buckets[e as usize].push(pos);
+    }
+    let mut w_v = vec![Ef::ZERO; s * k];
+    let mut row_dots = vec![Ef::ZERO; n_experts * k];
+    let mut experts_read = vec![false; n_experts];
+    for e in 0..n_experts {
+        if !all_experts && buckets[e].is_empty() {
+            continue;
+        }
+        let block = weights.block(e, k, n);
+        debug_assert_eq!(block.len(), k * n);
+        for d in 0..k {
+            let row = &block[d * n..(d + 1) * n];
+            let mut acc = Ef::ZERO;
+            for j in 0..n {
+                acc = acc + Ef::from(row[j]) * eq_v[j];
+            }
+            row_dots[e * k + d] = acc;
+        }
+        for &pos in &buckets[e] {
+            w_v[pos * k..(pos + 1) * k].copy_from_slice(&row_dots[e * k..(e + 1) * k]);
+        }
+        experts_read[e] = true;
+    }
+    StreamedWeightsEf { w_v, row_dots, experts_read, n_experts, k }
 }
 
 /// Fold each expert's `K x N` block against `eq(j, v)` once, then emit

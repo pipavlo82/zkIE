@@ -361,6 +361,47 @@ Existing base-field paths remain untouched; no proof bytes changed. Composer
 claim/reverse migration, budget caps, dead-field canonicalization and A/B/D/C
 measurements remain for 2b-2b/2b-2c.
 
+## 9e. Step 2b-2b status — composer reverse layer on EF
+
+Sub-step 2b-2b migrates the composer's outer claim/reduction layer to EF.
+The committed data plane is unchanged: tensors, Merkle commitments, table
+contents and public execution values stay in the base field.
+
+- `EfClaim` (tensor id, EF point, EF value) replaces `EvalClaim` across
+  `reverse_setup` / `prove_reverse_dag` / `verify_reverse_dag` and every
+  per-op reverse prover/verifier (Gather, TopKSelect, BroadcastScale,
+  ScaleVec[Shifted], Scatter, GeluIndex, Scale, Argmax, GatherMatMul,
+  Lookup, Projection, Relu, and the reduction steps).
+- `ReverseReduction` scalar variants (Add, CombineIdx, IdxBroadcast,
+  PadIdx) and all reverse proof structs carry EF points, claimed values and
+  sumcheck terminals. Round messages use the EF cores from 2a/2b-1;
+  `common/ef_batched.rs` adds the per-position batched MatMul reduction and
+  `StreamedWeightsEf` streams the folded weight matrix in EF.
+- The LogUp fractional chain (α, β, γ, per-layer claims and leaf values),
+  tie/rank/signed-range/remainder relations, and the O7 deep weight groups
+  are EF throughout.
+- `execution_seeds` lifts each public F tensor by evaluating it at the EF
+  challenge point (`mle_eval_at_ef`), producing EF claims; transcript
+  absorption of EF values uses the two-lane encoding from 2a.
+- PCS boundary: aux, weight-batch, selector and token openings all use
+  `prove/verify_batch_open_committed_ef`. Openings are checked against the
+  original base-field commitments at the EF challenge points, so EF proofs
+  cannot re-point a base commitment; the verifier never trusts an EF value
+  without replaying the corresponding opening.
+- The legacy committed-DAG verifier was already permanently closed; its
+  dead inner verifier is deleted in this step. The legacy prover keeps a
+  base-field token-evaluation helper because its output is never accepted
+  (the byte entry rejects before decoding).
+- The S8 verifier caps run unchanged before any EF challenge derivation.
+  All S1–S8 negative and fuzz tests pass unchanged, including the
+  `s8_*_reject_without_panic` wire-mutation tests.
+
+Verification: `cargo test -p zkie-core --release` 88 passed / 1 ignored;
+`cargo test -p zkie-ops --release` 175 passed (all S1–S8 negatives included);
+`cargo check --workspace --release` clean. Verifier budget caps, dead-field
+canonicalization and the real A/B/D/C before/after measurements remain for
+2b-2c/2b-2d.
+
 ## 10. Acceptance status
 
 Step 1 delivers only this inventory and budget. The S9 acceptance items

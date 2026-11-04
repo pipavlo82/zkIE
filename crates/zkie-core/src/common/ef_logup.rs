@@ -211,6 +211,80 @@ pub fn fractional_leaf(proof: &EfFractionalProof) -> (Vec<Ef>, Ef, Vec<Ef>, Ef) 
     }
 }
 
+/// EF permutation proof: two fractional sides plus the EF alpha. The
+/// permutation columns `a`/`b` are tensor data and stay base-field; the
+/// verifier never consumes them (they are prover-side context).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct EfPermutationProof {
+    pub a_side: EfFractionalProof,
+    pub b_side: EfFractionalProof,
+    pub alpha: Ef,
+    pub a: Vec<Ef>,
+    pub b: Vec<Ef>,
+}
+
+/// Permutation-side LogUp columns over EF: `1/(α−value[i])`.
+pub fn build_perm_num_den(value: &[Ef], alpha: Ef) -> (Vec<Ef>, Vec<Ef>) {
+    let total = value.len().next_power_of_two().max(32);
+    let mut num = vec![Ef::ZERO; total];
+    let mut den = vec![alpha; total];
+    for i in 0..value.len() {
+        num[i] = Ef::ONE;
+        den[i] = alpha - value[i];
+    }
+    (num, den)
+}
+
+pub fn prove_permutation(
+    a: &[Ef],
+    b: &[Ef],
+    transcript: &mut Transcript,
+) -> EfPermutationProof {
+    assert_eq!(a.len(), b.len());
+    let alpha = transcript.ef_field();
+    let (num_a, den_a) = build_perm_num_den(a, alpha);
+    let (num_b, den_b) = build_perm_num_den(b, alpha);
+    let a_side = prove_fractional(num_a, den_a, transcript);
+    let b_side = prove_fractional(num_b, den_b, transcript);
+    EfPermutationProof { a_side, b_side, alpha, a: a.to_vec(), b: b.to_vec() }
+}
+
+pub fn verify_lookup_split(
+    witness: &EfFractionalProof,
+    table: &EfFractionalProof,
+    t_witness: usize,
+    t_table: usize,
+    transcript: &mut Transcript,
+) -> bool {
+    let wc = match verify_fractional_chain_core(witness, t_witness, transcript) {
+        Some(c) => c,
+        None => return false,
+    };
+    if wc.final_den == Ef::ZERO {
+        return false;
+    }
+    let tc = match verify_fractional_chain_core(table, t_table, transcript) {
+        Some(c) => c,
+        None => return false,
+    };
+    if tc.final_den == Ef::ZERO {
+        return false;
+    }
+    wc.final_num * tc.final_den == tc.final_num * wc.final_den
+}
+
+pub fn verify_permutation(
+    proof: &EfPermutationProof,
+    t: usize,
+    transcript: &mut Transcript,
+) -> bool {
+    let alpha = transcript.ef_field();
+    if alpha != proof.alpha {
+        return false;
+    }
+    verify_lookup_split(&proof.a_side, &proof.b_side, t, t, transcript)
+}
+
 /// Multiplicity of each table entry for one routing array.
 pub fn lookup_multiplicity(x: &[u32], t: usize) -> Vec<u64> {
     let mut m = vec![0u64; t];
@@ -233,6 +307,40 @@ pub fn merge_multiplicity(xs: &[&[u32]], t: usize) -> Vec<u64> {
         }
     }
     m
+}
+
+/// Batched witness-side EF columns: flatten all `(x,y)` pairs into one
+/// column, padded to at least 2^5 (the WHIR folding-factor floor), and prove
+/// the fraction tree. Returns the proof plus the flattened x/y/num/den
+/// columns for the caller's openings.
+pub fn prove_lookup_witness_batch_columns(
+    xs: &[&[u32]],
+    ys: &[&[Goldilocks]],
+    alpha: Ef,
+    beta: Ef,
+    transcript: &mut Transcript,
+) -> (EfFractionalProof, Vec<Ef>, Vec<Ef>, Vec<Ef>, Vec<Ef>) {
+    assert_eq!(xs.len(), ys.len());
+    let n: usize = xs.iter().map(|x| x.len()).sum();
+    let total = n.next_power_of_two().max(32);
+    let mut num = vec![Ef::ZERO; total];
+    let mut x_flat = vec![Ef::ZERO; total];
+    let mut y_flat = vec![Ef::ZERO; total];
+    let mut den = vec![Ef::ZERO; total];
+    let mut pos = 0usize;
+    for (x, y) in xs.iter().zip(ys.iter()) {
+        for i in 0..x.len() {
+            num[pos] = Ef::ONE;
+            x_flat[pos] = ef_u64(x[i] as u64);
+            y_flat[pos] = efg(y[i]);
+            pos += 1;
+        }
+    }
+    for j in 0..total {
+        den[j] = alpha + x_flat[j] + beta * y_flat[j];
+    }
+    let proof = prove_fractional(num.clone(), den.clone(), transcript);
+    (proof, x_flat, y_flat, num, den)
 }
 
 /// Witness-side LogUp columns over EF: `1/(α+x_i+β·y_i)`.
@@ -268,18 +376,6 @@ pub fn build_lookup_table_num_den(
         num[j] = if j < t { ef_u64(m[j]) } else { Ef::ZERO };
         let tj = if j < t { table[j] } else { Goldilocks::ZERO };
         den[j] = alpha + ef_u64(j as u64) + beta * efg(tj);
-    }
-    (num, den)
-}
-
-/// Permutation-side LogUp columns over EF: `1/(α−value[i])`.
-pub fn build_perm_num_den(value: &[Goldilocks], alpha: Ef) -> (Vec<Ef>, Vec<Ef>) {
-    let total = value.len().next_power_of_two().max(32);
-    let mut num = vec![Ef::ZERO; total];
-    let mut den = vec![alpha; total];
-    for i in 0..value.len() {
-        num[i] = Ef::ONE;
-        den[i] = alpha - efg(value[i]);
     }
     (num, den)
 }

@@ -33,7 +33,11 @@ use crate::rope::{prove_rope, rope_forward, rope_out_points, verify_rope, RoPEPr
 use crate::softmax_scaled::{prove_softmax_rounded, verify_softmax_rounded, SoftmaxRoundedProof};
 use crate::topk::{argmax_forward, prove_argmax, prove_topk, topk_forward, verify_argmax, verify_topk, ArgmaxProof, TopKSelectProof};
 use rayon::prelude::*;
-use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+use zkie_core::common::field::{Field, Goldilocks, Ef, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+use zkie_core::common::ef_outer::{self as efo, EfSamePolyProof, EfVirtualProof};
+use zkie_core::common::ef_matmul::EfMatmulProof;
+use zkie_core::common::ef_logup::{EfFractionalProof, EfFractionalChainClaims, EfPermutationProof};
+use zkie_core::pcs::ef_batch_open::{EfBatchOpeningProof, prove_batch_open_committed_ef, verify_batch_open_committed_ef};
 use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
 use zkie_core::common::logup_gkr::{
     prove_lookup_fractional, prove_lookup_fractional_batch, prove_lookup_fractional_columns,
@@ -55,6 +59,40 @@ use zkie_core::common::weights_io::WeightMmap;
 /// The largest proof recorded in this workspace's benchmarks is ~225 MB
 /// (DeepSeek-V2-Lite, 512 tokens, legacy committed pipeline); 512 MiB keeps
 /// more than 2x headroom while making decode memory bounded and explicit.
+/// S9 EF helpers used by the migrated bound/reverse layer.
+#[inline]
+fn ef_u64(x: u64) -> Ef {
+    Ef::from(Goldilocks::from_u64(x))
+}
+
+#[inline]
+fn ef_i64(x: i64) -> Ef {
+    if x >= 0 { ef_u64(x as u64) } else { -ef_u64((-x) as u64) }
+}
+
+#[inline]
+fn ef_lift(values: &[Goldilocks]) -> Vec<Ef> {
+    values.iter().map(|&x| Ef::from(x)).collect()
+}
+
+#[inline]
+fn lift_columns(cols: &[Vec<Goldilocks>]) -> Vec<Vec<Ef>> {
+    cols.iter().map(|c| ef_lift(c)).collect()
+}
+
+/// Evaluate a base-field MLE at an EF point. The length contract is checked
+/// by the callers' statement-derived arities; an internal mismatch is a
+/// protocol-construction error, not a proof-data decision.
+#[inline]
+fn ef_eval(values: &[Goldilocks], point: &[Ef]) -> Ef {
+    efo::mle_eval_at_ef(values, point).expect("EF MLE evaluation")
+}
+
+#[inline]
+fn ef_eq_poly(r: &[Ef], x: &[Ef]) -> Ef {
+    efo::eq_poly(r, x).expect("EF eq-poly arity")
+}
+
 pub const MAX_PROOF_BYTES: usize = 512 * 1024 * 1024;
 /// Aux descriptors are fully pinned to the trusted graph; this cap bounds the
 /// work done before that comparison.
@@ -235,7 +273,7 @@ fn derive_lookup_group_ab(
     transcript: &mut Transcript,
     ops: &[Op],
     model: &TrustedModelManifest,
-) -> Option<std::collections::BTreeMap<T, (Goldilocks, Goldilocks)>> {
+) -> Option<std::collections::BTreeMap<T, (Ef, Ef)>> {
     let groups = static_lookup_groups(ops, model)?;
     let mut out = std::collections::BTreeMap::new();
     for (tid, members) in groups {
@@ -248,8 +286,8 @@ fn derive_lookup_group_ab(
         for &oi in &members {
             transcript.absorb_u64(oi as u64);
         }
-        let alpha = transcript.field();
-        let beta = transcript.field();
+        let alpha = transcript.ef_field();
+        let beta = transcript.ef_field();
         out.insert(tid, (alpha, beta));
     }
     Some(out)
@@ -307,6 +345,16 @@ pub struct EvalClaim {
     pub tensor_id: T,
     pub point: Vec<Goldilocks>,
     pub value: Goldilocks,
+}
+
+/// S9: EF challenge claim used by the bound/outer reverse layer. Tensor data
+/// and public execution values remain base-field; the challenge point and
+/// evaluation are EF (2-lane wire).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EfClaim {
+    pub tensor_id: T,
+    pub point: Vec<Ef>,
+    pub value: Ef,
 }
 
 /// Field and index tensor IDs occupy distinct Store namespaces. Reverse claims
@@ -374,13 +422,13 @@ struct ReverseGatherProof {
     /// Routing relation (claim 0): selector booleanity, exactly one token per
     /// valid position (mask), and token_id(pos) = sum_t t*M[t,pos]. The
     /// verifier only opens the committed one-hot columns at the derived point.
-    routing: VirtualProof,
+    routing: EfVirtualProof,
     /// Eq-weighted product sumcheck over the position domain:
     /// sum_pos R'(pos) * W'(pos) * gate(pos) == out~(r_j, r_t).
-    sum: VirtualProof,
+    sum: EfVirtualProof,
     /// Selector evaluations M[t](z_r), one per token (aux batch opening).
-    aux_values: Vec<Goldilocks>,
-    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    aux_values: Vec<Ef>,
+    opening: EfBatchOpeningProof,
 }
 
 fn gather_dims(op: &Op) -> Option<(T, T, T, T, usize, usize)> {
@@ -395,9 +443,9 @@ fn gather_dims(op: &Op) -> Option<(T, T, T, T, usize, usize)> {
 
 /// S7b: eq-weighted token-routing relation terms. MLE indices: 0 = eq,
 /// 1..=m the one-hot token selectors, 1+m the token_id column, 2+m the mask.
-fn gather_routing_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec<usize>)> {
+fn gather_routing_terms(gamma: Ef, count: usize) -> Vec<(Ef, Vec<usize>)> {
     let mut terms = Vec::with_capacity(4 * count + 2);
-    let mut gp = Goldilocks::ONE;
+    let mut gp = Ef::ONE;
     for t in 0..count {
         terms.push((gp, vec![0usize, 1 + t, 1 + t]));
         terms.push((-gp, vec![0usize, 1 + t]));
@@ -405,7 +453,7 @@ fn gather_routing_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec
     }
     let tie_w = gp;
     for t in 0..count {
-        terms.push((tie_w * Goldilocks::from_u64(t as u64), vec![0usize, 1 + t]));
+        terms.push((tie_w * ef_u64(t as u64), vec![0usize, 1 + t]));
     }
     terms.push((-tie_w, vec![0usize, 1 + count]));
     let onehot_w = tie_w * gamma;
@@ -416,9 +464,9 @@ fn gather_routing_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec
     terms
 }
 
-fn prove_reverse_gather(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+fn prove_reverse_gather(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     aux: PreparedAux, transcript: &mut Transcript)
-    -> Option<(ReverseGatherProof, Vec<EvalClaim>)>
+    -> Option<(ReverseGatherProof, Vec<EfClaim>)>
 {
     let (weighted, token_id, gate, out, m, h) = gather_dims(op)?;
     let lg_h = h.trailing_zeros() as usize;
@@ -436,37 +484,38 @@ fn prove_reverse_gather(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
     if tok.len() != s { return None; }
 
     // Routing relation (claim 0).
-    let q_r: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma = transcript.field();
+    let q_r: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma = transcript.ef_field();
     let terms = gather_routing_terms(gamma, m);
-    let eq_r = mle::eq_evals(&q_r);
-    let mut tok_pad = vec![Goldilocks::ZERO; padded];
-    for (pos, &t) in tok.iter().enumerate() { tok_pad[pos] = Goldilocks::from_u64(t as u64); }
-    let mut mask = vec![Goldilocks::ZERO; padded];
-    for pos in 0..s { mask[pos] = Goldilocks::ONE; }
-    let mut mles: Vec<&[Goldilocks]> = vec![&eq_r];
-    for t in 0..m { mles.push(&aux.columns[t]); }
+    let eq_r = efo::eq_evals(&q_r);
+    let mut tok_pad = vec![Ef::ZERO; padded];
+    for (pos, &t) in tok.iter().enumerate() { tok_pad[pos] = ef_u64(t as u64); }
+    let mut mask = vec![Ef::ZERO; padded];
+    for pos in 0..s { mask[pos] = Ef::ONE; }
+    let aux_cols = lift_columns(&aux.columns);
+    let mut mles: Vec<&[Ef]> = vec![&eq_r];
+    for t in 0..m { mles.push(aux_cols[t].as_slice()); }
     mles.push(&tok_pad);
     mles.push(&mask);
-    let (routing, zr) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    let (routing, zr) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
 
     // Scatter-add sumcheck anchored at the output claim.
-    let eq_t = mle::eq_evals(r_t);
-    let mut r_prime = vec![Goldilocks::ZERO; padded];
+    let eq_t = efo::eq_evals(r_t);
+    let mut r_prime = vec![Ef::ZERO; padded];
     for (pos, &t) in tok.iter().enumerate() { r_prime[pos] = eq_t[t as usize]; }
-    let eq_j = mle::eq_evals(r_j);
-    let mut w_prime = vec![Goldilocks::ZERO; padded];
+    let eq_j = efo::eq_evals(r_j);
+    let mut w_prime = vec![Ef::ZERO; padded];
     for pos in 0..s {
-        let mut acc = Goldilocks::ZERO;
-        for j in 0..h { acc = acc + eq_j[j] * store.get(weighted)[pos * h + j]; }
+        let mut acc = Ef::ZERO;
+        for j in 0..h { acc = acc + eq_j[j] * Ef::from(store.get(weighted)[pos * h + j]); }
         w_prime[pos] = acc;
     }
-    let mut gate_pad = vec![Goldilocks::ZERO; padded];
-    for pos in 0..s { gate_pad[pos] = store.get(gate)[pos]; }
-    let q_g: Vec<Goldilocks> = transcript.field_vec(arity);
-    let sum_terms = vec![(Goldilocks::ONE, vec![0usize, 1usize, 2usize])];
-    let sum_mles: [&[Goldilocks]; 3] = [&r_prime, &w_prime, &gate_pad];
-    let (sum, zg) = prove_virtual(&sum_mles, &sum_terms, v, transcript);
+    let mut gate_pad = vec![Ef::ZERO; padded];
+    for pos in 0..s { gate_pad[pos] = Ef::from(store.get(gate)[pos]); }
+    let q_g: Vec<Ef> = transcript.ef_field_vec(arity);
+    let sum_terms = vec![(Ef::ONE, vec![0usize, 1usize, 2usize])];
+    let sum_mles: [&[Ef]; 3] = [&r_prime, &w_prime, &gate_pad];
+    let (sum, zg) = efo::prove_virtual(&sum_mles, &sum_terms, v, transcript);
     if sum.final_evals.len() != 3 || routing.final_evals.len() != m + 3 { return None; }
 
     // Aux opening: the m selectors at zr (routing endpoints) and at zg (the
@@ -474,26 +523,18 @@ fn prove_reverse_gather(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
     let zp = argmax_pad_point(&zr, arity);
     let zpg = argmax_pad_point(&zg, arity);
     let mut idxs: Vec<usize> = Vec::with_capacity(2 * m);
-    let mut points: Vec<Vec<Goldilocks>> = Vec::with_capacity(2 * m);
-    let mut values: Vec<Goldilocks> = Vec::with_capacity(2 * m);
-    for t in 0..m { idxs.push(t); points.push(zp.clone()); values.push(mle::eval(&aux.columns[t], &zp)); }
-    for t in 0..m { idxs.push(t); points.push(zpg.clone()); values.push(mle::eval(&aux.columns[t], &zpg)); }
-    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&t| aux.columns[t].clone()).collect();
-    let ctx = zkie_core::pcs::committed::BatchCtx {
-        commitment: aux.descriptor.commitment.clone(),
-        prover_data: aux.prover_data,
-        protocol: aux.protocol,
-        whir: aux.whir,
-        num_tables: aux.descriptor.columns,
-    };
-    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+    let mut points: Vec<Vec<Ef>> = Vec::with_capacity(2 * m);
+    let mut values: Vec<Ef> = Vec::with_capacity(2 * m);
+    for t in 0..m { idxs.push(t); points.push(zp.clone()); values.push(ef_eval(&aux.columns[t], &zp)); }
+    for t in 0..m { idxs.push(t); points.push(zpg.clone()); values.push(ef_eval(&aux.columns[t], &zpg)); }
+    let opening = open_aux(aux, &idxs, &points, &values)?;
 
     // Zero-extension to the tensors' own domains.
     let lb = s.checked_next_power_of_two()?.trailing_zeros() as usize;
     if zr.len() < lb || zg.len() < lb { return None; }
     let pad_r = zero_ext_factor(&zr, lb);
     let pad_g = zero_ext_factor(&zg, lb);
-    if pad_r == Goldilocks::ZERO || pad_g == Goldilocks::ZERO { return None; }
+    if pad_r == Ef::ZERO || pad_g == Ef::ZERO { return None; }
     let mut w_point = r_j.to_vec();
     w_point.extend_from_slice(&zg[..lb]);
     let tok_key = TensorKey::Index(token_id).encoded()?;
@@ -501,15 +542,15 @@ fn prove_reverse_gather(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
     let fe_r = routing.final_evals.clone();
     Some((ReverseGatherProof { routing, sum, aux_values: values, opening },
         vec![
-            EvalClaim { tensor_id: weighted, point: w_point, value: fe_sum[1] * pad_g.inverse() },
-            EvalClaim { tensor_id: gate, point: zg[..lb].to_vec(), value: fe_sum[2] * pad_g.inverse() },
-            EvalClaim { tensor_id: tok_key, point: zr[..lb].to_vec(), value: fe_r[1 + m] * pad_r.inverse() },
+            EfClaim { tensor_id: weighted, point: w_point, value: fe_sum[1] * pad_g.inverse() },
+            EfClaim { tensor_id: gate, point: zg[..lb].to_vec(), value: fe_sum[2] * pad_g.inverse() },
+            EfClaim { tensor_id: tok_key, point: zr[..lb].to_vec(), value: fe_r[1 + m] * pad_r.inverse() },
         ]))
 }
 
-fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     descriptor: &AuxDescriptor, proof: &ReverseGatherProof, transcript: &mut Transcript)
-    -> Option<Vec<EvalClaim>>
+    -> Option<Vec<EfClaim>>
 {
     let (weighted, token_id, gate, out, m, h) = gather_dims(op)?;
     let lg_h = h.trailing_zeros() as usize;
@@ -522,39 +563,35 @@ fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     let arity = descriptor.arity;
     if proof.aux_values.len() != 2 * m { return None; }
 
-    let q_r: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma = transcript.field();
+    let q_r: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma = transcript.ef_field();
     let terms = gather_routing_terms(gamma, m);
-    let (okr, zr, fc_r) = verify_virtual(&proof.routing, &terms, Goldilocks::ZERO, arity, transcript);
+    let (okr, zr, fc_r) = efo::verify_virtual(&proof.routing, &terms, Ef::ZERO, arity, transcript);
     if !okr { return None; }
     let fe_r = &proof.routing.final_evals;
     if fe_r.len() != m + 3 { return None; }
-    if fe_r[0] != mle::eq_poly(&q_r, &zr) { return None; }
+    if fe_r[0] != ef_eq_poly(&q_r, &zr) { return None; }
     for t in 0..m { if fe_r[1 + t] != proof.aux_values[t] { return None; } }
     if fe_r[2 + m] != expert_mask_eval(&zr, s) { return None; }
-    if fc_r != virtual_eval(&terms, fe_r) { return None; }
+    if fc_r != efo::virtual_eval(&terms, fe_r) { return None; }
 
     // Aux opening at zr (routing endpoints) and zg (scatter-add endpoint).
     let zp = argmax_pad_point(&zr, arity);
     // Scatter-add: R'(z) is computed from the opened selectors only.
-    let q_g: Vec<Goldilocks> = transcript.field_vec(arity);
-    let sum_terms = vec![(Goldilocks::ONE, vec![0usize, 1usize, 2usize])];
-    let (ok, zg, fc) = verify_virtual(&proof.sum, &sum_terms, v, arity, transcript);
+    let q_g: Vec<Ef> = transcript.ef_field_vec(arity);
+    let sum_terms = vec![(Ef::ONE, vec![0usize, 1usize, 2usize])];
+    let (ok, zg, fc) = efo::verify_virtual(&proof.sum, &sum_terms, v, arity, transcript);
     if !ok { return None; }
     let fe = &proof.sum.final_evals;
     if fe.len() != 3 { return None; }
     let zpg = argmax_pad_point(&zg, arity);
     let mut idxs: Vec<usize> = Vec::with_capacity(2 * m);
-    let mut points: Vec<Vec<Goldilocks>> = Vec::with_capacity(2 * m);
+    let mut points: Vec<Vec<Ef>> = Vec::with_capacity(2 * m);
     for t in 0..m { idxs.push(t); points.push(zp.clone()); }
     for t in 0..m { idxs.push(t); points.push(zpg.clone()); }
-    let (whir, protocol) = aux_batch_whir(descriptor)?;
-    if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-        &whir, &descriptor.commitment, &protocol, descriptor.columns,
-        &idxs, &points, &proof.aux_values, &proof.opening,
-    ) { return None; }
-    let eq_t = mle::eq_evals(r_t);
-    let mut rp_z = Goldilocks::ZERO;
+    if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
+    let eq_t = efo::eq_evals(r_t);
+    let mut rp_z = Ef::ZERO;
     for t in 0..m { rp_z = rp_z + eq_t[t] * proof.aux_values[m + t]; }
     if fe[0] != rp_z || fc != fe[0] * fe[1] * fe[2] { return None; }
     let _ = q_g;
@@ -563,16 +600,16 @@ fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     if zr.len() < lb || zg.len() < lb { return None; }
     let pad_r = zero_ext_factor(&zr, lb);
     let pad_g = zero_ext_factor(&zg, lb);
-    if pad_r == Goldilocks::ZERO || pad_g == Goldilocks::ZERO { return None; }
+    if pad_r == Ef::ZERO || pad_g == Ef::ZERO { return None; }
     let mut w_point = r_j.to_vec();
     w_point.extend_from_slice(&zg[..lb]);
     // tok endpoint from the routing virtual, mapped to the token tensor domain.
     let tok_key = TensorKey::Index(token_id).encoded()?;
     let tok_val = fe_r[1 + m] * pad_r.inverse();
     Some(vec![
-        EvalClaim { tensor_id: weighted, point: w_point, value: fe[1] * pad_g.inverse() },
-        EvalClaim { tensor_id: gate, point: zg[..lb].to_vec(), value: fe[2] * pad_g.inverse() },
-        EvalClaim { tensor_id: tok_key, point: zr[..lb].to_vec(), value: tok_val },
+        EfClaim { tensor_id: weighted, point: w_point, value: fe[1] * pad_g.inverse() },
+        EfClaim { tensor_id: gate, point: zg[..lb].to_vec(), value: fe[2] * pad_g.inverse() },
+        EfClaim { tensor_id: tok_key, point: zr[..lb].to_vec(), value: tok_val },
     ])
 }
 
@@ -649,60 +686,60 @@ struct ReverseTopKSelectProof {
     /// Witness batch arity (lgn + lgm; also pinned by the aux descriptor).
     arity: usize,
     /// sel/att/witness-bit Booleanity, gamma-combined (claim 0).
-    bools: VirtualProof,
+    bools: EfVirtualProof,
     /// sum_e sel = k and sum_e att = 1, gamma-combined (claim g0*k + g1).
-    row_sums: VirtualProof,
+    row_sums: EfVirtualProof,
     /// gate = sel*x (eq-weighted, claim 0).
-    gate: VirtualProof,
+    gate: EfVirtualProof,
     /// d1 = sel*(x - thr_b) = sum_b 2^b d1_b (claim 0).
-    d1: VirtualProof,
+    d1: EfVirtualProof,
     /// d2s = (1-sel)*(thr_b - x - 1) = sum_b 2^b d2s_b (claim 0).
-    d2s: VirtualProof,
+    d2s: EfVirtualProof,
     /// att*(1-sel) = 0 (claim 0).
-    att_sel: VirtualProof,
+    att_sel: EfVirtualProof,
     /// att*(x - thr_b) = 0 (claim 0).
-    att_gap: VirtualProof,
+    att_gap: EfVirtualProof,
     /// sum_pos eq(q,pos)*thr_b(pos) = thr~(q_hi): whole-column broadcast
     /// against the committed row-domain thr column (claim thr~(q_hi)).
-    broadcast: VirtualProof,
+    broadcast: EfVirtualProof,
     /// Authenticated signed range: x + 2^22 = sum_b 2^b range_b with Boolean
     /// range bits (claim 0), so the 16-bit gaps imply the to_i64 order.
-    x_range: VirtualProof,
+    x_range: EfVirtualProof,
     /// Same signed range for the thr_b column used by the gap relations.
-    thr_range: VirtualProof,
+    thr_range: EfVirtualProof,
     /// Witness-column evaluations in the exact order rebuilt by the verifier.
-    aux_values: Vec<Goldilocks>,
-    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    aux_values: Vec<Ef>,
+    opening: EfBatchOpeningProof,
     /// thr-aux evaluations: [thr~(q_hi), thr~(qt)].
-    thr_values: Vec<Goldilocks>,
-    thr_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    thr_values: Vec<Ef>,
+    thr_opening: EfBatchOpeningProof,
     /// Range-aux evaluations (range bits at the range endpoint).
-    range_aux_values: Vec<Goldilocks>,
-    range_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    range_aux_values: Vec<Ef>,
+    range_opening: EfBatchOpeningProof,
     /// thr_b range-aux evaluations and opening.
-    thr_range_values: Vec<Goldilocks>,
-    thr_range_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    thr_range_values: Vec<Ef>,
+    thr_range_opening: EfBatchOpeningProof,
     /// Deterministic tie-break relations (see the module comment above).
-    tie_zero: VirtualProof,
-    tie_bits: VirtualProof,
-    tie_rank: VirtualProof,
-    tie_row: VirtualProof,
-    tie_less: VirtualProof,
+    tie_zero: EfVirtualProof,
+    tie_bits: EfVirtualProof,
+    tie_rank: EfVirtualProof,
+    tie_row: EfVirtualProof,
+    tie_less: EfVirtualProof,
     /// Pair-multiset permutations proving P_prev/T_prev are the cyclic
     /// shifts of P/T (same primitive as ScatterOrder).
-    perm_p: PermutationProof,
-    perm_t: PermutationProof,
-    perm_b: PermutationProof,
+    perm_p: EfPermutationProof,
+    perm_t: EfPermutationProof,
+    perm_b: EfPermutationProof,
     /// Tie-aux evaluations in the exact order rebuilt by the verifier.
-    tie_aux_values: Vec<Goldilocks>,
-    tie_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    tie_aux_values: Vec<Ef>,
+    tie_opening: EfBatchOpeningProof,
 }
 
 /// Shared by prove/verify: V1 mles are [eq, sel, att, d1 bits..., d2s bits...].
-fn topk_bools_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn topk_bools_terms(gamma: Ef) -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
     let mut terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
+        (Ef::ONE, vec![0usize, 1usize]),
         (neg, vec![0usize, 1usize, 1usize]),
         (gamma, vec![0usize, 2usize]),
         (-gamma, vec![0usize, 2usize, 2usize]),
@@ -716,23 +753,23 @@ fn topk_bools_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
     terms
 }
 /// Shared by prove/verify: V2 mles are [row-broadcast eq, sel, att].
-fn topk_row_terms(g0: Goldilocks, g1: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+fn topk_row_terms(g0: Ef, g1: Ef) -> Vec<(Ef, Vec<usize>)> {
     vec![(g0, vec![0usize, 1usize]), (g1, vec![0usize, 2usize])]
 }
 /// Shared by prove/verify: V3 mles are [eq, sel, x, gate].
-fn topk_gate_terms() -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    vec![(Goldilocks::ONE, vec![0usize, 1usize, 2usize]), (neg, vec![0usize, 3usize])]
+fn topk_gate_terms() -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
+    vec![(Ef::ONE, vec![0usize, 1usize, 2usize]), (neg, vec![0usize, 3usize])]
 }
 /// Shared by prove/verify: V4 mles are [eq, sel, x, thr_b, d1 bits...].
-fn topk_d1_terms() -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn topk_d1_terms() -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
     let mut terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Ef::ONE, vec![0usize, 1usize, 2usize]),
         (neg, vec![0usize, 1usize, 3usize]),
     ];
     for b in 0..TK_RANGE_BITS {
-        terms.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 4 + b]));
+        terms.push((-ef_u64(1u64 << b), vec![0usize, 4 + b]));
     }
     terms
 }
@@ -740,43 +777,43 @@ fn topk_d1_terms() -> Vec<(Goldilocks, Vec<usize>)> {
 /// One identity (non-strict gap): eq*(thr_b - x - sel*thr_b + sel*x - d2) = 0,
 /// i.e. d2 = (1-sel)*(thr_b-x). Equality is allowed here; the tie-break
 /// relations decide which equal-to-thr positions are selected.
-fn topk_d2s_terms() -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn topk_d2s_terms() -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
     let mut terms = vec![
-        (Goldilocks::ONE, vec![0usize, 3usize]),
+        (Ef::ONE, vec![0usize, 3usize]),
         (neg, vec![0usize, 2usize]),
         (neg, vec![0usize, 1usize, 3usize]),
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Ef::ONE, vec![0usize, 1usize, 2usize]),
     ];
     for b in 0..TK_RANGE_BITS {
-        terms.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 4 + b]));
+        terms.push((-ef_u64(1u64 << b), vec![0usize, 4 + b]));
     }
     terms
 }
 /// Shared by prove/verify: V6 mles are [eq, att, sel].
-fn topk_att_sel_terms() -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    vec![(Goldilocks::ONE, vec![0usize, 1usize]), (neg, vec![0usize, 1usize, 2usize])]
+fn topk_att_sel_terms() -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
+    vec![(Ef::ONE, vec![0usize, 1usize]), (neg, vec![0usize, 1usize, 2usize])]
 }
 /// Shared by prove/verify: V7 mles are [eq, att, x, thr_b].
-fn topk_att_gap_terms() -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    vec![(Goldilocks::ONE, vec![0usize, 1usize, 2usize]), (neg, vec![0usize, 1usize, 3usize])]
+fn topk_att_gap_terms() -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
+    vec![(Ef::ONE, vec![0usize, 1usize, 2usize]), (neg, vec![0usize, 1usize, 3usize])]
 }
 /// Shared by prove/verify: V8 mles are [eq, thr_b].
-fn topk_broadcast_terms() -> Vec<(Goldilocks, Vec<usize>)> {
-    vec![(Goldilocks::ONE, vec![0usize, 1usize])]
+fn topk_broadcast_terms() -> Vec<(Ef, Vec<usize>)> {
+    vec![(Ef::ONE, vec![0usize, 1usize])]
 }
 /// Shared by prove/verify: V9 mles are [eq, x, range bits...]. The linear
 /// identity eq*(x + 2^22 - sum_b 2^b bit_b) = 0 is combined with gamma-weighted
 /// bit Booleanity in one virtual (claim 0).
-fn topk_range_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+fn topk_range_terms(gamma: Ef) -> Vec<(Ef, Vec<usize>)> {
     let mut terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (Goldilocks::from_u64(1u64 << 22), vec![0usize]),
+        (Ef::ONE, vec![0usize, 1usize]),
+        (ef_u64(1u64 << 22), vec![0usize]),
     ];
     for b in 0..TK_SIGNED_BITS {
-        terms.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 2 + b]));
+        terms.push((-ef_u64(1u64 << b), vec![0usize, 2 + b]));
     }
     let mut gp = gamma;
     for b in 0..TK_SIGNED_BITS {
@@ -786,7 +823,7 @@ fn topk_range_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
     }
     terms
 }
-fn topk_range_layout(z9: &[Goldilocks], arity: usize) -> Vec<(usize, Vec<Goldilocks>)> {
+fn topk_range_layout(z9: &[Ef], arity: usize) -> Vec<(usize, Vec<Ef>)> {
     let pad = argmax_pad_point(z9, arity);
     (0..TK_SIGNED_BITS).map(|b| (b, pad.clone())).collect()
 }
@@ -973,14 +1010,14 @@ fn prepare_topk_thr_range_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedA
 /// Exact opening layout, shared by prove/verify. Column ids are witness-batch
 /// columns; every point is padded to the batch arity.
 #[allow(clippy::too_many_arguments)]
-fn topk_witness_layout(z1: &[Goldilocks], z2: &[Goldilocks], z3: &[Goldilocks],
-    z4: &[Goldilocks], z5: &[Goldilocks], z6: &[Goldilocks], z7: &[Goldilocks],
-    z8: &[Goldilocks], z10: &[Goldilocks], z_zero: &[Goldilocks], z_less: &[Goldilocks],
-    z_row: &[Goldilocks], qs: &[Goldilocks], qg: &[Goldilocks],
-    qd: &[Goldilocks], q2: &[Goldilocks], arity: usize) -> Vec<(usize, Vec<Goldilocks>)>
+fn topk_witness_layout(z1: &[Ef], z2: &[Ef], z3: &[Ef],
+    z4: &[Ef], z5: &[Ef], z6: &[Ef], z7: &[Ef],
+    z8: &[Ef], z10: &[Ef], z_zero: &[Ef], z_less: &[Ef],
+    z_row: &[Ef], qs: &[Ef], qg: &[Ef],
+    qd: &[Ef], q2: &[Ef], arity: usize) -> Vec<(usize, Vec<Ef>)>
 {
-    let pad = |z: &[Goldilocks]| argmax_pad_point(z, arity);
-    let mut e: Vec<(usize, Vec<Goldilocks>)> = Vec::new();
+    let pad = |z: &[Ef]| argmax_pad_point(z, arity);
+    let mut e: Vec<(usize, Vec<Ef>)> = Vec::new();
     // V1: [eq, sel, att, d1 bits, d2s bits].
     e.push((TK_SEL_COL, pad(z1)));
     e.push((TK_ATT_COL, pad(z1)));
@@ -1027,8 +1064,8 @@ fn topk_witness_layout(z1: &[Goldilocks], z2: &[Goldilocks], z3: &[Goldilocks],
 
 /// thr-aux opening layout: the broadcast row point q_hi and the claimed thr
 /// point qt (row domain), both padded to the thr batch arity.
-fn topk_thr_layout(q_hi: &[Goldilocks], qt: &[Goldilocks], thr_arity: usize)
-    -> Vec<(usize, Vec<Goldilocks>)>
+fn topk_thr_layout(q_hi: &[Ef], qt: &[Ef], thr_arity: usize)
+    -> Vec<(usize, Vec<Ef>)>
 {
     vec![
         (0usize, argmax_pad_point(q_hi, thr_arity)),
@@ -1041,9 +1078,9 @@ fn topk_thr_layout(q_hi: &[Goldilocks], qt: &[Goldilocks], thr_arity: usize)
 /// T1*d1 = 0, (1-T1)*(d1*w1-1) = 0, T2*d2 = 0, (1-T2)*(d2*w2-1) = 0 and
 /// T = sel*T1 + (1-sel)*T2, so T1 = Z(d1), T2 = Z(d2) and T is the exact
 /// equality-to-threshold indicator.
-fn tie_zero_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+fn tie_zero_terms(gamma: Ef) -> Vec<(Ef, Vec<usize>)> {
     let mut t = Vec::new();
-    let mut g = Goldilocks::ONE;
+    let mut g = Ef::ONE;
     t.push((g, vec![0usize, 2usize, 4usize]));
     g = g * gamma;
     t.push((g, vec![0usize, 2usize, 3usize]));
@@ -1074,14 +1111,14 @@ fn tie_zero_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
 /// power would only pin P + t_b, letting a prover submit Boolean bit columns
 /// whose weighted sums are not bits(P)/bits(t_b); the less gadget consumes
 /// those columns directly, so that would let an arbitrary tied subset pass.
-fn tie_bits_terms(b_bits: usize, gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
-    let mut t = vec![(Goldilocks::ONE, vec![0usize, 1usize])];
+fn tie_bits_terms(b_bits: usize, gamma: Ef) -> Vec<(Ef, Vec<usize>)> {
+    let mut t = vec![(Ef::ONE, vec![0usize, 1usize])];
     for b in 0..b_bits {
-        t.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 3 + b]));
+        t.push((-ef_u64(1u64 << b), vec![0usize, 3 + b]));
     }
     t.push((gamma, vec![0usize, 2usize]));
     for b in 0..b_bits {
-        t.push((-gamma * Goldilocks::from_u64(1u64 << b), vec![0usize, 3 + b_bits + b]));
+        t.push((-gamma * ef_u64(1u64 << b), vec![0usize, 3 + b_bits + b]));
     }
     let mut g = gamma * gamma;
     for b in 0..b_bits {
@@ -1100,10 +1137,10 @@ fn tie_bits_terms(b_bits: usize, gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usiz
 /// Shared by prove/verify: mles are [eq, P, P_prev, T_prev, E0] where E0 is
 /// the row-start indicator (e = 0). E0*P = 0 and
 /// (1-E0)*(P - P_prev - T_prev) = 0 pin the 0-based prefix rank.
-fn tie_rank_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn tie_rank_terms(gamma: Ef) -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
     vec![
-        (Goldilocks::ONE, vec![0usize, 4usize, 1usize]),
+        (Ef::ONE, vec![0usize, 4usize, 1usize]),
         (gamma, vec![0usize, 1usize]),
         (-gamma, vec![0usize, 2usize]),
         (-gamma, vec![0usize, 3usize]),
@@ -1124,10 +1161,10 @@ fn tie_rank_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
 /// challenge and is caught w.h.p. t_b_prev is bound to the cyclic shift by
 /// the permutation, so t_b is constant inside every row and `less` cannot
 /// use a per-position cutoff.
-fn tie_row_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn tie_row_terms(gamma: Ef) -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
     vec![
-        (Goldilocks::ONE, vec![0usize, 2usize, 3usize]),
+        (Ef::ONE, vec![0usize, 2usize, 3usize]),
         (neg, vec![0usize, 5usize, 4usize]),
         (gamma, vec![1usize, 4usize]),
         (-gamma, vec![1usize, 5usize, 4usize]),
@@ -1141,11 +1178,11 @@ fn tie_row_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
 /// E_{B-1} = 1, E_b = E_{b+1}*(1-P_b-C_b+2*P_b*C_b), and the strict less is
 /// sum_b (1-P_b)*C_b*E_b. The selection condition
 /// T*(sel - less(P, t_b)) = 0 is gamma-separated from the recurrence.
-fn tie_less_terms(b_bits: usize, gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn tie_less_terms(b_bits: usize, gamma: Ef) -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
     let e0 = 4 + 2 * b_bits;
     let mut t = Vec::new();
-    let mut g = Goldilocks::ONE;
+    let mut g = Ef::ONE;
     t.push((g, vec![0usize, e0 + b_bits - 1]));
     t.push((-g, vec![0usize]));
     g = g * gamma;
@@ -1265,15 +1302,15 @@ fn prepare_topk_tie_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
 
 /// Exact tie-aux opening layout, shared by prove/verify.
 #[allow(clippy::too_many_arguments)]
-fn topk_tie_layout(z_zero: &[Goldilocks], z_bits: &[Goldilocks], z_rank: &[Goldilocks],
-    z_row: &[Goldilocks], z_less: &[Goldilocks],
-    q_den_ap: &[Goldilocks], q_den_bp: &[Goldilocks],
-    q_den_at: &[Goldilocks], q_den_bt: &[Goldilocks],
-    q_den_abt: &[Goldilocks], q_den_bbt: &[Goldilocks],
-    b_bits: usize, arity: usize) -> Vec<(usize, Vec<Goldilocks>)>
+fn topk_tie_layout(z_zero: &[Ef], z_bits: &[Ef], z_rank: &[Ef],
+    z_row: &[Ef], z_less: &[Ef],
+    q_den_ap: &[Ef], q_den_bp: &[Ef],
+    q_den_at: &[Ef], q_den_bt: &[Ef],
+    q_den_abt: &[Ef], q_den_bbt: &[Ef],
+    b_bits: usize, arity: usize) -> Vec<(usize, Vec<Ef>)>
 {
-    let pad = |z: &[Goldilocks]| argmax_pad_point(z, arity);
-    let mut e: Vec<(usize, Vec<Goldilocks>)> = Vec::new();
+    let pad = |z: &[Ef]| argmax_pad_point(z, arity);
+    let mut e: Vec<(usize, Vec<Ef>)> = Vec::new();
     // zero virtual: w1, T1, w2, T2, T.
     e.push((TIE_W1, pad(z_zero)));
     e.push((TIE_T1, pad(z_zero)));
@@ -1309,10 +1346,10 @@ fn topk_tie_layout(z_zero: &[Goldilocks], z_bits: &[Goldilocks], z_rank: &[Goldi
     e
 }
 
-fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     witness: PreparedAux, thr_aux: PreparedAux, range_aux: PreparedAux,
     thr_range_aux: PreparedAux, tie_aux: PreparedAux, transcript: &mut Transcript)
-    -> Option<(ReverseTopKSelectProof, Vec<EvalClaim>)>
+    -> Option<(ReverseTopKSelectProof, Vec<EfClaim>)>
 {
     let (x, sel_t, thr_t, gate_t, d1_t, d2_t, m, n, k) = topk_dims(op)?;
     let len = m.checked_mul(n)?;
@@ -1335,8 +1372,8 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldi
     if witness.columns.len() != TK_COLS || thr_aux.columns.len() != 1
         || range_aux.columns.len() != TK_SIGNED_BITS
         || thr_range_aux.columns.len() != TK_SIGNED_BITS { return None; }
-    let range_cols = &range_aux.columns;
-    let thr_range_cols = &thr_range_aux.columns;
+    let range_cols = lift_columns(&range_aux.columns);
+    let thr_range_cols = lift_columns(&thr_range_aux.columns);
     let padded = 1usize.checked_shl(arity as u32)?;
     if padded != len { return None; }
     let thr_col = &thr_aux.columns[0];
@@ -1349,79 +1386,79 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldi
     if qs.len() != arity || qg.len() != arity || qd.len() != arity
         || q2.len() != arity || qt.len() != lgm { return None; }
     if store.get(x).len() != len { return None; }
-    let cols = &witness.columns;
-    let mut xp = store.get(x).to_vec(); xp.resize(padded, Goldilocks::ZERO);
+    let cols = lift_columns(&witness.columns);
+    let mut xp = ef_lift(store.get(x)); xp.resize(padded, Ef::ZERO);
 
-    let q1: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma1 = transcript.field();
-    let eq1 = mle::eq_evals(&q1);
-    let mut mles1: Vec<&[Goldilocks]> = vec![&eq1, &cols[TK_SEL_COL], &cols[TK_ATT_COL]];
+    let q1: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma1 = transcript.ef_field();
+    let eq1 = efo::eq_evals(&q1);
+    let mut mles1: Vec<&[Ef]> = vec![&eq1, &cols[TK_SEL_COL], &cols[TK_ATT_COL]];
     for b in 0..(2 * TK_RANGE_BITS) { mles1.push(&cols[TK_D1_COL + b]); }
-    let (bools, z1) = prove_virtual(&mles1, &topk_bools_terms(gamma1), Goldilocks::ZERO, transcript);
+    let (bools, z1) = efo::prove_virtual(&mles1, &topk_bools_terms(gamma1), Ef::ZERO, transcript);
 
-    let qr: Vec<Goldilocks> = transcript.field_vec(lgm);
-    let g0 = transcript.field();
-    let g1 = transcript.field();
-    let eq_rows = mle::eq_evals(&qr);
-    let mut eq_rows_b = vec![Goldilocks::ZERO; padded];
+    let qr: Vec<Ef> = transcript.ef_field_vec(lgm);
+    let g0 = transcript.ef_field();
+    let g1 = transcript.ef_field();
+    let eq_rows = efo::eq_evals(&qr);
+    let mut eq_rows_b = vec![Ef::ZERO; padded];
     for row in 0..m { for e in 0..n { eq_rows_b[row * n + e] = eq_rows[row]; } }
-    let row_claim = g0 * Goldilocks::from_u64(k as u64) + g1;
-    let (row_sums, z2) = prove_virtual(
+    let row_claim = g0 * ef_u64(k as u64) + g1;
+    let (row_sums, z2) = efo::prove_virtual(
         &[&eq_rows_b, &cols[TK_SEL_COL], &cols[TK_ATT_COL]],
         &topk_row_terms(g0, g1), row_claim, transcript);
 
-    let q3: Vec<Goldilocks> = transcript.field_vec(arity);
-    let eq3 = mle::eq_evals(&q3);
-    let (gate, z3) = prove_virtual(
+    let q3: Vec<Ef> = transcript.ef_field_vec(arity);
+    let eq3 = efo::eq_evals(&q3);
+    let (gate, z3) = efo::prove_virtual(
         &[&eq3, &cols[TK_SEL_COL], &xp, &cols[TK_GATE_COL]],
-        &topk_gate_terms(), Goldilocks::ZERO, transcript);
+        &topk_gate_terms(), Ef::ZERO, transcript);
 
-    let q4: Vec<Goldilocks> = transcript.field_vec(arity);
-    let eq4 = mle::eq_evals(&q4);
-    let mut mles4: Vec<&[Goldilocks]> = vec![&eq4, &cols[TK_SEL_COL], &xp, &cols[TK_THR_B_COL]];
+    let q4: Vec<Ef> = transcript.ef_field_vec(arity);
+    let eq4 = efo::eq_evals(&q4);
+    let mut mles4: Vec<&[Ef]> = vec![&eq4, &cols[TK_SEL_COL], &xp, &cols[TK_THR_B_COL]];
     for b in 0..TK_RANGE_BITS { mles4.push(&cols[TK_D1_COL + b]); }
-    let (d1, z4) = prove_virtual(&mles4, &topk_d1_terms(), Goldilocks::ZERO, transcript);
+    let (d1, z4) = efo::prove_virtual(&mles4, &topk_d1_terms(), Ef::ZERO, transcript);
 
-    let q5: Vec<Goldilocks> = transcript.field_vec(arity);
-    let eq5 = mle::eq_evals(&q5);
-    let mut mles5: Vec<&[Goldilocks]> = vec![&eq5, &cols[TK_SEL_COL], &xp, &cols[TK_THR_B_COL]];
+    let q5: Vec<Ef> = transcript.ef_field_vec(arity);
+    let eq5 = efo::eq_evals(&q5);
+    let mut mles5: Vec<&[Ef]> = vec![&eq5, &cols[TK_SEL_COL], &xp, &cols[TK_THR_B_COL]];
     for b in 0..TK_RANGE_BITS { mles5.push(&cols[TK_D2S_COL + b]); }
-    let (d2s, z5) = prove_virtual(&mles5, &topk_d2s_terms(), Goldilocks::ZERO, transcript);
+    let (d2s, z5) = efo::prove_virtual(&mles5, &topk_d2s_terms(), Ef::ZERO, transcript);
 
-    let q6: Vec<Goldilocks> = transcript.field_vec(arity);
-    let eq6 = mle::eq_evals(&q6);
-    let (att_sel, z6) = prove_virtual(
+    let q6: Vec<Ef> = transcript.ef_field_vec(arity);
+    let eq6 = efo::eq_evals(&q6);
+    let (att_sel, z6) = efo::prove_virtual(
         &[&eq6, &cols[TK_ATT_COL], &cols[TK_SEL_COL]],
-        &topk_att_sel_terms(), Goldilocks::ZERO, transcript);
+        &topk_att_sel_terms(), Ef::ZERO, transcript);
 
-    let q7: Vec<Goldilocks> = transcript.field_vec(arity);
-    let eq7 = mle::eq_evals(&q7);
-    let (att_gap, z7) = prove_virtual(
+    let q7: Vec<Ef> = transcript.ef_field_vec(arity);
+    let eq7 = efo::eq_evals(&q7);
+    let (att_gap, z7) = efo::prove_virtual(
         &[&eq7, &cols[TK_ATT_COL], &xp, &cols[TK_THR_B_COL]],
-        &topk_att_gap_terms(), Goldilocks::ZERO, transcript);
+        &topk_att_gap_terms(), Ef::ZERO, transcript);
 
-    let qb: Vec<Goldilocks> = transcript.field_vec(arity);
+    let qb: Vec<Ef> = transcript.ef_field_vec(arity);
     let q_hi = qb[lgn..].to_vec();
     let thr_point = argmax_pad_point(&q_hi, thr_arity);
-    let thr_at_q = mle::eval(thr_col, &thr_point);
-    let eqb = mle::eq_evals(&qb);
-    let (broadcast, z8) = prove_virtual(
+    let thr_at_q = ef_eval(thr_col, &thr_point);
+    let eqb = efo::eq_evals(&qb);
+    let (broadcast, z8) = efo::prove_virtual(
         &[&eqb, &cols[TK_THR_B_COL]],
         &topk_broadcast_terms(), thr_at_q, transcript);
 
-    let q9: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma9 = transcript.field();
-    let eq9 = mle::eq_evals(&q9);
-    let mut mles9: Vec<&[Goldilocks]> = vec![&eq9, &xp];
+    let q9: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma9 = transcript.ef_field();
+    let eq9 = efo::eq_evals(&q9);
+    let mut mles9: Vec<&[Ef]> = vec![&eq9, &xp];
     for b in 0..TK_SIGNED_BITS { mles9.push(&range_cols[b]); }
-    let (x_range, z9) = prove_virtual(&mles9, &topk_range_terms(gamma9), Goldilocks::ZERO, transcript);
+    let (x_range, z9) = efo::prove_virtual(&mles9, &topk_range_terms(gamma9), Ef::ZERO, transcript);
 
-    let q10: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma10 = transcript.field();
-    let eq10 = mle::eq_evals(&q10);
-    let mut mles10: Vec<&[Goldilocks]> = vec![&eq10, &cols[TK_THR_B_COL]];
+    let q10: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma10 = transcript.ef_field();
+    let eq10 = efo::eq_evals(&q10);
+    let mut mles10: Vec<&[Ef]> = vec![&eq10, &cols[TK_THR_B_COL]];
     for b in 0..TK_SIGNED_BITS { mles10.push(&thr_range_cols[b]); }
-    let (thr_range, z10) = prove_virtual(&mles10, &topk_range_terms(gamma10), Goldilocks::ZERO, transcript);
+    let (thr_range, z10) = efo::prove_virtual(&mles10, &topk_range_terms(gamma10), Ef::ZERO, transcript);
 
     // ---- Deterministic tie-break (S7c task 2a) ----
     let b_bits = tie_b_bits(lgn);
@@ -1430,183 +1467,153 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldi
         || tie_aux.descriptor.len != len || tie_aux.descriptor.arity != arity
         || tie_aux.descriptor.columns != tie_total_cols(b_bits) { return None; }
     if tie_aux.columns.len() != tie_total_cols(b_bits) { return None; }
-    let tc = &tie_aux.columns;
+    let tc = lift_columns(&tie_aux.columns);
     // The zero tests are stated on the gap values reconstructed from the
     // committed 16-bit witness columns, so the verifier can bind them with
     // the same openings the d1/d2 relations already use.
-    let mut d1_vals = vec![Goldilocks::ZERO; padded];
-    let mut d2_vals = vec![Goldilocks::ZERO; padded];
+    let mut d1_vals = vec![Ef::ZERO; padded];
+    let mut d2_vals = vec![Ef::ZERO; padded];
     for at in 0..len {
         for b in 0..TK_RANGE_BITS {
-            d1_vals[at] = d1_vals[at] + Goldilocks::from_u64(1u64 << b) * cols[TK_D1_COL + b][at];
-            d2_vals[at] = d2_vals[at] + Goldilocks::from_u64(1u64 << b) * cols[TK_D2S_COL + b][at];
+            d1_vals[at] = d1_vals[at] + ef_u64(1u64 << b) * cols[TK_D1_COL + b][at];
+            d2_vals[at] = d2_vals[at] + ef_u64(1u64 << b) * cols[TK_D2S_COL + b][at];
         }
     }
 
-    let qz: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gz = transcript.field();
-    let eqz = mle::eq_evals(&qz);
-    let (tie_zero, z_zero) = prove_virtual(
+    let qz: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gz = transcript.ef_field();
+    let eqz = efo::eq_evals(&qz);
+    let (tie_zero, z_zero) = efo::prove_virtual(
         &[&eqz, &cols[TK_SEL_COL], &d1_vals, &tc[TIE_W1], &tc[TIE_T1],
           &d2_vals, &tc[TIE_W2], &tc[TIE_T2], &tc[TIE_T]],
-        &tie_zero_terms(gz), Goldilocks::ZERO, transcript);
+        &tie_zero_terms(gz), Ef::ZERO, transcript);
     if z_zero.len() != arity || tie_zero.final_evals.len() != 9 { return None; }
 
-    let qbits: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gbits = transcript.field();
-    let eqbits = mle::eq_evals(&qbits);
-    let mut mles_bits: Vec<&[Goldilocks]> = vec![&eqbits, &tc[TIE_P], &tc[TIE_TB]];
+    let qbits: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gbits = transcript.ef_field();
+    let eqbits = efo::eq_evals(&qbits);
+    let mut mles_bits: Vec<&[Ef]> = vec![&eqbits, &tc[TIE_P], &tc[TIE_TB]];
     for b in 0..b_bits { mles_bits.push(&tc[tie_p_bits_col(b)]); }
     for b in 0..b_bits { mles_bits.push(&tc[tie_tb_bits_col(b_bits, b)]); }
-    let (tie_bits, z_bits) = prove_virtual(&mles_bits,
-        &tie_bits_terms(b_bits, gbits), Goldilocks::ZERO, transcript);
+    let (tie_bits, z_bits) = efo::prove_virtual(&mles_bits,
+        &tie_bits_terms(b_bits, gbits), Ef::ZERO, transcript);
     if z_bits.len() != arity || tie_bits.final_evals.len() != 3 + 2 * b_bits { return None; }
 
-    let qrank: Vec<Goldilocks> = transcript.field_vec(arity);
-    let grank = transcript.field();
-    let eqrank = mle::eq_evals(&qrank);
-    let mut e0 = vec![Goldilocks::ZERO; padded];
-    for row in 0..m { e0[row * n] = Goldilocks::ONE; }
-    let (tie_rank, z_rank) = prove_virtual(
+    let qrank: Vec<Ef> = transcript.ef_field_vec(arity);
+    let grank = transcript.ef_field();
+    let eqrank = efo::eq_evals(&qrank);
+    let mut e0 = vec![Ef::ZERO; padded];
+    for row in 0..m { e0[row * n] = Ef::ONE; }
+    let (tie_rank, z_rank) = efo::prove_virtual(
         &[&eqrank, &tc[TIE_P], &tc[TIE_P_PREV], &tc[TIE_T_PREV], &e0],
-        &tie_rank_terms(grank), Goldilocks::ZERO, transcript);
+        &tie_rank_terms(grank), Ef::ZERO, transcript);
     if z_rank.len() != arity || tie_rank.final_evals.len() != 5 { return None; }
 
-    let qrow_t: Vec<Goldilocks> = transcript.field_vec(lgm);
-    let qfull: Vec<Goldilocks> = transcript.field_vec(arity);
-    let grow = transcript.field();
-    let eq_rows_t = mle::eq_evals(&qrow_t);
-    let mut eq_rows_bt = vec![Goldilocks::ZERO; padded];
+    let qrow_t: Vec<Ef> = transcript.ef_field_vec(lgm);
+    let qfull: Vec<Ef> = transcript.ef_field_vec(arity);
+    let grow = transcript.ef_field();
+    let eq_rows_t = efo::eq_evals(&qrow_t);
+    let mut eq_rows_bt = vec![Ef::ZERO; padded];
     for row in 0..m { for e in 0..n { eq_rows_bt[row * n + e] = eq_rows_t[row]; } }
-    let eq_full_t = mle::eq_evals(&qfull);
-    let (tie_row, z_row) = prove_virtual(
+    let eq_full_t = efo::eq_evals(&qfull);
+    let (tie_row, z_row) = efo::prove_virtual(
         &[&eq_rows_bt, &eq_full_t, &tc[TIE_T], &cols[TK_SEL_COL], &tc[TIE_TB], &e0,
           &tc[tie_tb_prev_col(b_bits)]],
-        &tie_row_terms(grow), Goldilocks::ZERO, transcript);
+        &tie_row_terms(grow), Ef::ZERO, transcript);
     if z_row.len() != arity || tie_row.final_evals.len() != 7 { return None; }
 
-    let qless: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gless = transcript.field();
-    let eqless = mle::eq_evals(&qless);
-    let mut mles_less: Vec<&[Goldilocks]> =
+    let qless: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gless = transcript.ef_field();
+    let eqless = efo::eq_evals(&qless);
+    let mut mles_less: Vec<&[Ef]> =
         vec![&eqless, &tc[TIE_T], &cols[TK_SEL_COL], &tc[TIE_TB]];
     for b in 0..b_bits { mles_less.push(&tc[tie_p_bits_col(b)]); }
     for b in 0..b_bits { mles_less.push(&tc[tie_tb_bits_col(b_bits, b)]); }
     for b in 0..b_bits { mles_less.push(&tc[tie_eq_col(b_bits, b)]); }
-    let (tie_less, z_less) = prove_virtual(&mles_less,
-        &tie_less_terms(b_bits, gless), Goldilocks::ZERO, transcript);
+    let (tie_less, z_less) = efo::prove_virtual(&mles_less,
+        &tie_less_terms(b_bits, gless), Ef::ZERO, transcript);
     if z_less.len() != arity || tie_less.final_evals.len() != 4 + 3 * b_bits { return None; }
 
     // Cyclic-shift pair-multiset permutations for P and T: prove that
     // P_prev[pos] = P[pos-1 mod dom] (and likewise T) using the ScatterOrder
     // primitive with the position encoding.
-    let gamma_pp = transcript.field();
-    let mut per_a_p = vec![Goldilocks::ZERO; padded];
-    let mut per_b_p = vec![Goldilocks::ZERO; padded];
+    let gamma_pp = transcript.ef_field();
+    let mut per_a_p = vec![Ef::ZERO; padded];
+    let mut per_b_p = vec![Ef::ZERO; padded];
     for q in 0..padded {
-        per_a_p[q] = tc[TIE_P_PREV][q] + gamma_pp * Goldilocks::from_u64(q as u64);
-        per_b_p[q] = tc[TIE_P][q] + gamma_pp * Goldilocks::from_u64(((q + 1) % padded) as u64);
+        per_a_p[q] = tc[TIE_P_PREV][q] + gamma_pp * ef_u64(q as u64);
+        per_b_p[q] = tc[TIE_P][q] + gamma_pp * ef_u64(((q + 1) % padded) as u64);
     }
-    let perm_p = prove_permutation(&per_a_p, &per_b_p, transcript);
-    let q_den_ap = fractional_leaf(&perm_p.a_side).2;
-    let q_den_bp = fractional_leaf(&perm_p.b_side).2;
+    let perm_p = zkie_core::common::ef_logup::prove_permutation(&per_a_p, &per_b_p, transcript);
+    let q_den_ap = zkie_core::common::ef_logup::fractional_leaf(&perm_p.a_side).2;
+    let q_den_bp = zkie_core::common::ef_logup::fractional_leaf(&perm_p.b_side).2;
 
-    let gamma_pt = transcript.field();
-    let mut per_a_t = vec![Goldilocks::ZERO; padded];
-    let mut per_b_t = vec![Goldilocks::ZERO; padded];
+    let gamma_pt = transcript.ef_field();
+    let mut per_a_t = vec![Ef::ZERO; padded];
+    let mut per_b_t = vec![Ef::ZERO; padded];
     for q in 0..padded {
-        per_a_t[q] = tc[TIE_T_PREV][q] + gamma_pt * Goldilocks::from_u64(q as u64);
-        per_b_t[q] = tc[TIE_T][q] + gamma_pt * Goldilocks::from_u64(((q + 1) % padded) as u64);
+        per_a_t[q] = tc[TIE_T_PREV][q] + gamma_pt * ef_u64(q as u64);
+        per_b_t[q] = tc[TIE_T][q] + gamma_pt * ef_u64(((q + 1) % padded) as u64);
     }
-    let perm_t = prove_permutation(&per_a_t, &per_b_t, transcript);
-    let q_den_at = fractional_leaf(&perm_t.a_side).2;
-    let q_den_bt = fractional_leaf(&perm_t.b_side).2;
+    let perm_t = zkie_core::common::ef_logup::prove_permutation(&per_a_t, &per_b_t, transcript);
+    let q_den_at = zkie_core::common::ef_logup::fractional_leaf(&perm_t.a_side).2;
+    let q_den_bt = zkie_core::common::ef_logup::fractional_leaf(&perm_t.b_side).2;
 
     // t_b_prev must be the cyclic shift of t_b; together with the
     // (1-E0)*(t_b - t_b_prev) identity this forces t_b to be constant inside
     // every row (the per-position cutoff equals the row's t_b).
-    let gamma_pb = transcript.field();
-    let mut per_a_b = vec![Goldilocks::ZERO; padded];
-    let mut per_b_b = vec![Goldilocks::ZERO; padded];
+    let gamma_pb = transcript.ef_field();
+    let mut per_a_b = vec![Ef::ZERO; padded];
+    let mut per_b_b = vec![Ef::ZERO; padded];
     for q in 0..padded {
-        per_a_b[q] = tc[tie_tb_prev_col(b_bits)][q] + gamma_pb * Goldilocks::from_u64(q as u64);
-        per_b_b[q] = tc[TIE_TB][q] + gamma_pb * Goldilocks::from_u64(((q + 1) % padded) as u64);
+        per_a_b[q] = tc[tie_tb_prev_col(b_bits)][q] + gamma_pb * ef_u64(q as u64);
+        per_b_b[q] = tc[TIE_TB][q] + gamma_pb * ef_u64(((q + 1) % padded) as u64);
     }
-    let perm_b = prove_permutation(&per_a_b, &per_b_b, transcript);
-    let q_den_abt = fractional_leaf(&perm_b.a_side).2;
-    let q_den_bbt = fractional_leaf(&perm_b.b_side).2;
+    let perm_b = zkie_core::common::ef_logup::prove_permutation(&per_a_b, &per_b_b, transcript);
+    let q_den_abt = zkie_core::common::ef_logup::fractional_leaf(&perm_b.a_side).2;
+    let q_den_bbt = zkie_core::common::ef_logup::fractional_leaf(&perm_b.b_side).2;
 
     let tie_layout = topk_tie_layout(&z_zero, &z_bits, &z_rank, &z_row, &z_less,
         &q_den_ap, &q_den_bp, &q_den_at, &q_den_bt, &q_den_abt, &q_den_bbt, b_bits, arity);
     let tie_idxs: Vec<usize> = tie_layout.iter().map(|e| e.0).collect();
-    let tie_points: Vec<Vec<Goldilocks>> = tie_layout.iter().map(|e| e.1.clone()).collect();
-    let tie_values: Vec<Goldilocks> = tie_layout.iter().map(|e| mle::eval(&tc[e.0], &e.1)).collect();
-    let tie_tensors: Vec<Vec<Goldilocks>> = tie_idxs.iter().map(|&c| tc[c].clone()).collect();
-    let tie_ctx = zkie_core::pcs::committed::BatchCtx {
-        commitment: tie_aux.descriptor.commitment.clone(), prover_data: tie_aux.prover_data,
-        protocol: tie_aux.protocol, whir: tie_aux.whir, num_tables: tie_aux.descriptor.columns,
-    };
-    let tie_opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-        tie_ctx, &tie_idxs, &tie_tensors, &tie_points, &tie_values).ok()?;
+    let tie_points: Vec<Vec<Ef>> = tie_layout.iter().map(|e| e.1.clone()).collect();
+    let tie_values: Vec<Ef> = tie_layout.iter()
+        .map(|e| ef_eval(&tie_aux.columns[e.0], &e.1)).collect();
+    let tie_opening = open_aux(tie_aux, &tie_idxs, &tie_points, &tie_values)?;
 
     let layout = topk_witness_layout(&z1, &z2, &z3, &z4, &z5, &z6, &z7, &z8, &z10,
         &z_zero, &z_less, &z_row, &qs, &qg, &qd, &q2, arity);
     let idxs: Vec<usize> = layout.iter().map(|e| e.0).collect();
-    let points: Vec<Vec<Goldilocks>> = layout.iter().map(|e| e.1.clone()).collect();
-    let values: Vec<Goldilocks> = layout.iter().map(|e| mle::eval(&cols[e.0], &e.1)).collect();
-    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&c| cols[c].clone()).collect();
-    let ctx = zkie_core::pcs::committed::BatchCtx {
-        commitment: witness.descriptor.commitment.clone(), prover_data: witness.prover_data,
-        protocol: witness.protocol, whir: witness.whir, num_tables: witness.descriptor.columns,
-    };
-    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-        ctx, &idxs, &tensors, &points, &values).ok()?;
+    let points: Vec<Vec<Ef>> = layout.iter().map(|e| e.1.clone()).collect();
+    let values: Vec<Ef> = layout.iter().map(|e| ef_eval(&witness.columns[e.0], &e.1)).collect();
+    let opening = open_aux(witness, &idxs, &points, &values)?;
 
     let thr_layout = topk_thr_layout(&q_hi, &qt, thr_arity);
     let thr_idxs: Vec<usize> = thr_layout.iter().map(|e| e.0).collect();
-    let thr_points: Vec<Vec<Goldilocks>> = thr_layout.iter().map(|e| e.1.clone()).collect();
-    let thr_values: Vec<Goldilocks> = thr_points.iter().map(|p| mle::eval(thr_col, p)).collect();
-    let thr_tensors: Vec<Vec<Goldilocks>> = thr_idxs.iter().map(|_| thr_col.clone()).collect();
-    let thr_ctx = zkie_core::pcs::committed::BatchCtx {
-        commitment: thr_aux.descriptor.commitment.clone(), prover_data: thr_aux.prover_data,
-        protocol: thr_aux.protocol, whir: thr_aux.whir, num_tables: thr_aux.descriptor.columns,
-    };
-    let thr_opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-        thr_ctx, &thr_idxs, &thr_tensors, &thr_points, &thr_values).ok()?;
+    let thr_points: Vec<Vec<Ef>> = thr_layout.iter().map(|e| e.1.clone()).collect();
+    let thr_values: Vec<Ef> = thr_points.iter().map(|p| ef_eval(thr_col, p)).collect();
+    let thr_opening = open_aux(thr_aux, &thr_idxs, &thr_points, &thr_values)?;
 
     let range_layout = topk_range_layout(&z9, arity);
     let range_idxs: Vec<usize> = range_layout.iter().map(|e| e.0).collect();
-    let range_points: Vec<Vec<Goldilocks>> = range_layout.iter().map(|e| e.1.clone()).collect();
-    let range_values: Vec<Goldilocks> = range_layout.iter()
-        .map(|e| mle::eval(&range_cols[e.0], &e.1)).collect();
-    let range_tensors: Vec<Vec<Goldilocks>> = range_idxs.iter().map(|&c| range_cols[c].clone()).collect();
-    let range_ctx = zkie_core::pcs::committed::BatchCtx {
-        commitment: range_aux.descriptor.commitment.clone(), prover_data: range_aux.prover_data,
-        protocol: range_aux.protocol, whir: range_aux.whir, num_tables: range_aux.descriptor.columns,
-    };
-    let range_opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-        range_ctx, &range_idxs, &range_tensors, &range_points, &range_values).ok()?;
+    let range_points: Vec<Vec<Ef>> = range_layout.iter().map(|e| e.1.clone()).collect();
+    let range_values: Vec<Ef> = range_layout.iter()
+        .map(|e| ef_eval(&range_aux.columns[e.0], &e.1)).collect();
+    let range_opening = open_aux(range_aux, &range_idxs, &range_points, &range_values)?;
 
     let tr_range_layout = topk_range_layout(&z10, arity);
     let tr_range_idxs: Vec<usize> = tr_range_layout.iter().map(|e| e.0).collect();
-    let tr_range_points: Vec<Vec<Goldilocks>> = tr_range_layout.iter().map(|e| e.1.clone()).collect();
-    let tr_range_values: Vec<Goldilocks> = tr_range_layout.iter()
-        .map(|e| mle::eval(&thr_range_cols[e.0], &e.1)).collect();
-    let tr_range_tensors: Vec<Vec<Goldilocks>> = tr_range_idxs.iter()
-        .map(|&c| thr_range_cols[c].clone()).collect();
-    let tr_range_ctx = zkie_core::pcs::committed::BatchCtx {
-        commitment: thr_range_aux.descriptor.commitment.clone(), prover_data: thr_range_aux.prover_data,
-        protocol: thr_range_aux.protocol, whir: thr_range_aux.whir, num_tables: thr_range_aux.descriptor.columns,
-    };
-    let thr_range_opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-        tr_range_ctx, &tr_range_idxs, &tr_range_tensors, &tr_range_points, &tr_range_values).ok()?;
+    let tr_range_points: Vec<Vec<Ef>> = tr_range_layout.iter().map(|e| e.1.clone()).collect();
+    let tr_range_values: Vec<Ef> = tr_range_layout.iter()
+        .map(|e| ef_eval(&thr_range_aux.columns[e.0], &e.1)).collect();
+    let thr_range_opening = open_aux(thr_range_aux, &tr_range_idxs, &tr_range_points, &tr_range_values)?;
 
     let xk = TensorKey::Field(x).encoded()?;
-    let x_claim = |z: &[Goldilocks], v: Goldilocks| -> Option<EvalClaim> {
+    let x_claim = |z: &[Ef], v: Ef| -> Option<EfClaim> {
         if z.len() < arity { return None; }
         let f = zero_ext_factor(z, arity);
-        if f == Goldilocks::ZERO { return None; }
-        Some(EvalClaim { tensor_id: xk, point: z[..arity].to_vec(), value: v * f.inverse() })
+        if f == Ef::ZERO { return None; }
+        Some(EfClaim { tensor_id: xk, point: z[..arity].to_vec(), value: v * f.inverse() })
     };
     let claims = vec![
         x_claim(&z3, gate.final_evals[2])?,
@@ -1626,10 +1633,10 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldi
     }, claims))
 }
 
-fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     witness: &AuxDescriptor, thr_aux: &AuxDescriptor, range_aux: &AuxDescriptor,
     thr_range_aux: &AuxDescriptor, tie_aux: &AuxDescriptor,
-    proof: &ReverseTopKSelectProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+    proof: &ReverseTopKSelectProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
 {
     let (x, sel_t, thr_t, gate_t, d1_t, d2_t, m, n, k) = topk_dims(op)?;
     let len = m.checked_mul(n)?;
@@ -1670,90 +1677,90 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
         || proof.range_aux_values.len() != TK_SIGNED_BITS
         || proof.thr_range_values.len() != TK_SIGNED_BITS { return None; }
 
-    let q1: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma1 = transcript.field();
+    let q1: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma1 = transcript.ef_field();
     let terms = topk_bools_terms(gamma1);
-    let (ok, z1, f1) = verify_virtual(&proof.bools, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || f1 != virtual_eval(&terms, &proof.bools.final_evals)
-        || proof.bools.final_evals[0] != mle::eq_poly(&q1, &z1) { return None; }
+    let (ok, z1, f1) = efo::verify_virtual(&proof.bools, &terms, Ef::ZERO, arity, transcript);
+    if !ok || f1 != efo::virtual_eval(&terms, &proof.bools.final_evals)
+        || proof.bools.final_evals[0] != ef_eq_poly(&q1, &z1) { return None; }
 
-    let qr: Vec<Goldilocks> = transcript.field_vec(lgm);
-    let g0 = transcript.field();
-    let g1 = transcript.field();
-    let row_claim = g0 * Goldilocks::from_u64(k as u64) + g1;
+    let qr: Vec<Ef> = transcript.ef_field_vec(lgm);
+    let g0 = transcript.ef_field();
+    let g1 = transcript.ef_field();
+    let row_claim = g0 * ef_u64(k as u64) + g1;
     let terms = topk_row_terms(g0, g1);
-    let (ok, z2, f2) = verify_virtual(&proof.row_sums, &terms, row_claim, arity, transcript);
-    if !ok || f2 != virtual_eval(&terms, &proof.row_sums.final_evals) { return None; }
-    if z2.len() != arity || proof.row_sums.final_evals[0] != mle::eq_poly(&qr, &z2[lgn..]) { return None; }
+    let (ok, z2, f2) = efo::verify_virtual(&proof.row_sums, &terms, row_claim, arity, transcript);
+    if !ok || f2 != efo::virtual_eval(&terms, &proof.row_sums.final_evals) { return None; }
+    if z2.len() != arity || proof.row_sums.final_evals[0] != ef_eq_poly(&qr, &z2[lgn..]) { return None; }
 
-    let q3: Vec<Goldilocks> = transcript.field_vec(arity);
+    let q3: Vec<Ef> = transcript.ef_field_vec(arity);
     let terms = topk_gate_terms();
-    let (ok, z3, f3) = verify_virtual(&proof.gate, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || f3 != virtual_eval(&terms, &proof.gate.final_evals)
-        || proof.gate.final_evals[0] != mle::eq_poly(&q3, &z3) { return None; }
+    let (ok, z3, f3) = efo::verify_virtual(&proof.gate, &terms, Ef::ZERO, arity, transcript);
+    if !ok || f3 != efo::virtual_eval(&terms, &proof.gate.final_evals)
+        || proof.gate.final_evals[0] != ef_eq_poly(&q3, &z3) { return None; }
 
-    let q4: Vec<Goldilocks> = transcript.field_vec(arity);
+    let q4: Vec<Ef> = transcript.ef_field_vec(arity);
     let terms = topk_d1_terms();
-    let (ok, z4, f4) = verify_virtual(&proof.d1, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || f4 != virtual_eval(&terms, &proof.d1.final_evals)
-        || proof.d1.final_evals[0] != mle::eq_poly(&q4, &z4) { return None; }
+    let (ok, z4, f4) = efo::verify_virtual(&proof.d1, &terms, Ef::ZERO, arity, transcript);
+    if !ok || f4 != efo::virtual_eval(&terms, &proof.d1.final_evals)
+        || proof.d1.final_evals[0] != ef_eq_poly(&q4, &z4) { return None; }
 
-    let q5: Vec<Goldilocks> = transcript.field_vec(arity);
+    let q5: Vec<Ef> = transcript.ef_field_vec(arity);
     let terms = topk_d2s_terms();
-    let (ok, z5, f5) = verify_virtual(&proof.d2s, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || f5 != virtual_eval(&terms, &proof.d2s.final_evals)
-        || proof.d2s.final_evals[0] != mle::eq_poly(&q5, &z5) { return None; }
+    let (ok, z5, f5) = efo::verify_virtual(&proof.d2s, &terms, Ef::ZERO, arity, transcript);
+    if !ok || f5 != efo::virtual_eval(&terms, &proof.d2s.final_evals)
+        || proof.d2s.final_evals[0] != ef_eq_poly(&q5, &z5) { return None; }
 
-    let q6: Vec<Goldilocks> = transcript.field_vec(arity);
+    let q6: Vec<Ef> = transcript.ef_field_vec(arity);
     let terms = topk_att_sel_terms();
-    let (ok, z6, f6) = verify_virtual(&proof.att_sel, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || f6 != virtual_eval(&terms, &proof.att_sel.final_evals)
-        || proof.att_sel.final_evals[0] != mle::eq_poly(&q6, &z6) { return None; }
+    let (ok, z6, f6) = efo::verify_virtual(&proof.att_sel, &terms, Ef::ZERO, arity, transcript);
+    if !ok || f6 != efo::virtual_eval(&terms, &proof.att_sel.final_evals)
+        || proof.att_sel.final_evals[0] != ef_eq_poly(&q6, &z6) { return None; }
 
-    let q7: Vec<Goldilocks> = transcript.field_vec(arity);
+    let q7: Vec<Ef> = transcript.ef_field_vec(arity);
     let terms = topk_att_gap_terms();
-    let (ok, z7, f7) = verify_virtual(&proof.att_gap, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || f7 != virtual_eval(&terms, &proof.att_gap.final_evals)
-        || proof.att_gap.final_evals[0] != mle::eq_poly(&q7, &z7) { return None; }
+    let (ok, z7, f7) = efo::verify_virtual(&proof.att_gap, &terms, Ef::ZERO, arity, transcript);
+    if !ok || f7 != efo::virtual_eval(&terms, &proof.att_gap.final_evals)
+        || proof.att_gap.final_evals[0] != ef_eq_poly(&q7, &z7) { return None; }
 
     // Broadcast: thr~(q_hi) comes from the verified thr-aux opening, so the
     // virtual's claim is the authenticated row-domain evaluation.
-    let qb: Vec<Goldilocks> = transcript.field_vec(arity);
+    let qb: Vec<Ef> = transcript.ef_field_vec(arity);
     let q_hi = qb[lgn..].to_vec();
     let thr_layout = topk_thr_layout(&q_hi, &qt, thr_arity);
     let thr_idxs: Vec<usize> = thr_layout.iter().map(|e| e.0).collect();
-    let thr_points: Vec<Vec<Goldilocks>> = thr_layout.iter().map(|e| e.1.clone()).collect();
+    let thr_points: Vec<Vec<Ef>> = thr_layout.iter().map(|e| e.1.clone()).collect();
     if proof.thr_values.len() != thr_points.len() { return None; }
     if !verify_aux_open(thr_aux, &thr_idxs, &thr_points, &proof.thr_values, &proof.thr_opening) { return None; }
     if proof.thr_values[1] != vt { return None; }
     let terms = topk_broadcast_terms();
-    let (ok, z8, f8) = verify_virtual(&proof.broadcast, &terms, proof.thr_values[0], arity, transcript);
-    if !ok || f8 != virtual_eval(&terms, &proof.broadcast.final_evals)
-        || proof.broadcast.final_evals[0] != mle::eq_poly(&qb, &z8) { return None; }
+    let (ok, z8, f8) = efo::verify_virtual(&proof.broadcast, &terms, proof.thr_values[0], arity, transcript);
+    if !ok || f8 != efo::virtual_eval(&terms, &proof.broadcast.final_evals)
+        || proof.broadcast.final_evals[0] != ef_eq_poly(&qb, &z8) { return None; }
 
-    let q9: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma9 = transcript.field();
+    let q9: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma9 = transcript.ef_field();
     let terms = topk_range_terms(gamma9);
-    let (ok, z9, f9) = verify_virtual(&proof.x_range, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || f9 != virtual_eval(&terms, &proof.x_range.final_evals)
-        || proof.x_range.final_evals[0] != mle::eq_poly(&q9, &z9) { return None; }
+    let (ok, z9, f9) = efo::verify_virtual(&proof.x_range, &terms, Ef::ZERO, arity, transcript);
+    if !ok || f9 != efo::virtual_eval(&terms, &proof.x_range.final_evals)
+        || proof.x_range.final_evals[0] != ef_eq_poly(&q9, &z9) { return None; }
     let range_layout = topk_range_layout(&z9, arity);
     let range_idxs: Vec<usize> = range_layout.iter().map(|e| e.0).collect();
-    let range_points: Vec<Vec<Goldilocks>> = range_layout.iter().map(|e| e.1.clone()).collect();
+    let range_points: Vec<Vec<Ef>> = range_layout.iter().map(|e| e.1.clone()).collect();
     if !verify_aux_open(range_aux, &range_idxs, &range_points, &proof.range_aux_values, &proof.range_opening) { return None; }
     for b in 0..TK_SIGNED_BITS {
         if proof.x_range.final_evals[2 + b] != proof.range_aux_values[b] { return None; }
     }
 
-    let q10: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma10 = transcript.field();
+    let q10: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma10 = transcript.ef_field();
     let terms = topk_range_terms(gamma10);
-    let (ok, z10, f10) = verify_virtual(&proof.thr_range, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || f10 != virtual_eval(&terms, &proof.thr_range.final_evals)
-        || proof.thr_range.final_evals[0] != mle::eq_poly(&q10, &z10) { return None; }
+    let (ok, z10, f10) = efo::verify_virtual(&proof.thr_range, &terms, Ef::ZERO, arity, transcript);
+    if !ok || f10 != efo::virtual_eval(&terms, &proof.thr_range.final_evals)
+        || proof.thr_range.final_evals[0] != ef_eq_poly(&q10, &z10) { return None; }
     let tr_range_layout = topk_range_layout(&z10, arity);
     let tr_range_idxs: Vec<usize> = tr_range_layout.iter().map(|e| e.0).collect();
-    let tr_range_points: Vec<Vec<Goldilocks>> = tr_range_layout.iter().map(|e| e.1.clone()).collect();
+    let tr_range_points: Vec<Vec<Ef>> = tr_range_layout.iter().map(|e| e.1.clone()).collect();
     if !verify_aux_open(thr_range_aux, &tr_range_idxs, &tr_range_points,
         &proof.thr_range_values, &proof.thr_range_opening) { return None; }
     for b in 0..TK_SIGNED_BITS {
@@ -1767,78 +1774,78 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
         || proof.tie_row.final_evals.len() != 7
         || proof.tie_less.final_evals.len() != 4 + 3 * b_bits { return None; }
 
-    let qz: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gz = transcript.field();
+    let qz: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gz = transcript.ef_field();
     let terms = tie_zero_terms(gz);
-    let (ok, z_zero, fz) = verify_virtual(&proof.tie_zero, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || fz != virtual_eval(&terms, &proof.tie_zero.final_evals)
-        || proof.tie_zero.final_evals[0] != mle::eq_poly(&qz, &z_zero) { return None; }
+    let (ok, z_zero, fz) = efo::verify_virtual(&proof.tie_zero, &terms, Ef::ZERO, arity, transcript);
+    if !ok || fz != efo::virtual_eval(&terms, &proof.tie_zero.final_evals)
+        || proof.tie_zero.final_evals[0] != ef_eq_poly(&qz, &z_zero) { return None; }
 
-    let qbits: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gbits = transcript.field();
+    let qbits: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gbits = transcript.ef_field();
     let terms = tie_bits_terms(b_bits, gbits);
-    let (ok, z_bits, fb) = verify_virtual(&proof.tie_bits, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || fb != virtual_eval(&terms, &proof.tie_bits.final_evals)
-        || proof.tie_bits.final_evals[0] != mle::eq_poly(&qbits, &z_bits) { return None; }
+    let (ok, z_bits, fb) = efo::verify_virtual(&proof.tie_bits, &terms, Ef::ZERO, arity, transcript);
+    if !ok || fb != efo::virtual_eval(&terms, &proof.tie_bits.final_evals)
+        || proof.tie_bits.final_evals[0] != ef_eq_poly(&qbits, &z_bits) { return None; }
 
-    let qrank: Vec<Goldilocks> = transcript.field_vec(arity);
-    let grank = transcript.field();
+    let qrank: Vec<Ef> = transcript.ef_field_vec(arity);
+    let grank = transcript.ef_field();
     let terms = tie_rank_terms(grank);
-    let (ok, z_rank, fr) = verify_virtual(&proof.tie_rank, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || fr != virtual_eval(&terms, &proof.tie_rank.final_evals)
-        || proof.tie_rank.final_evals[0] != mle::eq_poly(&qrank, &z_rank) { return None; }
+    let (ok, z_rank, fr) = efo::verify_virtual(&proof.tie_rank, &terms, Ef::ZERO, arity, transcript);
+    if !ok || fr != efo::virtual_eval(&terms, &proof.tie_rank.final_evals)
+        || proof.tie_rank.final_evals[0] != ef_eq_poly(&qrank, &z_rank) { return None; }
     // E0 is not committed: the verifier evaluates its MLE (row start e = 0)
     // in closed form at the final point.
     let e0_at = z_rank[..lgn].iter()
-        .fold(Goldilocks::ONE, |a, &v| a * (Goldilocks::ONE - v));
+        .fold(Ef::ONE, |a, &v| a * (Ef::ONE - v));
     if proof.tie_rank.final_evals[4] != e0_at { return None; }
 
-    let qrow_t: Vec<Goldilocks> = transcript.field_vec(lgm);
-    let qfull: Vec<Goldilocks> = transcript.field_vec(arity);
-    let grow = transcript.field();
+    let qrow_t: Vec<Ef> = transcript.ef_field_vec(lgm);
+    let qfull: Vec<Ef> = transcript.ef_field_vec(arity);
+    let grow = transcript.ef_field();
     let terms = tie_row_terms(grow);
-    let (ok, z_row, fw) = verify_virtual(&proof.tie_row, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || fw != virtual_eval(&terms, &proof.tie_row.final_evals) { return None; }
+    let (ok, z_row, fw) = efo::verify_virtual(&proof.tie_row, &terms, Ef::ZERO, arity, transcript);
+    if !ok || fw != efo::virtual_eval(&terms, &proof.tie_row.final_evals) { return None; }
     if z_row.len() != arity
-        || proof.tie_row.final_evals[0] != mle::eq_poly(&qrow_t, &z_row[lgn..])
-        || proof.tie_row.final_evals[1] != mle::eq_poly(&qfull, &z_row) { return None; }
+        || proof.tie_row.final_evals[0] != ef_eq_poly(&qrow_t, &z_row[lgn..])
+        || proof.tie_row.final_evals[1] != ef_eq_poly(&qfull, &z_row) { return None; }
     let e0_row_at = z_row[..lgn].iter()
-        .fold(Goldilocks::ONE, |a, &v| a * (Goldilocks::ONE - v));
+        .fold(Ef::ONE, |a, &v| a * (Ef::ONE - v));
     if proof.tie_row.final_evals[5] != e0_row_at { return None; }
 
-    let qless: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gless = transcript.field();
+    let qless: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gless = transcript.ef_field();
     let terms = tie_less_terms(b_bits, gless);
-    let (ok, z_less, fl) = verify_virtual(&proof.tie_less, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || fl != virtual_eval(&terms, &proof.tie_less.final_evals)
-        || proof.tie_less.final_evals[0] != mle::eq_poly(&qless, &z_less) { return None; }
+    let (ok, z_less, fl) = efo::verify_virtual(&proof.tie_less, &terms, Ef::ZERO, arity, transcript);
+    if !ok || fl != efo::virtual_eval(&terms, &proof.tie_less.final_evals)
+        || proof.tie_less.final_evals[0] != ef_eq_poly(&qless, &z_less) { return None; }
 
     // Cyclic-shift pair-multiset permutations (same primitive as ScatterOrder).
-    let gamma_pp = transcript.field();
-    let alpha_pp = transcript.field();
+    let gamma_pp = transcript.ef_field();
+    let alpha_pp = transcript.ef_field();
     if alpha_pp != proof.perm_p.alpha { return None; }
-    let wcp = verify_fractional_chain_core(&proof.perm_p.a_side, arity, transcript)?;
-    let tcp = verify_fractional_chain_core(&proof.perm_p.b_side, arity, transcript)?;
-    if wcp.final_den == Goldilocks::ZERO || tcp.final_den == Goldilocks::ZERO { return None; }
+    let wcp = zkie_core::common::ef_logup::verify_fractional_chain_core(&proof.perm_p.a_side, arity, transcript)?;
+    let tcp = zkie_core::common::ef_logup::verify_fractional_chain_core(&proof.perm_p.b_side, arity, transcript)?;
+    if wcp.final_den == Ef::ZERO || tcp.final_den == Ef::ZERO { return None; }
     if wcp.final_num * tcp.final_den != tcp.final_num * wcp.final_den { return None; }
-    if wcp.num_leaf != Goldilocks::ONE || tcp.num_leaf != Goldilocks::ONE { return None; }
+    if wcp.num_leaf != Ef::ONE || tcp.num_leaf != Ef::ONE { return None; }
 
-    let gamma_pt = transcript.field();
-    let alpha_pt = transcript.field();
+    let gamma_pt = transcript.ef_field();
+    let alpha_pt = transcript.ef_field();
     if alpha_pt != proof.perm_t.alpha { return None; }
-    let wct = verify_fractional_chain_core(&proof.perm_t.a_side, arity, transcript)?;
-    let tct = verify_fractional_chain_core(&proof.perm_t.b_side, arity, transcript)?;
-    if wct.final_den == Goldilocks::ZERO || tct.final_den == Goldilocks::ZERO { return None; }
+    let wct = zkie_core::common::ef_logup::verify_fractional_chain_core(&proof.perm_t.a_side, arity, transcript)?;
+    let tct = zkie_core::common::ef_logup::verify_fractional_chain_core(&proof.perm_t.b_side, arity, transcript)?;
+    if wct.final_den == Ef::ZERO || tct.final_den == Ef::ZERO { return None; }
     if wct.final_num * tct.final_den != tct.final_num * wct.final_den { return None; }
-    if wct.num_leaf != Goldilocks::ONE || tct.num_leaf != Goldilocks::ONE { return None; }
-    let gamma_pb = transcript.field();
-    let alpha_pb = transcript.field();
+    if wct.num_leaf != Ef::ONE || tct.num_leaf != Ef::ONE { return None; }
+    let gamma_pb = transcript.ef_field();
+    let alpha_pb = transcript.ef_field();
     if alpha_pb != proof.perm_b.alpha { return None; }
-    let wcb = verify_fractional_chain_core(&proof.perm_b.a_side, arity, transcript)?;
-    let tcb = verify_fractional_chain_core(&proof.perm_b.b_side, arity, transcript)?;
-    if wcb.final_den == Goldilocks::ZERO || tcb.final_den == Goldilocks::ZERO { return None; }
+    let wcb = zkie_core::common::ef_logup::verify_fractional_chain_core(&proof.perm_b.a_side, arity, transcript)?;
+    let tcb = zkie_core::common::ef_logup::verify_fractional_chain_core(&proof.perm_b.b_side, arity, transcript)?;
+    if wcb.final_den == Ef::ZERO || tcb.final_den == Ef::ZERO { return None; }
     if wcb.final_num * tcb.final_den != tcb.final_num * wcb.final_den { return None; }
-    if wcb.num_leaf != Goldilocks::ONE || tcb.num_leaf != Goldilocks::ONE { return None; }
+    if wcb.num_leaf != Ef::ONE || tcb.num_leaf != Ef::ONE { return None; }
     let dom = 1usize.checked_shl(arity as u32)?;
     // Exact domain: no padding rows take part in the rank recurrence or in
     // the cyclic-shift permutation.
@@ -1847,7 +1854,7 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     let tie_layout = topk_tie_layout(&z_zero, &z_bits, &z_rank, &z_row, &z_less,
         &wcp.q_den, &tcp.q_den, &wct.q_den, &tct.q_den, &wcb.q_den, &tcb.q_den, b_bits, arity);
     let tie_idxs: Vec<usize> = tie_layout.iter().map(|e| e.0).collect();
-    let tie_points: Vec<Vec<Goldilocks>> = tie_layout.iter().map(|e| e.1.clone()).collect();
+    let tie_points: Vec<Vec<Ef>> = tie_layout.iter().map(|e| e.1.clone()).collect();
     if proof.tie_aux_values.len() != tie_layout.len() { return None; }
     if !verify_aux_open(tie_aux, &tie_idxs, &tie_points, &proof.tie_aux_values, &proof.tie_opening) { return None; }
     let tv = &proof.tie_aux_values;
@@ -1896,7 +1903,7 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     let layout = topk_witness_layout(&z1, &z2, &z3, &z4, &z5, &z6, &z7, &z8, &z10,
         &z_zero, &z_less, &z_row, &qs, &qg, &qd, &q2, arity);
     let idxs: Vec<usize> = layout.iter().map(|e| e.0).collect();
-    let points: Vec<Vec<Goldilocks>> = layout.iter().map(|e| e.1.clone()).collect();
+    let points: Vec<Vec<Ef>> = layout.iter().map(|e| e.1.clone()).collect();
     if proof.aux_values.len() != layout.len() { return None; }
     if !verify_aux_open(witness, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
 
@@ -1944,17 +1951,17 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     // Output claims: sel, gate, d1 bits -> d1, d2s bits + sel -> d2.
     let out_sel = take();
     let out_gate = take();
-    let mut d1v = Goldilocks::ZERO;
-    for b in 0..TK_RANGE_BITS { d1v = d1v + Goldilocks::from_u64(1u64 << b) * take(); }
-    let mut d2sv = Goldilocks::ZERO;
-    for b in 0..TK_RANGE_BITS { d2sv = d2sv + Goldilocks::from_u64(1u64 << b) * take(); }
+    let mut d1v = Ef::ZERO;
+    for b in 0..TK_RANGE_BITS { d1v = d1v + ef_u64(1u64 << b) * take(); }
+    let mut d2sv = Ef::ZERO;
+    for b in 0..TK_RANGE_BITS { d2sv = d2sv + ef_u64(1u64 << b) * take(); }
     let out_sel_q2 = take();
     // Tie endpoints: sel + d1 bits + d2 bits at z_zero, then sel at z_less.
     let zero_sel = take();
-    let mut zero_d1 = Goldilocks::ZERO;
-    for b in 0..TK_RANGE_BITS { zero_d1 = zero_d1 + Goldilocks::from_u64(1u64 << b) * take(); }
-    let mut zero_d2 = Goldilocks::ZERO;
-    for b in 0..TK_RANGE_BITS { zero_d2 = zero_d2 + Goldilocks::from_u64(1u64 << b) * take(); }
+    let mut zero_d1 = Ef::ZERO;
+    for b in 0..TK_RANGE_BITS { zero_d1 = zero_d1 + ef_u64(1u64 << b) * take(); }
+    let mut zero_d2 = Ef::ZERO;
+    for b in 0..TK_RANGE_BITS { zero_d2 = zero_d2 + ef_u64(1u64 << b) * take(); }
     let less_sel = take();
     let row_sel = take();
     if o != av.len() { return None; }
@@ -1970,11 +1977,11 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     let _ = out_sel_q2;
 
     let xk = TensorKey::Field(x).encoded()?;
-    let x_claim = |z: &[Goldilocks], v: Goldilocks| -> Option<EvalClaim> {
+    let x_claim = |z: &[Ef], v: Ef| -> Option<EfClaim> {
         if z.len() < arity { return None; }
         let f = zero_ext_factor(z, arity);
-        if f == Goldilocks::ZERO { return None; }
-        Some(EvalClaim { tensor_id: xk, point: z[..arity].to_vec(), value: v * f.inverse() })
+        if f == Ef::ZERO { return None; }
+        Some(EfClaim { tensor_id: xk, point: z[..arity].to_vec(), value: v * f.inverse() })
     };
     Some(vec![
         x_claim(&z3, proof.gate.final_evals[2])?,
@@ -1992,13 +1999,13 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
 // returned as claims. Rounding variants stay fail-closed.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseBroadcastScaleProof {
-    prod: VirtualProof,
-    bind: SamePolyProof,
+    prod: EfVirtualProof,
+    bind: EfSamePolyProof,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseScaleVecProof {
-    prod: VirtualProof,
-    bind: SamePolyProof,
+    prod: EfVirtualProof,
+    bind: EfSamePolyProof,
     /// log2 of the scale period, prover-supplied; the returned scale claim at
     /// this arity is authenticated upstream, which pins it unless the scale
     /// is constant.
@@ -2014,26 +2021,26 @@ struct ReverseScaleVecProof {
 /// point; `opening` authenticates them against the precommitted aux.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseScaleVecShiftedProof {
-    prod: VirtualProof,
-    bind: SamePolyProof,
+    prod: EfVirtualProof,
+    bind: EfSamePolyProof,
     scale_arity: usize,
-    remainder_bits: Vec<Goldilocks>,
-    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    remainder_bits: Vec<Ef>,
+    opening: EfBatchOpeningProof,
 }
 
-fn scale_vec_shift_terms(shift: usize, gamma: Goldilocks)
-    -> Vec<(Goldilocks, Vec<usize>)>
+fn scale_vec_shift_terms(shift: usize, gamma: Ef)
+    -> Vec<(Ef, Vec<usize>)>
 {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    let two_shift = Goldilocks::from_u64(1u64 << shift);
-    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+    let neg = Ef::ZERO - Ef::ONE;
+    let two_shift = ef_u64(1u64 << shift);
+    let half = ef_u64(1u64 << (shift - 1));
     let mut terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1, 2]),
+        (Ef::ONE, vec![0usize, 1, 2]),
         (-two_shift, vec![0usize, 3]),
         (half, vec![0usize]),
     ];
     for j in 0..shift {
-        terms.push((-Goldilocks::from_u64(1u64 << j), vec![0usize, 4 + j]));
+        terms.push((-ef_u64(1u64 << j), vec![0usize, 4 + j]));
     }
     let mut gp = gamma;
     for j in 0..shift {
@@ -2050,13 +2057,13 @@ fn broadcast_scale_dims(op: &Op) -> Option<(T, T, T, usize)> {
 fn scale_vec_dims(op: &Op) -> Option<(T, T, T, u32)> {
     match op { Op::ScaleVec { x, scale, out, shift } => Some((*x, *scale, *out, *shift)), _ => None }
 }
-fn exact_product_terms() -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    vec![(Goldilocks::ONE, vec![0usize, 1usize, 2usize]), (neg, vec![0usize, 3usize])]
+fn exact_product_terms() -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
+    vec![(Ef::ONE, vec![0usize, 1usize, 2usize]), (neg, vec![0usize, 3usize])]
 }
 
-fn prove_reverse_broadcast_scale(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
-    transcript: &mut Transcript) -> Option<(ReverseBroadcastScaleProof, Vec<EvalClaim>)>
+fn prove_reverse_broadcast_scale(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    transcript: &mut Transcript) -> Option<(ReverseBroadcastScaleProof, Vec<EfClaim>)>
 {
     let (x, scale, out, h) = broadcast_scale_dims(op)?;
     let xv = store.get(x);
@@ -2068,13 +2075,15 @@ fn prove_reverse_broadcast_scale(store: &Store, op: &Op, point: &[Goldilocks], v
     let lgl = l.trailing_zeros() as usize;
     let lgh = h.trailing_zeros() as usize;
     if point.len() != lgl { return None; }
-    let scale_b: Vec<Goldilocks> = (0..l).map(|i| sv[i / h]).collect();
-    let q: Vec<Goldilocks> = transcript.field_vec(lgl);
-    let eq = mle::eq_evals(&q);
+    let scale_b: Vec<Ef> = (0..l).map(|i| Ef::from(sv[i / h])).collect();
+    let q: Vec<Ef> = transcript.ef_field_vec(lgl);
+    let eq = efo::eq_evals(&q);
     let terms = exact_product_terms();
-    let (prod, z) = prove_virtual(&[&eq, xv, &scale_b, ov], &terms, Goldilocks::ZERO, transcript);
+    let xv_ef = ef_lift(xv);
+    let ov_ef = ef_lift(ov);
+    let (prod, z) = efo::prove_virtual(&[&eq, &xv_ef, &scale_b, &ov_ef], &terms, Ef::ZERO, transcript);
     if z.len() != lgl || prod.final_evals.len() != 4 { return None; }
-    let (bind, _) = prove_same_poly(ov, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
+    let (bind, _) = efo::prove_same_poly_ef(&ov_ef, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
     let x_val = prod.final_evals[1];
     let s_val = prod.final_evals[2];
     let xk = TensorKey::Field(x).encoded()?;
@@ -2082,13 +2091,13 @@ fn prove_reverse_broadcast_scale(store: &Store, op: &Op, point: &[Goldilocks], v
     let _ = &prod;
     Some((ReverseBroadcastScaleProof { prod, bind },
         vec![
-            EvalClaim { tensor_id: xk, point: z.clone(), value: x_val },
-            EvalClaim { tensor_id: sk, point: z[lgh..].to_vec(), value: s_val },
+            EfClaim { tensor_id: xk, point: z.clone(), value: x_val },
+            EfClaim { tensor_id: sk, point: z[lgh..].to_vec(), value: s_val },
         ]))
 }
 
-fn verify_reverse_broadcast_scale(op: &Op, point: &[Goldilocks], value: Goldilocks,
-    proof: &ReverseBroadcastScaleProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+fn verify_reverse_broadcast_scale(op: &Op, point: &[Ef], value: Ef,
+    proof: &ReverseBroadcastScaleProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
 {
     let (x, scale, _out, h) = broadcast_scale_dims(op)?;
     if !h.is_power_of_two() { return None; }
@@ -2096,25 +2105,25 @@ fn verify_reverse_broadcast_scale(op: &Op, point: &[Goldilocks], value: Goldiloc
     if lgl == 0 || lgl > 30 { return None; }
     let lgh = h.trailing_zeros() as usize;
     if lgh >= lgl { return None; }
-    let q: Vec<Goldilocks> = transcript.field_vec(lgl);
+    let q: Vec<Ef> = transcript.ef_field_vec(lgl);
     let terms = exact_product_terms();
-    let (ok, z, fc) = verify_virtual(&proof.prod, &terms, Goldilocks::ZERO, lgl, transcript);
+    let (ok, z, fc) = efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, transcript);
     if !ok || z.len() != lgl { return None; }
     let fe = &proof.prod.final_evals;
-    if fe.len() != 4 || fe[0] != mle::eq_poly(&q, &z) || fc != virtual_eval(&terms, fe) { return None; }
-    if verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
+    if fe.len() != 4 || fe[0] != ef_eq_poly(&q, &z) || fc != efo::virtual_eval(&terms, fe) { return None; }
+    if efo::verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
         { return None; }
     }
     let xk = TensorKey::Field(x).encoded()?;
     let sk = TensorKey::Field(scale).encoded()?;
     Some(vec![
-        EvalClaim { tensor_id: xk, point: z.clone(), value: fe[1] },
-        EvalClaim { tensor_id: sk, point: z[lgh..].to_vec(), value: fe[2] },
+        EfClaim { tensor_id: xk, point: z.clone(), value: fe[1] },
+        EfClaim { tensor_id: sk, point: z[lgh..].to_vec(), value: fe[2] },
     ])
 }
 
-fn prove_reverse_scale_vec(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
-    transcript: &mut Transcript) -> Option<(ReverseScaleVecProof, Vec<EvalClaim>)>
+fn prove_reverse_scale_vec(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    transcript: &mut Transcript) -> Option<(ReverseScaleVecProof, Vec<EfClaim>)>
 {
     let (x, scale, out, shift) = scale_vec_dims(op)?;
     if shift != 0 { return None; }
@@ -2127,13 +2136,15 @@ fn prove_reverse_scale_vec(store: &Store, op: &Op, point: &[Goldilocks], value: 
     let lgl = l.trailing_zeros() as usize;
     let lgs = sv.len().trailing_zeros() as usize;
     if point.len() != lgl { return None; }
-    let scale_b: Vec<Goldilocks> = (0..l).map(|i| sv[i % sv.len()]).collect();
-    let q: Vec<Goldilocks> = transcript.field_vec(lgl);
-    let eq = mle::eq_evals(&q);
+    let scale_b: Vec<Ef> = (0..l).map(|i| Ef::from(sv[i % sv.len()])).collect();
+    let q: Vec<Ef> = transcript.ef_field_vec(lgl);
+    let eq = efo::eq_evals(&q);
     let terms = exact_product_terms();
-    let (prod, z) = prove_virtual(&[&eq, xv, &scale_b, ov], &terms, Goldilocks::ZERO, transcript);
+    let xv_ef = ef_lift(xv);
+    let ov_ef = ef_lift(ov);
+    let (prod, z) = efo::prove_virtual(&[&eq, &xv_ef, &scale_b, &ov_ef], &terms, Ef::ZERO, transcript);
     if z.len() != lgl || prod.final_evals.len() != 4 { return None; }
-    let (bind, _) = prove_same_poly(ov, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
+    let (bind, _) = efo::prove_same_poly_ef(&ov_ef, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
     let x_val = prod.final_evals[1];
     let s_val = prod.final_evals[2];
     let xk = TensorKey::Field(x).encoded()?;
@@ -2141,33 +2152,33 @@ fn prove_reverse_scale_vec(store: &Store, op: &Op, point: &[Goldilocks], value: 
     let _ = &prod;
     Some((ReverseScaleVecProof { prod, bind, scale_arity: lgs },
         vec![
-            EvalClaim { tensor_id: xk, point: z.clone(), value: x_val },
-            EvalClaim { tensor_id: sk, point: z[..lgs].to_vec(), value: s_val },
+            EfClaim { tensor_id: xk, point: z.clone(), value: x_val },
+            EfClaim { tensor_id: sk, point: z[..lgs].to_vec(), value: s_val },
         ]))
 }
 
-fn verify_reverse_scale_vec(op: &Op, point: &[Goldilocks], value: Goldilocks,
-    proof: &ReverseScaleVecProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+fn verify_reverse_scale_vec(op: &Op, point: &[Ef], value: Ef,
+    proof: &ReverseScaleVecProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
 {
     let (x, scale, _out, shift) = scale_vec_dims(op)?;
     if shift != 0 { return None; }
     let lgl = point.len();
     if lgl == 0 || lgl > 30 { return None; }
     if proof.scale_arity > lgl { return None; }
-    let q: Vec<Goldilocks> = transcript.field_vec(lgl);
+    let q: Vec<Ef> = transcript.ef_field_vec(lgl);
     let terms = exact_product_terms();
-    let (ok, z, fc) = verify_virtual(&proof.prod, &terms, Goldilocks::ZERO, lgl, transcript);
+    let (ok, z, fc) = efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, transcript);
     if !ok || z.len() != lgl { return None; }
     let fe = &proof.prod.final_evals;
-    if fe.len() != 4 || fe[0] != mle::eq_poly(&q, &z) || fc != virtual_eval(&terms, fe) { return None; }
-    if verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
+    if fe.len() != 4 || fe[0] != ef_eq_poly(&q, &z) || fc != efo::virtual_eval(&terms, fe) { return None; }
+    if efo::verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
         { return None; }
     }
     let xk = TensorKey::Field(x).encoded()?;
     let sk = TensorKey::Field(scale).encoded()?;
     Some(vec![
-        EvalClaim { tensor_id: xk, point: z.clone(), value: fe[1] },
-        EvalClaim { tensor_id: sk, point: z[..proof.scale_arity].to_vec(), value: fe[2] },
+        EfClaim { tensor_id: xk, point: z.clone(), value: fe[1] },
+        EfClaim { tensor_id: sk, point: z[..proof.scale_arity].to_vec(), value: fe[2] },
     ])
 }
 
@@ -2176,9 +2187,9 @@ fn verify_reverse_scale_vec(op: &Op, point: &[Goldilocks], value: Goldilocks,
 /// dividing L, and the precommitted ScaleVecRemainder bit aux. The rounding is
 /// ties-up, matching Op::Scale: out*2^s = x*scale_b - rho with
 /// rho = rem - 2^(s-1) and rem in [0, 2^s).
-fn prove_reverse_scale_vec_shifted(store: &Store, op: &Op, point: &[Goldilocks],
-    value: Goldilocks, aux: PreparedAux, transcript: &mut Transcript)
-    -> Option<(ReverseScaleVecShiftedProof, Vec<EvalClaim>)>
+fn prove_reverse_scale_vec_shifted(store: &Store, op: &Op, point: &[Ef],
+    value: Ef, aux: PreparedAux, transcript: &mut Transcript)
+    -> Option<(ReverseScaleVecShiftedProof, Vec<EfClaim>)>
 {
     let (x, scale, out, shift) = scale_vec_dims(op)?;
     if shift == 0 || shift > 31 { return None; }
@@ -2205,27 +2216,24 @@ fn prove_reverse_scale_vec_shifted(store: &Store, op: &Op, point: &[Goldilocks],
             if aux.columns[j][i] != Goldilocks::from_u64(((rem as u64) >> j) & 1) { return None; }
         }
     }
-    let scale_b: Vec<Goldilocks> = (0..l).map(|i| sv[i % sv.len()]).collect();
+    let scale_b: Vec<Ef> = (0..l).map(|i| Ef::from(sv[i % sv.len()])).collect();
     transcript.absorb(b"zkie-scalevec-shift-v1");
-    let q = transcript.field_vec(lgl);
-    let gamma = transcript.field();
-    let eq = mle::eq_evals(&q);
-    let mut mles: Vec<&[Goldilocks]> = vec![&eq, xv, &scale_b, ov];
-    mles.extend(aux.columns.iter().map(Vec::as_slice));
+    let q = transcript.ef_field_vec(lgl);
+    let gamma = transcript.ef_field();
+    let eq = efo::eq_evals(&q);
+    let xv_ef = ef_lift(xv);
+    let ov_ef = ef_lift(ov);
+    let aux_ef = lift_columns(&aux.columns);
+    let mut mles: Vec<&[Ef]> = vec![&eq, &xv_ef, &scale_b, &ov_ef];
+    mles.extend(aux_ef.iter().map(Vec::as_slice));
     let terms = scale_vec_shift_terms(shift as usize, gamma);
-    let (prod, z) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    let (prod, z) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
     if z.len() != lgl || prod.final_evals.len() != 4 + shift as usize { return None; }
-    let (bind, _) = prove_same_poly(ov, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
+    let (bind, _) = efo::prove_same_poly_ef(&ov_ef, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
     let bits = prod.final_evals[4..4 + shift as usize].to_vec();
     let idxs: Vec<usize> = (0..shift as usize).collect();
     let points = vec![z.clone(); shift as usize];
-    let tensors = aux.columns.clone();
-    let ctx = zkie_core::pcs::committed::BatchCtx {
-        commitment: aux.descriptor.commitment.clone(), prover_data: aux.prover_data,
-        protocol: aux.protocol, whir: aux.whir, num_tables: shift as usize,
-    };
-    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-        ctx, &idxs, &tensors, &points, &bits).ok()?;
+    let opening = open_aux(aux, &idxs, &points, &bits)?;
     let (x_point, x_eval) = unpad_relu_claim(&z, prod.final_evals[1], lgl)?;
     let scale_eval = prod.final_evals[2];
     let lgs = sv.len().trailing_zeros() as usize;
@@ -2233,14 +2241,14 @@ fn prove_reverse_scale_vec_shifted(store: &Store, op: &Op, point: &[Goldilocks],
     let sk = TensorKey::Field(scale).encoded()?;
     Some((ReverseScaleVecShiftedProof { prod, bind, scale_arity: lgs, remainder_bits: bits, opening },
         vec![
-            EvalClaim { tensor_id: xk, point: x_point, value: x_eval },
-            EvalClaim { tensor_id: sk, point: z[..lgs].to_vec(), value: scale_eval },
+            EfClaim { tensor_id: xk, point: x_point, value: x_eval },
+            EfClaim { tensor_id: sk, point: z[..lgs].to_vec(), value: scale_eval },
         ]))
 }
 
-fn verify_reverse_scale_vec_shifted(op: &Op, point: &[Goldilocks], value: Goldilocks,
+fn verify_reverse_scale_vec_shifted(op: &Op, point: &[Ef], value: Ef,
     aux: Option<&AuxDescriptor>, proof: &ReverseScaleVecShiftedProof, transcript: &mut Transcript)
-    -> Option<Vec<EvalClaim>>
+    -> Option<Vec<EfClaim>>
 {
     let (x, scale, _out, shift) = scale_vec_dims(op)?;
     if shift == 0 || shift > 31 { return None; }
@@ -2254,27 +2262,27 @@ fn verify_reverse_scale_vec_shifted(op: &Op, point: &[Goldilocks], value: Goldil
         || proof.scale_arity > lgl
         || proof.prod.final_evals.len() != 4 + shift as usize { return None; }
     transcript.absorb(b"zkie-scalevec-shift-v1");
-    let q = transcript.field_vec(lgl);
-    let gamma = transcript.field();
+    let q = transcript.ef_field_vec(lgl);
+    let gamma = transcript.ef_field();
     let terms = scale_vec_shift_terms(shift as usize, gamma);
-    let (ok, z, fc) = verify_virtual(&proof.prod, &terms, Goldilocks::ZERO, lgl, transcript);
+    let (ok, z, fc) = efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, transcript);
     if !ok || z.len() != lgl { return None; }
     let fe = &proof.prod.final_evals;
-    if fe[0] != mle::eq_poly(&q, &z) || fc != virtual_eval(&terms, fe) { return None; }
+    if fe[0] != ef_eq_poly(&q, &z) || fc != efo::virtual_eval(&terms, fe) { return None; }
     if !verify_aux_open(descriptor, &(0..shift as usize).collect::<Vec<_>>(),
         &vec![z.clone(); shift as usize], &proof.remainder_bits, &proof.opening) { return None; }
     for j in 0..shift as usize {
         if fe[4 + j] != proof.remainder_bits[j] { return None; }
     }
-    if verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
+    if efo::verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
         return None;
     }
     let (x_point, x_eval) = unpad_relu_claim(&z, fe[1], lgl)?;
     let xk = TensorKey::Field(x).encoded()?;
     let sk = TensorKey::Field(scale).encoded()?;
     Some(vec![
-        EvalClaim { tensor_id: xk, point: x_point, value: x_eval },
-        EvalClaim { tensor_id: sk, point: z[..proof.scale_arity].to_vec(), value: fe[2] },
+        EfClaim { tensor_id: xk, point: x_point, value: x_eval },
+        EfClaim { tensor_id: sk, point: z[..proof.scale_arity].to_vec(), value: fe[2] },
     ])
 }
 
@@ -2305,25 +2313,25 @@ fn verify_reverse_scale_vec_shifted(op: &Op, point: &[Goldilocks], value: Goldil
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseScatterProof {
     /// Booleanity of every R/X column (claim 0).
-    bools: VirtualProof,
+    bools: EfVirtualProof,
     /// sum_pos eq(z,pos) * sum_t R_t(pos) = mask~(z).
-    mask_tok: VirtualProof,
+    mask_tok: EfVirtualProof,
     /// sum_pos eq(z,pos) * sum_e X_e(pos) = mask~(z).
-    mask_exp: VirtualProof,
+    mask_exp: EfVirtualProof,
     /// Counts/multiset identity (claim counts_total).
-    counts: VirtualProof,
+    counts: EfVirtualProof,
     /// The prover-committed counts total; forced by the sumcheck.
-    counts_total: Goldilocks,
+    counts_total: Ef,
     /// Aux values in the exact order rebuilt by the verifier.
-    aux_values: Vec<Goldilocks>,
-    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
-    order_key_cons: VirtualProof,
-    order_key_bits: VirtualProof,
-    order_d_rel: VirtualProof,
-    order_asc: VirtualProof,
-    perm: PermutationProof,
-    order_aux_values: Vec<Goldilocks>,
-    order_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    aux_values: Vec<Ef>,
+    opening: EfBatchOpeningProof,
+    order_key_cons: EfVirtualProof,
+    order_key_bits: EfVirtualProof,
+    order_d_rel: EfVirtualProof,
+    order_asc: EfVirtualProof,
+    perm: EfPermutationProof,
+    order_aux_values: Vec<Ef>,
+    order_opening: EfBatchOpeningProof,
 }
 
 fn scatter_dims(op: &Op) -> Option<(T, T, T, usize, usize)> {
@@ -2428,10 +2436,10 @@ fn prepare_scatter_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
 }
 
 /// Shared by prove/verify: booleanity of all m+n routing columns.
-fn scatter_bool_terms(gamma: Goldilocks, columns: usize) -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn scatter_bool_terms(gamma: Ef, columns: usize) -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
     let mut terms = Vec::with_capacity(2 * columns);
-    let mut gp = Goldilocks::ONE;
+    let mut gp = Ef::ONE;
     for c in 0..columns {
         terms.push((gp, vec![0usize, 1 + c, 1 + c]));
         terms.push((-gp, vec![0usize, 1 + c]));
@@ -2441,17 +2449,17 @@ fn scatter_bool_terms(gamma: Goldilocks, columns: usize) -> Vec<(Goldilocks, Vec
 }
 /// Shared by prove/verify: mask sums. `is_tok` selects R columns (mles
 /// 1..=m) or X columns (mles 1..=n).
-fn scatter_mask_terms(is_tok: bool, m: usize, n: usize) -> Vec<(Goldilocks, Vec<usize>)> {
+fn scatter_mask_terms(is_tok: bool, m: usize, n: usize) -> Vec<(Ef, Vec<usize>)> {
     let count = if is_tok { m } else { n };
-    (0..count).map(|i| (Goldilocks::ONE, vec![0usize, 1 + i])).collect()
+    (0..count).map(|i| (Ef::ONE, vec![0usize, 1 + i])).collect()
 }
 /// Shared by prove/verify: counts/multiset identity. With
 /// R'(pos) = sum_t eq_t[t] R_t(pos) and X' likewise, the unweighted sum
 /// sum_pos R'(pos) X'(pos) is the MLE of the routing count matrix
 /// count[t,e] at (q_t, q_e); equality with the sel claim forces
 /// count == sel pointwise (no duplicate, no dropped, no non-active pair).
-fn scatter_counts_terms(eq_t: &[Goldilocks], eq_e: &[Goldilocks], m: usize, n: usize)
-    -> Vec<(Goldilocks, Vec<usize>)>
+fn scatter_counts_terms(eq_t: &[Ef], eq_e: &[Ef], m: usize, n: usize)
+    -> Vec<(Ef, Vec<usize>)>
 {
     let mut terms = Vec::with_capacity(m * n);
     for t in 0..m {
@@ -2463,18 +2471,18 @@ fn scatter_counts_terms(eq_t: &[Goldilocks], eq_e: &[Goldilocks], m: usize, n: u
 }
 
 /// Shared by prove/verify: mles [eq, k, R_0..R_{m-1}, X_0..X_{n-1}].
-fn scatter_key_cons_terms(m: usize, n: usize) -> Vec<(Goldilocks, Vec<usize>)> {
-    let mut terms = vec![(Goldilocks::ONE, vec![0usize, 1usize])];
-    for t in 0..m { terms.push((-Goldilocks::from_u64(t as u64), vec![0usize, 2 + t])); }
+fn scatter_key_cons_terms(m: usize, n: usize) -> Vec<(Ef, Vec<usize>)> {
+    let mut terms = vec![(Ef::ONE, vec![0usize, 1usize])];
+    for t in 0..m { terms.push((-ef_u64(t as u64), vec![0usize, 2 + t])); }
     for e in 0..n {
-        terms.push((-Goldilocks::from_u64((m as u64) * e as u64), vec![0usize, 2 + m + e]));
+        terms.push((-ef_u64((m as u64) * e as u64), vec![0usize, 2 + m + e]));
     }
     terms
 }
 /// Shared by prove/verify: mles [eq, k, k_bits...].
-fn scatter_key_bits_terms(gamma: Goldilocks, bits: usize) -> Vec<(Goldilocks, Vec<usize>)> {
-    let mut terms = vec![(Goldilocks::ONE, vec![0usize, 1usize])];
-    for b in 0..bits { terms.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 2 + b])); }
+fn scatter_key_bits_terms(gamma: Ef, bits: usize) -> Vec<(Ef, Vec<usize>)> {
+    let mut terms = vec![(Ef::ONE, vec![0usize, 1usize])];
+    for b in 0..bits { terms.push((-ef_u64(1u64 << b), vec![0usize, 2 + b])); }
     let mut gp = gamma;
     for b in 0..bits {
         terms.push((gp, vec![0usize, 2 + b]));
@@ -2484,20 +2492,20 @@ fn scatter_key_bits_terms(gamma: Goldilocks, bits: usize) -> Vec<(Goldilocks, Ve
     terms
 }
 /// Shared by prove/verify: mles [eq, k, k_next, d]; d = k - k_next - 1.
-fn scatter_d_rel_terms() -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn scatter_d_rel_terms() -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
     vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
+        (Ef::ONE, vec![0usize, 1usize]),
         (neg, vec![0usize, 2usize]),
         (neg, vec![0usize]),
         (neg, vec![0usize, 3usize]),
     ]
 }
 /// Shared by prove/verify: mles [eq, mask2, d, d_bits...].
-fn scatter_asc_terms(gamma: Goldilocks, bits: usize) -> Vec<(Goldilocks, Vec<usize>)> {
-    let mut terms = vec![(Goldilocks::ONE, vec![0usize, 1usize, 2usize])];
+fn scatter_asc_terms(gamma: Ef, bits: usize) -> Vec<(Ef, Vec<usize>)> {
+    let mut terms = vec![(Ef::ONE, vec![0usize, 1usize, 2usize])];
     for b in 0..bits {
-        terms.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 1usize, 3 + b]));
+        terms.push((-ef_u64(1u64 << b), vec![0usize, 1usize, 3 + b]));
     }
     let mut gp = gamma;
     for b in 0..bits {
@@ -2507,21 +2515,21 @@ fn scatter_asc_terms(gamma: Goldilocks, bits: usize) -> Vec<(Goldilocks, Vec<usi
     }
     terms
 }
-fn pos_mle(z: &[Goldilocks]) -> Goldilocks {
-    z.iter().enumerate().fold(Goldilocks::ZERO, |acc, (b, &v)| acc + Goldilocks::from_u64(1u64 << b) * v)
+fn pos_mle(z: &[Ef]) -> Ef {
+    z.iter().enumerate().fold(Ef::ZERO, |acc, (b, &v)| acc + ef_u64(1u64 << b) * v)
 }
-fn pos_plus1_mle(z: &[Goldilocks], dom: usize) -> Goldilocks {
-    let all = z.iter().fold(Goldilocks::ONE, |a, &v| a * v);
-    pos_mle(z) + Goldilocks::ONE - Goldilocks::from_u64(dom as u64) * all
+fn pos_plus1_mle(z: &[Ef], dom: usize) -> Ef {
+    let all = z.iter().fold(Ef::ONE, |a, &v| a * v);
+    pos_mle(z) + Ef::ONE - ef_u64(dom as u64) * all
 }
 
 /// Exact opening layout, shared by prove/verify.
-fn scatter_openings(z1: &[Goldilocks], z2t: &[Goldilocks], z2e: &[Goldilocks],
-    z4: &[Goldilocks], zk: &[Goldilocks], q_tok: &[Goldilocks], q_exp: &[Goldilocks],
-    m: usize, n: usize, arity: usize) -> Vec<(usize, Vec<Goldilocks>)>
+fn scatter_openings(z1: &[Ef], z2t: &[Ef], z2e: &[Ef],
+    z4: &[Ef], zk: &[Ef], q_tok: &[Ef], q_exp: &[Ef],
+    m: usize, n: usize, arity: usize) -> Vec<(usize, Vec<Ef>)>
 {
-    let pad = |z: &[Goldilocks]| argmax_pad_point(z, arity);
-    let mut e: Vec<(usize, Vec<Goldilocks>)> = Vec::new();
+    let pad = |z: &[Ef]| argmax_pad_point(z, arity);
+    let mut e: Vec<(usize, Vec<Ef>)> = Vec::new();
     for c in 0..(m + n) { e.push((c, pad(z1))); }
     for c in 0..m { e.push((c, pad(z2t))); }
     for c in 0..n { e.push((m + c, pad(z2e))); }
@@ -2531,12 +2539,12 @@ fn scatter_openings(z1: &[Goldilocks], z2t: &[Goldilocks], z2e: &[Goldilocks],
     for c in 0..(m + n) { e.push((c, pad(zk))); }
     e
 }
-fn scatter_order_layout(zk: &[Goldilocks], zkb: &[Goldilocks], zd: &[Goldilocks],
-    za: &[Goldilocks], q_den_a: &[Goldilocks], q_den_b: &[Goldilocks],
-    bits: usize, arity: usize) -> Vec<(usize, Vec<Goldilocks>)>
+fn scatter_order_layout(zk: &[Ef], zkb: &[Ef], zd: &[Ef],
+    za: &[Ef], q_den_a: &[Ef], q_den_b: &[Ef],
+    bits: usize, arity: usize) -> Vec<(usize, Vec<Ef>)>
 {
-    let pad = |z: &[Goldilocks]| argmax_pad_point(z, arity);
-    let mut e: Vec<(usize, Vec<Goldilocks>)> = Vec::new();
+    let pad = |z: &[Ef]| argmax_pad_point(z, arity);
+    let mut e: Vec<(usize, Vec<Ef>)> = Vec::new();
     e.push((0, pad(zk)));
     e.push((0, pad(zkb)));
     for b in 0..bits { e.push((3 + b, pad(zkb))); }
@@ -2550,9 +2558,9 @@ fn scatter_order_layout(zk: &[Goldilocks], zkb: &[Goldilocks], zd: &[Goldilocks]
     e
 }
 
-fn prove_reverse_scatter(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+fn prove_reverse_scatter(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     aux: PreparedAux, order_aux: PreparedAux, transcript: &mut Transcript)
-    -> Option<(ReverseScatterProof, Vec<EvalClaim>)>
+    -> Option<(ReverseScatterProof, Vec<EfClaim>)>
 {
     let (sel, token_id, expert_of, m, n) = scatter_dims(op)?;
     if aux.descriptor.role != AuxRole::ScatterRouting || aux.descriptor.columns != m.checked_add(n)? {
@@ -2577,110 +2585,99 @@ fn prove_reverse_scatter(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Go
     let (q_tok, v_tok) = argmax_claim(outs, tok_key)?;
     let (q_exp, v_exp) = argmax_claim(outs, exp_key)?;
     if q_tok.len() != lb || q_exp.len() != lb { return None; }
-    let cols = &aux.columns;
+    let cols = lift_columns(&aux.columns);
     if cols.len() != m + n { return None; }
 
-    let q1: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma1 = transcript.field();
-    let eq1 = mle::eq_evals(&q1);
-    let mut mles: Vec<&[Goldilocks]> = vec![&eq1];
+    let q1: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma1 = transcript.ef_field();
+    let eq1 = efo::eq_evals(&q1);
+    let mut mles: Vec<&[Ef]> = vec![&eq1];
     for c in 0..(m + n) { mles.push(&cols[c]); }
-    let (bools, z1) = prove_virtual(&mles, &scatter_bool_terms(gamma1, m + n), Goldilocks::ZERO, transcript);
+    let (bools, z1) = efo::prove_virtual(&mles, &scatter_bool_terms(gamma1, m + n), Ef::ZERO, transcript);
 
-    let q2t: Vec<Goldilocks> = transcript.field_vec(arity);
-    let eq2t = mle::eq_evals(&q2t);
-    let mut mles_t: Vec<&[Goldilocks]> = vec![&eq2t];
+    let q2t: Vec<Ef> = transcript.ef_field_vec(arity);
+    let eq2t = efo::eq_evals(&q2t);
+    let mut mles_t: Vec<&[Ef]> = vec![&eq2t];
     for t in 0..m { mles_t.push(&cols[t]); }
-    let (mask_tok, z2t) = prove_virtual(&mles_t, &scatter_mask_terms(true, m, n),
+    let (mask_tok, z2t) = efo::prove_virtual(&mles_t, &scatter_mask_terms(true, m, n),
         expert_mask_eval(&q2t, s), transcript);
 
-    let q2e: Vec<Goldilocks> = transcript.field_vec(arity);
-    let eq2e = mle::eq_evals(&q2e);
-    let mut mles_e: Vec<&[Goldilocks]> = vec![&eq2e];
+    let q2e: Vec<Ef> = transcript.ef_field_vec(arity);
+    let eq2e = efo::eq_evals(&q2e);
+    let mut mles_e: Vec<&[Ef]> = vec![&eq2e];
     for e in 0..n { mles_e.push(&cols[m + e]); }
-    let (mask_exp, z2e) = prove_virtual(&mles_e, &scatter_mask_terms(false, m, n),
+    let (mask_exp, z2e) = efo::prove_virtual(&mles_e, &scatter_mask_terms(false, m, n),
         expert_mask_eval(&q2e, s), transcript);
 
-    let q_t: Vec<Goldilocks> = transcript.field_vec(lgm);
-    let q_e: Vec<Goldilocks> = transcript.field_vec(lgn);
-    let eq_t = mle::eq_evals(&q_t);
-    let eq_e = mle::eq_evals(&q_e);
-    let mut total = Goldilocks::ZERO;
+    let q_t: Vec<Ef> = transcript.ef_field_vec(lgm);
+    let q_e: Vec<Ef> = transcript.ef_field_vec(lgn);
+    let eq_t = efo::eq_evals(&q_t);
+    let eq_e = efo::eq_evals(&q_e);
+    let mut total = Ef::ZERO;
     for pos in 0..s {
-        let mut rp = Goldilocks::ZERO;
+        let mut rp = Ef::ZERO;
         for t in 0..m { rp = rp + eq_t[t] * cols[t][pos]; }
-        let mut xp = Goldilocks::ZERO;
+        let mut xp = Ef::ZERO;
         for e in 0..n { xp = xp + eq_e[e] * cols[m + e][pos]; }
         total = total + rp * xp;
     }
-    let mut mles_c: Vec<&[Goldilocks]> = Vec::with_capacity(m + n);
+    let mut mles_c: Vec<&[Ef]> = Vec::with_capacity(m + n);
     for c in 0..(m + n) { mles_c.push(&cols[c]); }
-    let (counts, z4) = prove_virtual(&mles_c, &scatter_counts_terms(&eq_t, &eq_e, m, n), total, transcript);
+    let (counts, z4) = efo::prove_virtual(&mles_c, &scatter_counts_terms(&eq_t, &eq_e, m, n), total, transcript);
 
-    let oc = &order_aux.columns;
-    let qk: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gk = transcript.field();
-    let eqk = mle::eq_evals(&qk);
-    let mut mles_kc: Vec<&[Goldilocks]> = vec![&eqk, &oc[0]];
+    let oc = lift_columns(&order_aux.columns);
+    let qk: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gk = transcript.ef_field();
+    let eqk = efo::eq_evals(&qk);
+    let mut mles_kc: Vec<&[Ef]> = vec![&eqk, &oc[0]];
     for c in 0..(m + n) { mles_kc.push(&cols[c]); }
-    let (order_key_cons, zk) = prove_virtual(&mles_kc, &scatter_key_cons_terms(m, n), Goldilocks::ZERO, transcript);
+    let (order_key_cons, zk) = efo::prove_virtual(&mles_kc, &scatter_key_cons_terms(m, n), Ef::ZERO, transcript);
 
-    let qkb: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gkb = transcript.field();
-    let eqkb = mle::eq_evals(&qkb);
-    let mut mles_kb: Vec<&[Goldilocks]> = vec![&eqkb, &oc[0]];
+    let qkb: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gkb = transcript.ef_field();
+    let eqkb = efo::eq_evals(&qkb);
+    let mut mles_kb: Vec<&[Ef]> = vec![&eqkb, &oc[0]];
     for b in 0..b_bits { mles_kb.push(&oc[3 + b]); }
-    let (order_key_bits, zkb) = prove_virtual(&mles_kb, &scatter_key_bits_terms(gkb, b_bits), Goldilocks::ZERO, transcript);
+    let (order_key_bits, zkb) = efo::prove_virtual(&mles_kb, &scatter_key_bits_terms(gkb, b_bits), Ef::ZERO, transcript);
 
-    let qd: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gd = transcript.field();
-    let eqd = mle::eq_evals(&qd);
-    let (order_d_rel, zd) = prove_virtual(&[&eqd, &oc[0], &oc[1], &oc[2]],
-        &scatter_d_rel_terms(), Goldilocks::ZERO, transcript);
+    let qd: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gd = transcript.ef_field();
+    let eqd = efo::eq_evals(&qd);
+    let (order_d_rel, zd) = efo::prove_virtual(&[&eqd, &oc[0], &oc[1], &oc[2]],
+        &scatter_d_rel_terms(), Ef::ZERO, transcript);
 
-    let qa: Vec<Goldilocks> = transcript.field_vec(arity);
-    let ga = transcript.field();
-    let eqa = mle::eq_evals(&qa);
-    let mut mask2 = vec![Goldilocks::ZERO; padded];
-    for pos in 1..s { mask2[pos] = Goldilocks::ONE; }
-    let mut mles_asc: Vec<&[Goldilocks]> = vec![&eqa, &mask2, &oc[2]];
+    let qa: Vec<Ef> = transcript.ef_field_vec(arity);
+    let ga = transcript.ef_field();
+    let eqa = efo::eq_evals(&qa);
+    let mut mask2 = vec![Ef::ZERO; padded];
+    for pos in 1..s { mask2[pos] = Ef::ONE; }
+    let mut mles_asc: Vec<&[Ef]> = vec![&eqa, &mask2, &oc[2]];
     for b in 0..b_bits { mles_asc.push(&oc[3 + b_bits + b]); }
-    let (order_asc, za) = prove_virtual(&mles_asc, &scatter_asc_terms(ga, b_bits), Goldilocks::ZERO, transcript);
+    let (order_asc, za) = efo::prove_virtual(&mles_asc, &scatter_asc_terms(ga, b_bits), Ef::ZERO, transcript);
 
-    let gamma_p = transcript.field();
-    let mut per_a = vec![Goldilocks::ZERO; padded];
-    let mut per_b = vec![Goldilocks::ZERO; padded];
+    let gamma_p = transcript.ef_field();
+    let mut per_a = vec![Ef::ZERO; padded];
+    let mut per_b = vec![Ef::ZERO; padded];
     for q in 0..padded {
-        per_a[q] = oc[1][q] + gamma_p * Goldilocks::from_u64(q as u64);
-        per_b[q] = oc[0][q] + gamma_p * Goldilocks::from_u64(((q + 1) % padded) as u64);
+        per_a[q] = oc[1][q] + gamma_p * ef_u64(q as u64);
+        per_b[q] = oc[0][q] + gamma_p * ef_u64(((q + 1) % padded) as u64);
     }
-    let perm = prove_permutation(&per_a, &per_b, transcript);
-    let q_den_a = fractional_leaf(&perm.a_side).2;
-    let q_den_b = fractional_leaf(&perm.b_side).2;
+    let perm = zkie_core::common::ef_logup::prove_permutation(&per_a, &per_b, transcript);
+    let q_den_a = zkie_core::common::ef_logup::fractional_leaf(&perm.a_side).2;
+    let q_den_b = zkie_core::common::ef_logup::fractional_leaf(&perm.b_side).2;
 
     let layout = scatter_openings(&z1, &z2t, &z2e, &z4, &zk, &q_tok, &q_exp, m, n, arity);
     let idxs: Vec<usize> = layout.iter().map(|e| e.0).collect();
-    let points: Vec<Vec<Goldilocks>> = layout.iter().map(|e| e.1.clone()).collect();
-    let values: Vec<Goldilocks> = layout.iter().map(|e| mle::eval(&cols[e.0], &e.1)).collect();
-    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&c| cols[c].clone()).collect();
-    let ctx = zkie_core::pcs::committed::BatchCtx {
-        commitment: aux.descriptor.commitment.clone(), prover_data: aux.prover_data,
-        protocol: aux.protocol, whir: aux.whir, num_tables: aux.descriptor.columns,
-    };
-    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-        ctx, &idxs, &tensors, &points, &values).ok()?;
+    let points: Vec<Vec<Ef>> = layout.iter().map(|e| e.1.clone()).collect();
+    let values: Vec<Ef> = layout.iter().map(|e| ef_eval(&aux.columns[e.0], &e.1)).collect();
+    let opening = open_aux(aux, &idxs, &points, &values)?;
 
     let olayout = scatter_order_layout(&zk, &zkb, &zd, &za, &q_den_a, &q_den_b, b_bits, arity);
     let oidxs: Vec<usize> = olayout.iter().map(|e| e.0).collect();
-    let opoints: Vec<Vec<Goldilocks>> = olayout.iter().map(|e| e.1.clone()).collect();
-    let ovalues: Vec<Goldilocks> = olayout.iter().map(|e| mle::eval(&oc[e.0], &e.1)).collect();
-    let otensors: Vec<Vec<Goldilocks>> = oidxs.iter().map(|&c| oc[c].clone()).collect();
-    let octx = zkie_core::pcs::committed::BatchCtx {
-        commitment: order_aux.descriptor.commitment.clone(), prover_data: order_aux.prover_data,
-        protocol: order_aux.protocol, whir: order_aux.whir, num_tables: order_aux.descriptor.columns,
-    };
-    let order_opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-        octx, &oidxs, &otensors, &opoints, &ovalues).ok()?;
+    let opoints: Vec<Vec<Ef>> = olayout.iter().map(|e| e.1.clone()).collect();
+    let ovalues: Vec<Ef> = olayout.iter()
+        .map(|e| ef_eval(&order_aux.columns[e.0], &e.1)).collect();
+    let order_opening = open_aux(order_aux, &oidxs, &opoints, &ovalues)?;
     let _ = padded;
     let _ = v_tok;
     let _ = v_exp;
@@ -2692,13 +2689,13 @@ fn prove_reverse_scatter(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Go
         aux_values: values, opening,
         order_key_cons, order_key_bits, order_d_rel, order_asc, perm,
         order_aux_values: ovalues, order_opening },
-        vec![EvalClaim { tensor_id: sel, point: q_sel, value: sel_value }]))
+        vec![EfClaim { tensor_id: sel, point: q_sel, value: sel_value }]))
 }
 
-fn verify_reverse_scatter(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+fn verify_reverse_scatter(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     descriptor: &AuxDescriptor, order_descriptor: &AuxDescriptor,
     proof: &ReverseScatterProof, transcript: &mut Transcript)
-    -> Option<Vec<EvalClaim>>
+    -> Option<Vec<EfClaim>>
 {
     let (sel, token_id, expert_of, m, n) = scatter_dims(op)?;
     if descriptor.role != AuxRole::ScatterRouting || descriptor.columns != m.checked_add(n)? {
@@ -2729,78 +2726,78 @@ fn verify_reverse_scatter(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
         || proof.order_d_rel.final_evals.len() != 4
         || proof.order_asc.final_evals.len() != 3 + b_bits { return None; }
 
-    let q1: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma1 = transcript.field();
+    let q1: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma1 = transcript.ef_field();
     let terms = scatter_bool_terms(gamma1, m + n);
-    let (ok, z1, f1) = verify_virtual(&proof.bools, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || f1 != virtual_eval(&terms, &proof.bools.final_evals)
-        || proof.bools.final_evals[0] != mle::eq_poly(&q1, &z1) { return None; }
+    let (ok, z1, f1) = efo::verify_virtual(&proof.bools, &terms, Ef::ZERO, arity, transcript);
+    if !ok || f1 != efo::virtual_eval(&terms, &proof.bools.final_evals)
+        || proof.bools.final_evals[0] != ef_eq_poly(&q1, &z1) { return None; }
 
-    let q2t: Vec<Goldilocks> = transcript.field_vec(arity);
+    let q2t: Vec<Ef> = transcript.ef_field_vec(arity);
     let terms = scatter_mask_terms(true, m, n);
-    let (ok, z2t, f2t) = verify_virtual(&proof.mask_tok, &terms, expert_mask_eval(&q2t, s), arity, transcript);
-    if !ok || f2t != virtual_eval(&terms, &proof.mask_tok.final_evals)
-        || proof.mask_tok.final_evals[0] != mle::eq_poly(&q2t, &z2t) { return None; }
+    let (ok, z2t, f2t) = efo::verify_virtual(&proof.mask_tok, &terms, expert_mask_eval(&q2t, s), arity, transcript);
+    if !ok || f2t != efo::virtual_eval(&terms, &proof.mask_tok.final_evals)
+        || proof.mask_tok.final_evals[0] != ef_eq_poly(&q2t, &z2t) { return None; }
 
-    let q2e: Vec<Goldilocks> = transcript.field_vec(arity);
+    let q2e: Vec<Ef> = transcript.ef_field_vec(arity);
     let terms = scatter_mask_terms(false, m, n);
-    let (ok, z2e, f2e) = verify_virtual(&proof.mask_exp, &terms, expert_mask_eval(&q2e, s), arity, transcript);
-    if !ok || f2e != virtual_eval(&terms, &proof.mask_exp.final_evals)
-        || proof.mask_exp.final_evals[0] != mle::eq_poly(&q2e, &z2e) { return None; }
+    let (ok, z2e, f2e) = efo::verify_virtual(&proof.mask_exp, &terms, expert_mask_eval(&q2e, s), arity, transcript);
+    if !ok || f2e != efo::virtual_eval(&terms, &proof.mask_exp.final_evals)
+        || proof.mask_exp.final_evals[0] != ef_eq_poly(&q2e, &z2e) { return None; }
 
-    let q_t: Vec<Goldilocks> = transcript.field_vec(lgm);
-    let q_e: Vec<Goldilocks> = transcript.field_vec(lgn);
-    let eq_t = mle::eq_evals(&q_t);
-    let eq_e = mle::eq_evals(&q_e);
+    let q_t: Vec<Ef> = transcript.ef_field_vec(lgm);
+    let q_e: Vec<Ef> = transcript.ef_field_vec(lgn);
+    let eq_t = efo::eq_evals(&q_t);
+    let eq_e = efo::eq_evals(&q_e);
     let terms = scatter_counts_terms(&eq_t, &eq_e, m, n);
-    let (ok, z4, f4) = verify_virtual(&proof.counts, &terms, proof.counts_total, arity, transcript);
-    if !ok || f4 != virtual_eval(&terms, &proof.counts.final_evals) { return None; }
+    let (ok, z4, f4) = efo::verify_virtual(&proof.counts, &terms, proof.counts_total, arity, transcript);
+    if !ok || f4 != efo::virtual_eval(&terms, &proof.counts.final_evals) { return None; }
 
-    let qk: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gk = transcript.field();
+    let qk: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gk = transcript.ef_field();
     let terms = scatter_key_cons_terms(m, n);
-    let (ok, zk, fk) = verify_virtual(&proof.order_key_cons, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || fk != virtual_eval(&terms, &proof.order_key_cons.final_evals)
-        || proof.order_key_cons.final_evals[0] != mle::eq_poly(&qk, &zk) { return None; }
+    let (ok, zk, fk) = efo::verify_virtual(&proof.order_key_cons, &terms, Ef::ZERO, arity, transcript);
+    if !ok || fk != efo::virtual_eval(&terms, &proof.order_key_cons.final_evals)
+        || proof.order_key_cons.final_evals[0] != ef_eq_poly(&qk, &zk) { return None; }
 
-    let qkb: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gkb = transcript.field();
+    let qkb: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gkb = transcript.ef_field();
     let terms = scatter_key_bits_terms(gkb, b_bits);
-    let (ok, zkb, fkb) = verify_virtual(&proof.order_key_bits, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || fkb != virtual_eval(&terms, &proof.order_key_bits.final_evals)
-        || proof.order_key_bits.final_evals[0] != mle::eq_poly(&qkb, &zkb) { return None; }
+    let (ok, zkb, fkb) = efo::verify_virtual(&proof.order_key_bits, &terms, Ef::ZERO, arity, transcript);
+    if !ok || fkb != efo::virtual_eval(&terms, &proof.order_key_bits.final_evals)
+        || proof.order_key_bits.final_evals[0] != ef_eq_poly(&qkb, &zkb) { return None; }
 
-    let qd: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gd = transcript.field();
+    let qd: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gd = transcript.ef_field();
     let terms = scatter_d_rel_terms();
-    let (ok, zd, fd) = verify_virtual(&proof.order_d_rel, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || fd != virtual_eval(&terms, &proof.order_d_rel.final_evals)
-        || proof.order_d_rel.final_evals[0] != mle::eq_poly(&qd, &zd) { return None; }
+    let (ok, zd, fd) = efo::verify_virtual(&proof.order_d_rel, &terms, Ef::ZERO, arity, transcript);
+    if !ok || fd != efo::virtual_eval(&terms, &proof.order_d_rel.final_evals)
+        || proof.order_d_rel.final_evals[0] != ef_eq_poly(&qd, &zd) { return None; }
 
-    let qa: Vec<Goldilocks> = transcript.field_vec(arity);
-    let ga = transcript.field();
+    let qa: Vec<Ef> = transcript.ef_field_vec(arity);
+    let ga = transcript.ef_field();
     let terms = scatter_asc_terms(ga, b_bits);
-    let (ok, za, fa) = verify_virtual(&proof.order_asc, &terms, Goldilocks::ZERO, arity, transcript);
-    if !ok || fa != virtual_eval(&terms, &proof.order_asc.final_evals)
-        || proof.order_asc.final_evals[0] != mle::eq_poly(&qa, &za) { return None; }
-    let eqa = mle::eq_evals(&za);
+    let (ok, za, fa) = efo::verify_virtual(&proof.order_asc, &terms, Ef::ZERO, arity, transcript);
+    if !ok || fa != efo::virtual_eval(&terms, &proof.order_asc.final_evals)
+        || proof.order_asc.final_evals[0] != ef_eq_poly(&qa, &za) { return None; }
+    let eqa = efo::eq_evals(&za);
     let mask2_eval = expert_mask_eval(&za, s) - eqa[0];
     if proof.order_asc.final_evals[1] != mask2_eval { return None; }
     let _ = gd;
 
-    let gamma_p = transcript.field();
-    let alpha = transcript.field();
+    let gamma_p = transcript.ef_field();
+    let alpha = transcript.ef_field();
     if alpha != proof.perm.alpha { return None; }
-    let wc = verify_fractional_chain_core(&proof.perm.a_side, arity, transcript)?;
-    let tc = verify_fractional_chain_core(&proof.perm.b_side, arity, transcript)?;
-    if wc.final_den == Goldilocks::ZERO || tc.final_den == Goldilocks::ZERO { return None; }
+    let wc = zkie_core::common::ef_logup::verify_fractional_chain_core(&proof.perm.a_side, arity, transcript)?;
+    let tc = zkie_core::common::ef_logup::verify_fractional_chain_core(&proof.perm.b_side, arity, transcript)?;
+    if wc.final_den == Ef::ZERO || tc.final_den == Ef::ZERO { return None; }
     if wc.final_num * tc.final_den != tc.final_num * wc.final_den { return None; }
-    if wc.num_leaf != Goldilocks::ONE || tc.num_leaf != Goldilocks::ONE { return None; }
+    if wc.num_leaf != Ef::ONE || tc.num_leaf != Ef::ONE { return None; }
     let dom = 1usize.checked_shl(arity as u32)?;
 
     let layout = scatter_openings(&z1, &z2t, &z2e, &z4, &zk, &q_tok, &q_exp, m, n, arity);
     let idxs: Vec<usize> = layout.iter().map(|e| e.0).collect();
-    let points: Vec<Vec<Goldilocks>> = layout.iter().map(|e| e.1.clone()).collect();
+    let points: Vec<Vec<Ef>> = layout.iter().map(|e| e.1.clone()).collect();
     if proof.aux_values.len() != layout.len() { return None; }
     if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
 
@@ -2815,11 +2812,11 @@ fn verify_reverse_scatter(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     for e in 0..n { if fe[1 + e] != take() { return None; } }
     let fe = &proof.counts.final_evals;
     for c in 0..(m + n) { if fe[c] != take() { return None; } }
-    let mut tok_v = Goldilocks::ZERO;
-    for t in 0..m { tok_v = tok_v + Goldilocks::from_u64(t as u64) * take(); }
+    let mut tok_v = Ef::ZERO;
+    for t in 0..m { tok_v = tok_v + ef_u64(t as u64) * take(); }
     if tok_v != v_tok { return None; }
-    let mut exp_v = Goldilocks::ZERO;
-    for e in 0..n { exp_v = exp_v + Goldilocks::from_u64(e as u64) * take(); }
+    let mut exp_v = Ef::ZERO;
+    for e in 0..n { exp_v = exp_v + ef_u64(e as u64) * take(); }
     if exp_v != v_exp { return None; }
     for c in 0..(m + n) {
         if proof.order_key_cons.final_evals[2 + c] != take() { return None; }
@@ -2828,7 +2825,7 @@ fn verify_reverse_scatter(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
 
     let olayout = scatter_order_layout(&zk, &zkb, &zd, &za, &wc.q_den, &tc.q_den, b_bits, arity);
     let oidxs: Vec<usize> = olayout.iter().map(|e| e.0).collect();
-    let opoints: Vec<Vec<Goldilocks>> = olayout.iter().map(|e| e.1.clone()).collect();
+    let opoints: Vec<Vec<Ef>> = olayout.iter().map(|e| e.1.clone()).collect();
     if proof.order_aux_values.len() != olayout.len() { return None; }
     if !verify_aux_open(order_descriptor, &oidxs, &opoints, &proof.order_aux_values, &proof.order_opening) { return None; }
     let ov = &proof.order_aux_values;
@@ -2855,7 +2852,7 @@ fn verify_reverse_scatter(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     let sel_value = proof.counts_total;
     let mut q_sel = q_e.clone();
     q_sel.extend_from_slice(&q_t);
-    Some(vec![EvalClaim { tensor_id: sel, point: q_sel, value: sel_value }])
+    Some(vec![EfClaim { tensor_id: sel, point: q_sel, value: sel_value }])
 }
 
 /// Reverse reduction proof. Its returned leaf claims still need independent
@@ -2866,9 +2863,9 @@ pub struct ReverseDagProof { steps: Vec<ReverseStep> }
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseOutputClaim {
     tensor_id: T,
-    merge: Option<SamePolyProof>,
-    point: Vec<Goldilocks>,
-    value: Goldilocks,
+    merge: Option<EfSamePolyProof>,
+    point: Vec<Ef>,
+    value: Ef,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2879,8 +2876,8 @@ struct ReverseStep {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 enum ReverseReduction {
-    Add { a: Goldilocks, b: Goldilocks },
-    MatMul { proof: MatmulProof },
+    Add { a: Ef, b: Ef },
+    MatMul { proof: EfMatmulProof },
     Relu { proof: ReverseReluProof },
     Projection { proof: ReverseProjectionProof },
     Lookup { proof: ReverseLookupProof },
@@ -2891,11 +2888,11 @@ enum ReverseReduction {
     /// S7b: scatter-add with a replayed routing column.
     Gather { proof: ReverseGatherProof },
     /// S7b: linear index relations (`out = scale*a + b`).
-    CombineIdx { a: Goldilocks, b: Goldilocks },
+    CombineIdx { a: Ef, b: Ef },
     /// S7b: `out[i*b + j] = b*base[i] + j`.
-    IdxBroadcast { base: Goldilocks },
+    IdxBroadcast { base: Ef },
     /// S7b: `out` is `base` zero-padded to `len`.
-    PadIdx { base: Goldilocks },
+    PadIdx { base: Ef },
     /// S7c: router top-k authentication (pre-committed witness aux).
     TopKSelect { proof: ReverseTopKSelectProof },
     /// S7c: routing arrays -> authenticated TopK sel claim (counts identity).
@@ -2916,7 +2913,7 @@ enum ReverseReduction {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseGeluIndexProof {
-    lower_at_output: Goldilocks,
+    lower_at_output: Ef,
     upper: ReverseReluProof,
     lower: ReverseReluProof,
     /// Project ②: precommitted 25-bit x+2^24 range witness (bound before any
@@ -2924,22 +2921,22 @@ struct ReverseGeluIndexProof {
     /// descriptor via execution_seeds), its virtual range identity, the
     /// opened bit values and the batch opening.
     range_commitment: zkie_core::pcs::whir::Commitment,
-    x_range: VirtualProof,
-    range_aux_values: Vec<Goldilocks>,
-    range_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    x_range: EfVirtualProof,
+    range_aux_values: Vec<Ef>,
+    range_opening: EfBatchOpeningProof,
 }
 
 /// Identity for the 25-bit signed decomposition: eq(z)*(x + 2^24 - sum 2^b
 /// bits_b) == 0 plus gamma-weighted booleanity of every bit. mles = [eq, x,
 /// bits_0..bits_24].
-fn gelu_range_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn gelu_range_terms(gamma: Ef) -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
     let mut terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (Goldilocks::from_u64(GELU_BOUND as u64), vec![0usize]),
+        (Ef::ONE, vec![0usize, 1usize]),
+        (ef_u64(GELU_BOUND as u64), vec![0usize]),
     ];
     for b in 0..GELU_XRANGE_BITS {
-        terms.push((-Goldilocks::from_u64(1u64 << b), vec![0usize, 2 + b]));
+        terms.push((-ef_u64(1u64 << b), vec![0usize, 2 + b]));
     }
     let mut gp = gamma;
     for b in 0..GELU_XRANGE_BITS {
@@ -2958,8 +2955,8 @@ fn reverse_tensor_values(store: &Store, id: T) -> Option<Cow<'_, [Goldilocks]>> 
 }
 
 fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
-    point: &[Goldilocks], value: Goldilocks, range_aux: PreparedAux, transcript: &mut Transcript)
-    -> Option<(ReverseGeluIndexProof, Vec<(Vec<Goldilocks>, Goldilocks)>)>
+    point: &[Ef], value: Ef, range_aux: PreparedAux, transcript: &mut Transcript)
+    -> Option<(ReverseGeluIndexProof, Vec<(Vec<Ef>, Ef)>)>
 {
     // Project ② domain contract: table_len a power of two <= 2^24, offset
     // |.| <= 2^24, input power-of-two with point length log2(input).
@@ -2995,52 +2992,47 @@ fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
         if !(-GELU_BOUND..GELU_BOUND).contains(&high) { return None; }
         shifted.push(from_i64(w));
         upper_input.push(from_i64(high));
-        indices.push(from_i64(w.max(0) - high.max(0)));
+        indices.push(ef_i64(w.max(0) - high.max(0)));
     }
-    if mle::eval(&indices, point) != value { return None; }
-    let lower_values: Vec<_> = shifted.iter().map(|&x| from_i64(to_i64(x).max(0))).collect();
-    let lower_at_output = mle::eval(&lower_values, point);
-    transcript.absorb_field(lower_at_output);
+    if efo::eval_ef_slice(&indices, point)? != value { return None; }
+    let lower_values: Vec<Ef> = shifted.iter().map(|&x| ef_i64(to_i64(x).max(0))).collect();
+    let lower_at_output = efo::eval_ef_slice(&lower_values, point)?;
+    transcript.absorb_ef(lower_at_output);
     // Precommitted 25-bit x range witness: the commitment is already in the
     // bound transcript via execution_seeds; absorb it here as well so the same
     // code path is sound on the plain path (proof-carried commitment).
     transcript.absorb(b"zkie-gelu-range-v1");
     transcript.absorb(&bincode::serialize(&range_aux.descriptor.commitment).ok()?);
-    let mut x_padded = input.to_vec(); x_padded.resize(padded, Goldilocks::ZERO);
-    let q = transcript.field_vec(arity);
-    let eq = mle::eq_evals(&q);
-    let gamma = transcript.field();
-    let mut mles: Vec<&[Goldilocks]> = vec![&eq, &x_padded];
-    mles.extend(range_aux.columns.iter().map(Vec::as_slice));
+    let mut x_padded = ef_lift(input); x_padded.resize(padded, Ef::ZERO);
+    let q = transcript.ef_field_vec(arity);
+    let eq = efo::eq_evals(&q);
+    let gamma = transcript.ef_field();
+    let range_cols_ef = lift_columns(&range_aux.columns);
+    let mut mles: Vec<&[Ef]> = vec![&eq, &x_padded];
+    mles.extend(range_cols_ef.iter().map(Vec::as_slice));
     let terms = gelu_range_terms(gamma);
-    let (x_range, range_point) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    let (x_range, range_point) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
     let idxs: Vec<usize> = (0..GELU_XRANGE_BITS).collect();
     let points = vec![range_point.clone(); GELU_XRANGE_BITS];
     let values = x_range.final_evals[2..].to_vec();
-    let tensors = range_aux.columns.clone();
-    let ctx = zkie_core::pcs::committed::BatchCtx {
-        commitment: range_aux.descriptor.commitment.clone(), prover_data: range_aux.prover_data,
-        protocol: range_aux.protocol, whir: range_aux.whir, num_tables: GELU_XRANGE_BITS,
-    };
-    let range_opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-        ctx, &idxs, &tensors, &points, &values).ok()?;
+    let range_commitment = range_aux.descriptor.commitment.clone();
+    let range_opening = open_aux(range_aux, &idxs, &points, &values)?;
     let range_claim = unpad_relu_claim(&range_point, x_range.final_evals[1], input_arity)?;
     let (upper, upper_inputs) = prove_reverse_relu(&upper_input, point, lower_at_output - value, GELU_BITS, transcript)?;
-    let limit_f = from_i64(limit);
+    let limit_f = ef_i64(limit);
     transcript.absorb_u64(upper_inputs.len() as u64);
-    for (p, v) in &upper_inputs { transcript.absorb_u64(p.len() as u64); transcript.absorb_fields(p); transcript.absorb_field(*v); }
+    for (p, v) in &upper_inputs { transcript.absorb_u64(p.len() as u64); transcript.absorb_efs(p); transcript.absorb_ef(*v); }
     let (lower, shifted_inputs) = prove_reverse_relu(&shifted, point, lower_at_output, GELU_BITS, transcript)?;
-    let offset_f = from_i64(offset);
+    let offset_f = ef_i64(offset);
     let mut inputs: Vec<_> = upper_inputs.into_iter().map(|(p, v)| (p, v + limit_f - offset_f)).collect();
     inputs.extend(shifted_inputs.into_iter().map(|(p, v)| (p, v - offset_f)));
     inputs.push(range_claim);
-    let range_commitment = range_aux.descriptor.commitment;
     Some((ReverseGeluIndexProof { lower_at_output, upper, lower, range_commitment, x_range, range_aux_values: values, range_opening }, inputs))
 }
 
-fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Goldilocks], value: Goldilocks,
+fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Ef], value: Ef,
     range_aux: Option<&AuxDescriptor>, proof: &ReverseGeluIndexProof, transcript: &mut Transcript)
-    -> Option<Vec<(Vec<Goldilocks>, Goldilocks)>>
+    -> Option<Vec<(Vec<Ef>, Ef)>>
 {
     if table_len == 0 || !table_len.is_power_of_two() || table_len > GELU_BOUND as usize
         || offset.unsigned_abs() > GELU_BOUND as u64 { return None; }
@@ -3055,17 +3047,17 @@ fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Goldilocks]
             || bincode::serialize(&proof.range_commitment).ok()?
                 != bincode::serialize(&d.commitment).ok()? { return None; }
     }
-    let limit_f = from_i64((table_len - 1) as i64);
-    transcript.absorb_field(proof.lower_at_output);
+    let limit_f = ef_i64((table_len - 1) as i64);
+    transcript.absorb_ef(proof.lower_at_output);
     transcript.absorb(b"zkie-gelu-range-v1");
     transcript.absorb(&bincode::serialize(&proof.range_commitment).ok()?);
-    let q = transcript.field_vec(arity);
-    let gamma = transcript.field();
+    let q = transcript.ef_field_vec(arity);
+    let gamma = transcript.ef_field();
     let terms = gelu_range_terms(gamma);
-    let (ok, range_point, range_final) = verify_virtual(&proof.x_range, &terms, Goldilocks::ZERO, arity, transcript);
+    let (ok, range_point, range_final) = efo::verify_virtual(&proof.x_range, &terms, Ef::ZERO, arity, transcript);
     if !ok
-        || range_final != virtual_eval(&terms, &proof.x_range.final_evals)
-        || proof.x_range.final_evals[0] != mle::eq_poly(&q, &range_point) { return None; }
+        || range_final != efo::virtual_eval(&terms, &proof.x_range.final_evals)
+        || proof.x_range.final_evals[0] != ef_eq_poly(&q, &range_point) { return None; }
     let local = AuxDescriptor {
         op_index: 0, role: AuxRole::GeluIndexXRange, len: input_len, arity,
         columns: GELU_XRANGE_BITS, commitment: proof.range_commitment.clone(),
@@ -3080,9 +3072,9 @@ fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Goldilocks]
     let range_claim = unpad_relu_claim(&range_point, proof.x_range.final_evals[1], input_arity)?;
     let upper_inputs = verify_reverse_relu(&proof.upper, point, proof.lower_at_output - value, GELU_BITS, transcript)?;
     transcript.absorb_u64(upper_inputs.len() as u64);
-    for (p, v) in &upper_inputs { transcript.absorb_u64(p.len() as u64); transcript.absorb_fields(p); transcript.absorb_field(*v); }
+    for (p, v) in &upper_inputs { transcript.absorb_u64(p.len() as u64); transcript.absorb_efs(p); transcript.absorb_ef(*v); }
     let shifted_inputs = verify_reverse_relu(&proof.lower, point, proof.lower_at_output, GELU_BITS, transcript)?;
-    let offset_f = from_i64(offset);
+    let offset_f = ef_i64(offset);
     let mut inputs: Vec<_> = upper_inputs.into_iter().map(|(p, v)| (p, v + limit_f - offset_f)).collect();
     inputs.extend(shifted_inputs.into_iter().map(|(p, v)| (p, v - offset_f)));
     inputs.push(range_claim);
@@ -3091,14 +3083,14 @@ fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Goldilocks]
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseScaleProof {
-    remainder_bits: Vec<Goldilocks>,
-    booleanity: Option<VirtualProof>,
-    opening: Option<zkie_core::pcs::batch_open::BatchOpeningProof>,
-    input_eval: Option<Goldilocks>,
+    remainder_bits: Vec<Ef>,
+    booleanity: Option<EfVirtualProof>,
+    opening: Option<EfBatchOpeningProof>,
+    input_eval: Option<Ef>,
 }
 
-fn prove_reverse_scale(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
-    aux: Option<PreparedAux>, transcript: &mut Transcript) -> Option<(ReverseScaleProof, EvalClaim)>
+fn prove_reverse_scale(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    aux: Option<PreparedAux>, transcript: &mut Transcript) -> Option<(ReverseScaleProof, EfClaim)>
 {
     let (x, out, factor, shift) = match op {
         Op::Scale { x, out, factor, shift } => (*x, *out, *factor, *shift),
@@ -3107,47 +3099,46 @@ fn prove_reverse_scale(store: &Store, op: &Op, point: &[Goldilocks], value: Gold
     let xv = store.get(x);
     if xv.len() != store.get(out).len() || !xv.len().is_power_of_two()
         || point.len() != xv.len().trailing_zeros() as usize { return None; }
-    let x_eval = mle::eval(xv, point);
-    let factor_f = from_i64(factor);
+    let x_eval = ef_eval(xv, point);
+    let factor_f = ef_i64(factor);
     if shift == 0 {
         // round_div(a, 1) == a: the reverse relation is exact.
         if factor_f * x_eval != value { return None; }
         return Some((ReverseScaleProof { remainder_bits: Vec::new(), booleanity: None, opening: None,
             input_eval: if factor == 0 { Some(x_eval) } else { None } },
-            EvalClaim { tensor_id: x, point: point.to_vec(), value: x_eval }));
+            EfClaim { tensor_id: x, point: point.to_vec(), value: x_eval }));
     }
     let aux = aux?;
     if aux.descriptor.columns != shift as usize || aux.descriptor.len != xv.len()
         || aux.descriptor.arity < point.len() { return None; }
-    let two_shift = Goldilocks::from_u64(1u64 << shift);
-    let half = Goldilocks::from_u64(1u64 << (shift - 1));
-    let mut padded_point = point.to_vec(); padded_point.resize(aux.descriptor.arity, Goldilocks::ZERO);
-    let bit_evals: Vec<_> = aux.columns.iter().map(|c| mle::eval(c, &padded_point)).collect();
-    let remainder = bit_evals.iter().enumerate().fold(Goldilocks::ZERO, |acc, (j, &b)| acc + Goldilocks::from_u64(1u64 << j) * b);
+    let two_shift = ef_u64(1u64 << shift);
+    let half = ef_u64(1u64 << (shift - 1));
+    let mut padded_point = point.to_vec(); padded_point.resize(aux.descriptor.arity, Ef::ZERO);
+    let bit_evals: Vec<_> = aux.columns.iter().map(|c| ef_eval(c, &padded_point)).collect();
+    let remainder = bit_evals.iter().enumerate().fold(Ef::ZERO, |acc, (j, &b)| acc + ef_u64(1u64 << j) * b);
     if factor_f * x_eval != two_shift * value + remainder - half { return None; }
-    transcript.absorb_fields(&bit_evals);
-    let q = transcript.field_vec(aux.descriptor.arity);
-    let gamma = transcript.field();
-    let eq = mle::eq_evals(&q);
-    let mut mles: Vec<&[Goldilocks]> = vec![&eq];
-    mles.extend(aux.columns.iter().map(Vec::as_slice));
+    transcript.absorb_efs(&bit_evals);
+    let q = transcript.ef_field_vec(aux.descriptor.arity);
+    let gamma = transcript.ef_field();
+    let eq = efo::eq_evals(&q);
+    let aux_ef = lift_columns(&aux.columns);
+    let mut mles: Vec<&[Ef]> = vec![&eq];
+    mles.extend(aux_ef.iter().map(Vec::as_slice));
     let terms = projection_boolean_terms(aux.descriptor.columns, gamma);
-    let (booleanity, bool_point) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    let (booleanity, bool_point) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
     let mut idxs: Vec<usize> = (0..aux.descriptor.columns).collect();
     idxs.extend(0..aux.descriptor.columns);
     let mut points = vec![padded_point; aux.descriptor.columns];
     points.extend((0..aux.descriptor.columns).map(|_| bool_point.clone()));
     let mut values = bit_evals.clone(); values.extend_from_slice(&booleanity.final_evals[1..]);
-    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&i| aux.columns[i].clone()).collect();
-    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: aux.descriptor.commitment.clone(), prover_data: aux.prover_data, protocol: aux.protocol, whir: aux.whir, num_tables: aux.descriptor.columns };
-    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+    let opening = open_aux(aux, &idxs, &points, &values)?;
     Some((ReverseScaleProof { remainder_bits: bit_evals, booleanity: Some(booleanity), opening: Some(opening),
         input_eval: if factor == 0 { Some(x_eval) } else { None } },
-        EvalClaim { tensor_id: x, point: point.to_vec(), value: x_eval }))
+        EfClaim { tensor_id: x, point: point.to_vec(), value: x_eval }))
 }
 
-fn verify_reverse_scale(op: &Op, point: &[Goldilocks], value: Goldilocks, aux: Option<&AuxDescriptor>,
-    proof: &ReverseScaleProof, transcript: &mut Transcript) -> Option<EvalClaim>
+fn verify_reverse_scale(op: &Op, point: &[Ef], value: Ef, aux: Option<&AuxDescriptor>,
+    proof: &ReverseScaleProof, transcript: &mut Transcript) -> Option<EfClaim>
 {
     let (x, factor, shift) = match op {
         Op::Scale { x, factor, shift, .. } => (*x, *factor, *shift),
@@ -3161,14 +3152,14 @@ fn verify_reverse_scale(op: &Op, point: &[Goldilocks], value: Goldilocks, aux: O
             // x, so the proof must carry x's evaluation for upstream/leaf
             // authentication. It is never fabricated as zero.
             let input_eval = proof.input_eval?;
-            if value != Goldilocks::ZERO { return None; }
-            return Some(EvalClaim { tensor_id: x, point: point.to_vec(), value: input_eval });
+            if value != Ef::ZERO { return None; }
+            return Some(EfClaim { tensor_id: x, point: point.to_vec(), value: input_eval });
         }
         if proof.input_eval.is_some() { return None; }
-        let inv = from_i64(factor).try_inverse()?;
-        return Some(EvalClaim { tensor_id: x, point: point.to_vec(), value: value * inv });
+        let inv = ef_i64(factor).try_inverse()?;
+        return Some(EfClaim { tensor_id: x, point: point.to_vec(), value: value * inv });
     }
-    if factor == 0 && value != Goldilocks::ZERO { return None; }
+    if factor == 0 && value != Ef::ZERO { return None; }
     let descriptor = aux?;
     let booleanity = proof.booleanity.as_ref()?;
     let opening = proof.opening.as_ref()?;
@@ -3177,79 +3168,79 @@ fn verify_reverse_scale(op: &Op, point: &[Goldilocks], value: Goldilocks, aux: O
         || point.len() != descriptor.len.trailing_zeros() as usize
         || booleanity.final_evals.len() != descriptor.columns + 1 { return None; }
     if (factor == 0) != proof.input_eval.is_some() { return None; }
-    let two_shift = Goldilocks::from_u64(1u64 << shift);
-    let half = Goldilocks::from_u64(1u64 << (shift - 1));
-    let remainder = proof.remainder_bits.iter().enumerate().fold(Goldilocks::ZERO, |acc, (j, &b)| acc + Goldilocks::from_u64(1u64 << j) * b);
+    let two_shift = ef_u64(1u64 << shift);
+    let half = ef_u64(1u64 << (shift - 1));
+    let remainder = proof.remainder_bits.iter().enumerate().fold(Ef::ZERO, |acc, (j, &b)| acc + ef_u64(1u64 << j) * b);
     let rhs = two_shift * value + remainder - half;
     let x_eval = if factor == 0 {
         // out is constant zero; the range-checked remainder binds it, while x
         // remains free and is authenticated through the carried evaluation.
-        if rhs != Goldilocks::ZERO { return None; }
+        if rhs != Ef::ZERO { return None; }
         proof.input_eval?
     } else {
-        rhs * from_i64(factor).try_inverse()?
+        rhs * ef_i64(factor).try_inverse()?
     };
-    transcript.absorb_fields(&proof.remainder_bits);
-    let q = transcript.field_vec(descriptor.arity);
-    let gamma = transcript.field();
+    transcript.absorb_efs(&proof.remainder_bits);
+    let q = transcript.ef_field_vec(descriptor.arity);
+    let gamma = transcript.ef_field();
     let terms = projection_boolean_terms(descriptor.columns, gamma);
-    let (ok, bool_point, final_value) = verify_virtual(booleanity, &terms, Goldilocks::ZERO, descriptor.arity, transcript);
+    let (ok, bool_point, final_value) = efo::verify_virtual(booleanity, &terms, Ef::ZERO, descriptor.arity, transcript);
     if !ok { return None; }
-    let mut evals = booleanity.final_evals.clone(); evals[0] = mle::eq_poly(&q, &bool_point);
-    if final_value != virtual_eval(&terms, &evals) { return None; }
+    let mut evals = booleanity.final_evals.clone(); evals[0] = ef_eq_poly(&q, &bool_point);
+    if final_value != efo::virtual_eval(&terms, &evals) { return None; }
     let padded = 1usize.checked_shl(descriptor.arity as u32)?;
     let vars = descriptor.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
     let whir = verifier_whir(vars)?;
     let protocol = whir.batch_opening_protocol(descriptor.columns, descriptor.arity);
-    let mut padded_point = point.to_vec(); padded_point.resize(descriptor.arity, Goldilocks::ZERO);
+    let mut padded_point = point.to_vec(); padded_point.resize(descriptor.arity, Ef::ZERO);
     let mut idxs: Vec<usize> = (0..descriptor.columns).collect();
     idxs.extend(0..descriptor.columns);
     let mut points = vec![padded_point; descriptor.columns];
     points.extend((0..descriptor.columns).map(|_| bool_point.clone()));
     let mut values = proof.remainder_bits.clone(); values.extend_from_slice(&booleanity.final_evals[1..]);
-    if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &descriptor.commitment, &protocol, descriptor.columns, &idxs, &points, &values, opening) { return None; }
-    Some(EvalClaim { tensor_id: x, point: point.to_vec(), value: x_eval })
+    if !verify_aux_open(descriptor, &idxs, &points, &values, opening) { return None; }
+    Some(EfClaim { tensor_id: x, point: point.to_vec(), value: x_eval })
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseArgmaxProof {
-    sel_bool: VirtualProof,
-    bit_bool: VirtualProof,
-    row_sum: VirtualProof,
-    before_sum: VirtualProof,
-    out_sum: VirtualProof,
-    thr_sum: VirtualProof,
-    gate_rel: VirtualProof,
-    d1_rel: VirtualProof,
-    d2_rel: VirtualProof,
-    aux_values: Vec<Goldilocks>,
-    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    sel_bool: EfVirtualProof,
+    bit_bool: EfVirtualProof,
+    row_sum: EfVirtualProof,
+    before_sum: EfVirtualProof,
+    out_sum: EfVirtualProof,
+    thr_sum: EfVirtualProof,
+    gate_rel: EfVirtualProof,
+    d1_rel: EfVirtualProof,
+    d2_rel: EfVirtualProof,
+    aux_values: Vec<Ef>,
+    opening: EfBatchOpeningProof,
 }
 
-fn argmax_pad_point(point: &[Goldilocks], arity: usize) -> Vec<Goldilocks> {
+fn argmax_pad_point(point: &[Ef], arity: usize) -> Vec<Ef> {
     let mut out = point.to_vec();
-    out.resize(arity, Goldilocks::ZERO);
+    out.resize(arity, Ef::ZERO);
     out
 }
 
-fn argmax_claim(outs: &[(T, Vec<Goldilocks>, Goldilocks)], id: T) -> Option<(Vec<Goldilocks>, Goldilocks)> {
+fn argmax_claim(outs: &[(T, Vec<Ef>, Ef)], id: T) -> Option<(Vec<Ef>, Ef)> {
     outs.iter().find(|o| o.0 == id).map(|o| (o.1.clone(), o.2))
 }
 
-fn argmax_known_cols(m: usize, n: usize, arity: usize) -> (Vec<Goldilocks>, Vec<Goldilocks>) {
-    let mut rows = vec![Goldilocks::ZERO; 1usize << arity];
-    let mut ints = vec![Goldilocks::ZERO; 1usize << arity];
+fn argmax_known_cols(m: usize, n: usize, arity: usize) -> (Vec<Ef>, Vec<Ef>) {
+    let mut rows = vec![Ef::ZERO; 1usize << arity];
+    let mut ints = vec![Ef::ZERO; 1usize << arity];
     for i in 0..m {
         for j in 0..n {
-            rows[i * n + j] = Goldilocks::ONE;
-            ints[i * n + j] = Goldilocks::from_u64(j as u64);
+            rows[i * n + j] = Ef::ONE;
+            ints[i * n + j] = ef_u64(j as u64);
         }
     }
     (rows, ints)
 }
 
-fn argmax_coeff_col(eq_rows: &[Goldilocks], coeff: &[Goldilocks], m: usize, n: usize, arity: usize) -> Vec<Goldilocks> {
-    let mut out = vec![Goldilocks::ZERO; 1usize << arity];
+fn argmax_coeff_col(eq_rows: &[Ef], coeff: &[Ef], m: usize, n: usize, arity: usize) -> Vec<Ef> {
+    let mut out = vec![Ef::ZERO; 1usize << arity];
     for i in 0..m {
         for j in 0..n {
             out[i * n + j] = eq_rows[i] * coeff[j];
@@ -3264,10 +3255,10 @@ fn argmax_coeff_col(eq_rows: &[Goldilocks], coeff: &[Goldilocks], m: usize, n: u
 /// `sel(1-sel) + g·before(1-before) + g²·sel·before` to vanish at the random
 /// eq point; an unweighted global sum could hide non-boolean entries by
 /// cross-position cancellation.
-fn argmax_sel_bool_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+fn argmax_sel_bool_terms(gamma: Ef) -> Vec<(Ef, Vec<usize>)> {
     vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (-Goldilocks::ONE, vec![0usize, 1usize, 1usize]),
+        (Ef::ONE, vec![0usize, 1usize]),
+        (-Ef::ONE, vec![0usize, 1usize, 1usize]),
         (gamma, vec![0usize, 2usize]),
         (-gamma, vec![0usize, 2usize, 2usize]),
         (gamma * gamma, vec![0usize, 1usize, 2usize]),
@@ -3277,9 +3268,9 @@ fn argmax_sel_bool_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
 /// Shared by prove/verify and the regressions: the eq-weighted bit_bool
 /// relation terms for `count` bit columns (mle indices 1..=count), each
 /// term carrying the eq column at index 0.
-fn argmax_bit_bool_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec<usize>)> {
+fn argmax_bit_bool_terms(gamma: Ef, count: usize) -> Vec<(Ef, Vec<usize>)> {
     let mut terms = Vec::with_capacity(2 * count);
-    let mut gp = Goldilocks::ONE;
+    let mut gp = Ef::ONE;
     for i in 0..count {
         terms.push((gp, vec![0usize, 1 + i]));
         terms.push((-gp, vec![0usize, 1 + i, 1 + i]));
@@ -3288,8 +3279,8 @@ fn argmax_bit_bool_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Ve
     terms
 }
 
-fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
-    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseArgmaxProof, Vec<EvalClaim>)>
+fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
+    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseArgmaxProof, Vec<EfClaim>)>
 {
     let (x, sel, thr, gate, d1, d2, out, m, n) = match op {
         Op::Argmax { x, sel, thr, gate, d1, d2, out, m, n } => (*x, *sel, *thr, *gate, *d1, *d2, *out, *m, *n),
@@ -3310,18 +3301,18 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
     let (qo, vo) = argmax_claim(outs, out_key)?;
     if qs.len() != arity || qd.len() != arity || q2.len() != arity
         || qt.len() != lgm || qo.len() != lgm { return None; }
-    let cols = &aux.columns;
-    let col_eval = |i: usize, p: &[Goldilocks]| mle::eval(&cols[i], &argmax_pad_point(p, arity));
-    let mut xp = store.get(x).to_vec(); xp.resize(len, Goldilocks::ZERO);
-    let thrv = store.get(thr).to_vec();
+    let cols = lift_columns(&aux.columns);
+    let col_eval = |i: usize, p: &[Ef]| ef_eval(&aux.columns[i], &argmax_pad_point(p, arity));
+    let mut xp = ef_lift(store.get(x)); xp.resize(len, Ef::ZERO);
+    let thrv = ef_lift(store.get(thr));
     if thrv.len() != m { return None; }
-    let row_of = |p: &[Goldilocks]| -> Vec<Goldilocks> { p[lgn..lgn + lgm].to_vec() };
+    let row_of = |p: &[Ef]| -> Vec<Ef> { p[lgn..lgn + lgm].to_vec() };
 
     // Pointwise bindings at the claim points (linear relations only).
     if col_eval(0, &qs) != vs { return None; }
-    if vd != Goldilocks::ZERO { return None; }
-    let mut d2_at_q2 = Goldilocks::ZERO;
-    for b in 0..ARGMAX_D2_BITS { d2_at_q2 = d2_at_q2 + Goldilocks::from_u64(1u64 << b) * col_eval(ARGMAX_D2_COL + b, &q2); }
+    if vd != Ef::ZERO { return None; }
+    let mut d2_at_q2 = Ef::ZERO;
+    for b in 0..ARGMAX_D2_BITS { d2_at_q2 = d2_at_q2 + ef_u64(1u64 << b) * col_eval(ARGMAX_D2_COL + b, &q2); }
     if d2_at_q2 != v2 { return None; }
 
     // S5: gate = sel*x, d1 = sel*(x-thr), d2 = (1-sel)*(thr-x) are
@@ -3332,81 +3323,84 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
     // multilinearization (i.e. the pointwise relation) to vanish at the
     // random eq point; the endpoint evaluation is authenticated via the aux
     // opening (sel) and the returned claims (x / thr / gate / d1 / d2).
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    let q_rel: Vec<Goldilocks> = transcript.field_vec(arity);
-    let eq_rel = mle::eq_evals(&q_rel);
-    let thr_b: Vec<Goldilocks> = thrv.iter().flat_map(|&v| std::iter::repeat(v).take(n)).collect();
+    let neg = Ef::ZERO - Ef::ONE;
+    let q_rel: Vec<Ef> = transcript.ef_field_vec(arity);
+    let eq_rel = efo::eq_evals(&q_rel);
+    let thr_b: Vec<Ef> = thrv.iter().flat_map(|&v| std::iter::repeat(v).take(n)).collect();
     let gate_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Ef::ONE, vec![0usize, 1usize, 2usize]),
         (neg, vec![0usize, 3usize]),
     ];
-    let (gate_rel, zg) = prove_virtual(&[&eq_rel, &cols[0], &xp, store.get(gate)], &gate_terms, Goldilocks::ZERO, transcript);
+    let gate_ef = ef_lift(store.get(gate));
+    let d1_ef = ef_lift(store.get(d1));
+    let d2_ef = ef_lift(store.get(d2));
+    let (gate_rel, zg) = efo::prove_virtual(&[&eq_rel, &cols[0], &xp, &gate_ef], &gate_terms, Ef::ZERO, transcript);
     let d1_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Ef::ONE, vec![0usize, 1usize, 2usize]),
         (neg, vec![0usize, 1usize, 3usize]),
         (neg, vec![0usize, 4usize]),
     ];
-    let (d1_rel, zd1) = prove_virtual(&[&eq_rel, &cols[0], &xp, &thr_b, store.get(d1)], &d1_terms, Goldilocks::ZERO, transcript);
+    let (d1_rel, zd1) = efo::prove_virtual(&[&eq_rel, &cols[0], &xp, &thr_b, &d1_ef], &d1_terms, Ef::ZERO, transcript);
     let d2_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 3usize]),
+        (Ef::ONE, vec![0usize, 3usize]),
         (neg, vec![0usize, 2usize]),
         (neg, vec![0usize, 1usize, 3usize]),
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Ef::ONE, vec![0usize, 1usize, 2usize]),
         (neg, vec![0usize, 4usize]),
     ];
-    let (d2_rel, zd2) = prove_virtual(&[&eq_rel, &cols[0], &xp, &thr_b, store.get(d2)], &d2_terms, Goldilocks::ZERO, transcript);
+    let (d2_rel, zd2) = efo::prove_virtual(&[&eq_rel, &cols[0], &xp, &thr_b, &d2_ef], &d2_terms, Ef::ZERO, transcript);
 
     // Challenge points.
-    let q_bool = transcript.field_vec(arity);
-    let gamma_bool = transcript.field();
-    let q_bit = transcript.field_vec(arity);
-    let gamma_bit = transcript.field();
-    let q_tie = transcript.field_vec(arity);
-    let r_rows = transcript.field_vec(lgm);
-    let r_col = transcript.field_vec(lgn);
-    let r_before: Vec<Goldilocks> = r_col.iter().chain(r_rows.iter()).cloned().collect();
+    let q_bool = transcript.ef_field_vec(arity);
+    let gamma_bool = transcript.ef_field();
+    let q_bit = transcript.ef_field_vec(arity);
+    let gamma_bit = transcript.ef_field();
+    let q_tie = transcript.ef_field_vec(arity);
+    let r_rows = transcript.ef_field_vec(lgm);
+    let r_col = transcript.ef_field_vec(lgn);
+    let r_before: Vec<Ef> = r_col.iter().chain(r_rows.iter()).cloned().collect();
     let before_r = col_eval(ARGMAX_BEFORE_COL, &r_before);
-    let eq_rows = mle::eq_evals(&r_rows);
-    let eq_col = mle::eq_evals(&r_col);
-    let mut suffix = vec![Goldilocks::ZERO; n];
-    let mut acc = Goldilocks::ZERO;
+    let eq_rows = efo::eq_evals(&r_rows);
+    let eq_col = efo::eq_evals(&r_col);
+    let mut suffix = vec![Ef::ZERO; n];
+    let mut acc = Ef::ZERO;
     for k in 0..n { suffix[k] = acc; acc = acc + eq_col[k]; }
     let before_coeff = argmax_coeff_col(&eq_rows, &suffix, m, n, arity);
-    let ones = vec![Goldilocks::ONE; n];
+    let ones = vec![Ef::ONE; n];
     let eq_rows_col = argmax_coeff_col(&eq_rows, &ones, m, n, arity);
-    let qo_rows = mle::eq_evals(&qo);
-    let out_coeff = argmax_coeff_col(&qo_rows, &(0..n).map(|j| Goldilocks::from_u64(j as u64)).collect::<Vec<_>>(), m, n, arity);
-    let qt_rows = mle::eq_evals(&qt);
+    let qo_rows = efo::eq_evals(&qo);
+    let out_coeff = argmax_coeff_col(&qo_rows, &(0..n).map(|j| ef_u64(j as u64)).collect::<Vec<_>>(), m, n, arity);
+    let qt_rows = efo::eq_evals(&qt);
     let thr_rows_col = argmax_coeff_col(&qt_rows, &ones, m, n, arity);
 
     // Virtual proofs (aux evals at endpoints are opened in one batch below).
-    let eq_bool = mle::eq_evals(&q_bool);
-    let mut mles: Vec<&[Goldilocks]> = vec![&eq_bool, &cols[0], &cols[1]];
+    let eq_bool = efo::eq_evals(&q_bool);
+    let mut mles: Vec<&[Ef]> = vec![&eq_bool, &cols[0], &cols[1]];
     // Shared constructor: every term is eq-weighted (index 0) — claim 0
     // forces the per-position relation to vanish AT the random eq point; an
     // unweighted global sum could hide non-boolean entries by cross-position
     // cancellation.
     let terms = argmax_sel_bool_terms(gamma_bool);
-    let (sel_bool, z1) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
-    let eq_bit = mle::eq_evals(&q_bit);
+    let (sel_bool, z1) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
+    let eq_bit = efo::eq_evals(&q_bit);
     mles = vec![&eq_bit];
     for i in 0..(ARGMAX_D2_BITS + ARGMAX_TIE_BITS) { mles.push(&cols[ARGMAX_D2_COL + i]); }
     let bit_terms = argmax_bit_bool_terms(gamma_bit, ARGMAX_D2_BITS + ARGMAX_TIE_BITS);
-    let (bit_bool, z2) = prove_virtual(&mles, &bit_terms, Goldilocks::ZERO, transcript);
-    let mles_rs: Vec<&[Goldilocks]> = vec![&eq_rows_col, &cols[0]];
-    let (row_sum, z3) = prove_virtual(&mles_rs, &[(Goldilocks::ONE, vec![0usize, 1usize])], Goldilocks::ONE, transcript);
-    let mles_bs: Vec<&[Goldilocks]> = vec![&before_coeff, &cols[0]];
-    let (before_sum, z4) = prove_virtual(&mles_bs, &[(Goldilocks::ONE, vec![0usize, 1usize])], before_r, transcript);
-    let mles_os: Vec<&[Goldilocks]> = vec![&out_coeff, &cols[0]];
-    let (out_sum, z5) = prove_virtual(&mles_os, &[(Goldilocks::ONE, vec![0usize, 1usize])], vo, transcript);
-    let mles_ts: Vec<&[Goldilocks]> = vec![&thr_rows_col, &cols[0], &xp];
-    let (thr_sum, z6) = prove_virtual(&mles_ts, &[(Goldilocks::ONE, vec![0usize, 1usize, 2usize])], vt, transcript);
+    let (bit_bool, z2) = efo::prove_virtual(&mles, &bit_terms, Ef::ZERO, transcript);
+    let mles_rs: Vec<&[Ef]> = vec![&eq_rows_col, &cols[0]];
+    let (row_sum, z3) = efo::prove_virtual(&mles_rs, &[(Ef::ONE, vec![0usize, 1usize])], Ef::ONE, transcript);
+    let mles_bs: Vec<&[Ef]> = vec![&before_coeff, &cols[0]];
+    let (before_sum, z4) = efo::prove_virtual(&mles_bs, &[(Ef::ONE, vec![0usize, 1usize])], before_r, transcript);
+    let mles_os: Vec<&[Ef]> = vec![&out_coeff, &cols[0]];
+    let (out_sum, z5) = efo::prove_virtual(&mles_os, &[(Ef::ONE, vec![0usize, 1usize])], vo, transcript);
+    let mles_ts: Vec<&[Ef]> = vec![&thr_rows_col, &cols[0], &xp];
+    let (thr_sum, z6) = efo::prove_virtual(&mles_ts, &[(Ef::ONE, vec![0usize, 1usize, 2usize])], vt, transcript);
     let zs = [&z1, &z2, &z3, &z4, &z5, &z6];
 
     // One batch opening for fixed points and all endpoints.
     let mut idxs: Vec<usize> = Vec::new();
-    let mut points: Vec<Vec<Goldilocks>> = Vec::new();
-    let mut values: Vec<Goldilocks> = Vec::new();
+    let mut points: Vec<Vec<Ef>> = Vec::new();
+    let mut values: Vec<Ef> = Vec::new();
     macro_rules! push { ($idx:expr, $point:expr, $val:expr) => {{ idxs.push($idx); points.push($point); values.push($val); }}; }
     push!(0, argmax_pad_point(&qs, arity), vs);
     push!(ARGMAX_BEFORE_COL, argmax_pad_point(&r_before, arity), before_r);
@@ -3417,43 +3411,41 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Gol
     for b in 0..ARGMAX_TIE_BITS { push!(ARGMAX_TIE_COL + b, argmax_pad_point(&q_tie, arity), col_eval(ARGMAX_TIE_COL + b, &q_tie)); }
     for z in zs {
         let zp = argmax_pad_point(z, arity);
-        push!(0, zp.clone(), mle::eval(&cols[0], &zp));
+        push!(0, zp.clone(), ef_eval(&aux.columns[0], &zp));
     }
     // sel_bool also needs before.
     let before_bool_idx = values.len();
-    push!(ARGMAX_BEFORE_COL, argmax_pad_point(&z1, arity), mle::eval(&cols[ARGMAX_BEFORE_COL], &argmax_pad_point(&z1, arity)));
+    push!(ARGMAX_BEFORE_COL, argmax_pad_point(&z1, arity), ef_eval(&aux.columns[ARGMAX_BEFORE_COL], &argmax_pad_point(&z1, arity)));
     let mut bit_idx = Vec::new();
     for i in 0..(ARGMAX_D2_BITS + ARGMAX_TIE_BITS) {
         bit_idx.push(values.len());
-        push!(ARGMAX_D2_COL + i, argmax_pad_point(&z2, arity), mle::eval(&cols[ARGMAX_D2_COL + i], &argmax_pad_point(&z2, arity)));
+        push!(ARGMAX_D2_COL + i, argmax_pad_point(&z2, arity), ef_eval(&aux.columns[ARGMAX_D2_COL + i], &argmax_pad_point(&z2, arity)));
     }
     // sel at the three relation-virtual endpoints (authenticated against
     // final_evals[1] on the verify side).
     push!(0, argmax_pad_point(&zg, arity), col_eval(0, &zg));
     push!(0, argmax_pad_point(&zd1, arity), col_eval(0, &zd1));
     push!(0, argmax_pad_point(&zd2, arity), col_eval(0, &zd2));
-    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&i| cols[i].clone()).collect();
-    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: aux.descriptor.commitment.clone(), prover_data: aux.prover_data, protocol: aux.protocol, whir: aux.whir, num_tables: aux.descriptor.columns };
-    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+    let opening = open_aux(aux, &idxs, &points, &values)?;
 
     let x_z6 = thr_sum.final_evals[2];
     let claims = vec![
-        EvalClaim { tensor_id: x, point: zg.clone(), value: gate_rel.final_evals[2] },
-        EvalClaim { tensor_id: x, point: zd1.clone(), value: d1_rel.final_evals[2] },
-        EvalClaim { tensor_id: x, point: zd2.clone(), value: d2_rel.final_evals[2] },
-        EvalClaim { tensor_id: x, point: z6.clone(), value: x_z6 },
-        EvalClaim { tensor_id: thr, point: row_of(&zd1), value: d1_rel.final_evals[3] },
-        EvalClaim { tensor_id: thr, point: row_of(&zd2), value: d2_rel.final_evals[3] },
-        EvalClaim { tensor_id: gate, point: zg.clone(), value: gate_rel.final_evals[3] },
-        EvalClaim { tensor_id: d1, point: zd1.clone(), value: d1_rel.final_evals[4] },
-        EvalClaim { tensor_id: d2, point: zd2.clone(), value: d2_rel.final_evals[4] },
+        EfClaim { tensor_id: x, point: zg.clone(), value: gate_rel.final_evals[2] },
+        EfClaim { tensor_id: x, point: zd1.clone(), value: d1_rel.final_evals[2] },
+        EfClaim { tensor_id: x, point: zd2.clone(), value: d2_rel.final_evals[2] },
+        EfClaim { tensor_id: x, point: z6.clone(), value: x_z6 },
+        EfClaim { tensor_id: thr, point: row_of(&zd1), value: d1_rel.final_evals[3] },
+        EfClaim { tensor_id: thr, point: row_of(&zd2), value: d2_rel.final_evals[3] },
+        EfClaim { tensor_id: gate, point: zg.clone(), value: gate_rel.final_evals[3] },
+        EfClaim { tensor_id: d1, point: zd1.clone(), value: d1_rel.final_evals[4] },
+        EfClaim { tensor_id: d2, point: zd2.clone(), value: d2_rel.final_evals[4] },
     ];
     Some((ReverseArgmaxProof { sel_bool, bit_bool, row_sum, before_sum, out_sum, thr_sum,
         gate_rel, d1_rel, d2_rel, aux_values: values, opening }, claims))
 }
 
-fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
-    descriptor: &AuxDescriptor, proof: &ReverseArgmaxProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
+    descriptor: &AuxDescriptor, proof: &ReverseArgmaxProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
 {
     let (x, sel, thr, gate, d1, d2, out, m, n) = match op {
         Op::Argmax { x, sel, thr, gate, d1, d2, out, m, n } => (*x, *sel, *thr, *gate, *d1, *d2, *out, *m, *n),
@@ -3474,10 +3466,10 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     if qs.len() != arity || qd.len() != arity || q2.len() != arity
         || qt.len() != lgm || qo.len() != lgm { return None; }
     if descriptor.role != AuxRole::ArgmaxWitness || descriptor.len != m.checked_mul(n)? { return None; }
-    let row_of = |p: &[Goldilocks]| -> Vec<Goldilocks> { p[lgn..lgn + lgm].to_vec() };
+    let row_of = |p: &[Ef]| -> Vec<Ef> { p[lgn..lgn + lgm].to_vec() };
 
     // Pointwise linear binding at the claim points.
-    if vd != Goldilocks::ZERO { return None; }
+    if vd != Ef::ZERO { return None; }
 
     // S5 gate/d1/d2 relation virtuals (mirror of the prove side): the eq
     // point q_rel is squeezed once and shared; each virtual claims 0, which
@@ -3487,80 +3479,80 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     // through the returned claims.
     if proof.gate_rel.final_evals.len() != 4 || proof.d1_rel.final_evals.len() != 5
         || proof.d2_rel.final_evals.len() != 5 { return None; }
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    let q_rel: Vec<Goldilocks> = transcript.field_vec(arity);
+    let neg = Ef::ZERO - Ef::ONE;
+    let q_rel: Vec<Ef> = transcript.ef_field_vec(arity);
     let gate_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Ef::ONE, vec![0usize, 1usize, 2usize]),
         (neg, vec![0usize, 3usize]),
     ];
-    let (okg, zg, fg) = verify_virtual(&proof.gate_rel, &gate_terms, Goldilocks::ZERO, arity, transcript);
-    if !okg || fg != virtual_eval(&gate_terms, &proof.gate_rel.final_evals)
-        || proof.gate_rel.final_evals[0] != mle::eq_poly(&q_rel, &zg) { return None; }
+    let (okg, zg, fg) = efo::verify_virtual(&proof.gate_rel, &gate_terms, Ef::ZERO, arity, transcript);
+    if !okg || fg != efo::virtual_eval(&gate_terms, &proof.gate_rel.final_evals)
+        || proof.gate_rel.final_evals[0] != ef_eq_poly(&q_rel, &zg) { return None; }
     let d1_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Ef::ONE, vec![0usize, 1usize, 2usize]),
         (neg, vec![0usize, 1usize, 3usize]),
         (neg, vec![0usize, 4usize]),
     ];
-    let (okd, zd1, fd1) = verify_virtual(&proof.d1_rel, &d1_terms, Goldilocks::ZERO, arity, transcript);
-    if !okd || fd1 != virtual_eval(&d1_terms, &proof.d1_rel.final_evals)
-        || proof.d1_rel.final_evals[0] != mle::eq_poly(&q_rel, &zd1) { return None; }
+    let (okd, zd1, fd1) = efo::verify_virtual(&proof.d1_rel, &d1_terms, Ef::ZERO, arity, transcript);
+    if !okd || fd1 != efo::virtual_eval(&d1_terms, &proof.d1_rel.final_evals)
+        || proof.d1_rel.final_evals[0] != ef_eq_poly(&q_rel, &zd1) { return None; }
     let d2_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 3usize]),
+        (Ef::ONE, vec![0usize, 3usize]),
         (neg, vec![0usize, 2usize]),
         (neg, vec![0usize, 1usize, 3usize]),
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Ef::ONE, vec![0usize, 1usize, 2usize]),
         (neg, vec![0usize, 4usize]),
     ];
-    let (ok2r, zd2, fd2) = verify_virtual(&proof.d2_rel, &d2_terms, Goldilocks::ZERO, arity, transcript);
-    if !ok2r || fd2 != virtual_eval(&d2_terms, &proof.d2_rel.final_evals)
-        || proof.d2_rel.final_evals[0] != mle::eq_poly(&q_rel, &zd2) { return None; }
+    let (ok2r, zd2, fd2) = efo::verify_virtual(&proof.d2_rel, &d2_terms, Ef::ZERO, arity, transcript);
+    if !ok2r || fd2 != efo::virtual_eval(&d2_terms, &proof.d2_rel.final_evals)
+        || proof.d2_rel.final_evals[0] != ef_eq_poly(&q_rel, &zd2) { return None; }
 
-    let q_bool = transcript.field_vec(arity);
-    let gamma_bool = transcript.field();
-    let q_bit = transcript.field_vec(arity);
-    let gamma_bit = transcript.field();
-    let q_tie = transcript.field_vec(arity);
-    let r_rows = transcript.field_vec(lgm);
-    let r_col = transcript.field_vec(lgn);
-    let r_before: Vec<Goldilocks> = r_col.iter().chain(r_rows.iter()).cloned().collect();
-    let eq_rows = mle::eq_evals(&r_rows);
-    let eq_col = mle::eq_evals(&r_col);
-    let mut suffix = vec![Goldilocks::ZERO; n];
-    let mut acc = Goldilocks::ZERO;
+    let q_bool = transcript.ef_field_vec(arity);
+    let gamma_bool = transcript.ef_field();
+    let q_bit = transcript.ef_field_vec(arity);
+    let gamma_bit = transcript.ef_field();
+    let q_tie = transcript.ef_field_vec(arity);
+    let r_rows = transcript.ef_field_vec(lgm);
+    let r_col = transcript.ef_field_vec(lgn);
+    let r_before: Vec<Ef> = r_col.iter().chain(r_rows.iter()).cloned().collect();
+    let eq_rows = efo::eq_evals(&r_rows);
+    let eq_col = efo::eq_evals(&r_col);
+    let mut suffix = vec![Ef::ZERO; n];
+    let mut acc = Ef::ZERO;
     for k in 0..n { suffix[k] = acc; acc = acc + eq_col[k]; }
     let before_coeff = argmax_coeff_col(&eq_rows, &suffix, m, n, arity);
-    let ones = vec![Goldilocks::ONE; n];
-    let out_coeff = argmax_coeff_col(&mle::eq_evals(&qo), &(0..n).map(|j| Goldilocks::from_u64(j as u64)).collect::<Vec<_>>(), m, n, arity);
-    let qt_rows = mle::eq_evals(&qt);
+    let ones = vec![Ef::ONE; n];
+    let out_coeff = argmax_coeff_col(&efo::eq_evals(&qo), &(0..n).map(|j| ef_u64(j as u64)).collect::<Vec<_>>(), m, n, arity);
+    let qt_rows = efo::eq_evals(&qt);
     // The thr_sum virtual's eq kernel is qt-derived (its claim vt is the
     // thr value at qt); the endpoint check below evaluates eq_poly(qt, row)
     // directly, so the column itself is only built on the prove side.
     let _thr_rows_col = argmax_coeff_col(&qt_rows, &ones, m, n, arity);
 
     // Replay virtual proofs to derive endpoints and check the round arithmetic.
-    let eq_bool = mle::eq_evals(&q_bool);
+    let eq_bool = efo::eq_evals(&q_bool);
     // Shared constructor; mirrors the prove side exactly.
     let terms = argmax_sel_bool_terms(gamma_bool);
     let before_r = *proof.aux_values.get(1)?;
-    let (ok1, z1, f1) = verify_virtual(&proof.sel_bool, &terms, Goldilocks::ZERO, arity, transcript);
+    let (ok1, z1, f1) = efo::verify_virtual(&proof.sel_bool, &terms, Ef::ZERO, arity, transcript);
     if !ok1 { return None; }
-    let eq_bit = mle::eq_evals(&q_bit);
+    let eq_bit = efo::eq_evals(&q_bit);
     let bit_terms = argmax_bit_bool_terms(gamma_bit, ARGMAX_D2_BITS + ARGMAX_TIE_BITS);
-    let (ok2, z2, f2) = verify_virtual(&proof.bit_bool, &bit_terms, Goldilocks::ZERO, arity, transcript);
+    let (ok2, z2, f2) = efo::verify_virtual(&proof.bit_bool, &bit_terms, Ef::ZERO, arity, transcript);
     if !ok2 { return None; }
-    let (ok3, z3, f3) = verify_virtual(&proof.row_sum, &[(Goldilocks::ONE, vec![0usize, 1usize])], Goldilocks::ONE, arity, transcript);
+    let (ok3, z3, f3) = efo::verify_virtual(&proof.row_sum, &[(Ef::ONE, vec![0usize, 1usize])], Ef::ONE, arity, transcript);
     if !ok3 { return None; }
-    let (ok4, z4, f4) = verify_virtual(&proof.before_sum, &[(Goldilocks::ONE, vec![0usize, 1usize])], before_r, arity, transcript);
+    let (ok4, z4, f4) = efo::verify_virtual(&proof.before_sum, &[(Ef::ONE, vec![0usize, 1usize])], before_r, arity, transcript);
     if !ok4 { return None; }
-    let (ok5, z5, f5) = verify_virtual(&proof.out_sum, &[(Goldilocks::ONE, vec![0usize, 1usize])], vo, arity, transcript);
+    let (ok5, z5, f5) = efo::verify_virtual(&proof.out_sum, &[(Ef::ONE, vec![0usize, 1usize])], vo, arity, transcript);
     if !ok5 { return None; }
-    let (ok6, z6, f6) = verify_virtual(&proof.thr_sum, &[(Goldilocks::ONE, vec![0usize, 1usize, 2usize])], vt, arity, transcript);
+    let (ok6, z6, f6) = efo::verify_virtual(&proof.thr_sum, &[(Ef::ONE, vec![0usize, 1usize, 2usize])], vt, arity, transcript);
     if !ok6 { return None; }
     if proof.aux_values.len() != 2 + ARGMAX_D2_BITS + 2 + ARGMAX_D2_BITS + ARGMAX_TIE_BITS + 6 + 1 + (ARGMAX_D2_BITS + ARGMAX_TIE_BITS) + 3 { return None; }
 
     // Rebuild the exact opening list.
     let mut idxs: Vec<usize> = Vec::new();
-    let mut points: Vec<Vec<Goldilocks>> = Vec::new();
+    let mut points: Vec<Vec<Ef>> = Vec::new();
     macro_rules! push { ($idx:expr, $point:expr) => {{ idxs.push($idx); points.push($point); }}; }
     push!(0, argmax_pad_point(&qs, arity));
     push!(ARGMAX_BEFORE_COL, argmax_pad_point(&r_before, arity));
@@ -3589,10 +3581,7 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     let sel_d2_idx = idxs.len();
     push!(0, argmax_pad_point(&zd2, arity));
     let padded = 1usize.checked_shl(arity as u32)?;
-    let vars = descriptor.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-    let whir = verifier_whir(vars)?;
-    let protocol = whir.batch_opening_protocol(descriptor.columns, arity);
-    if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &descriptor.commitment, &protocol, descriptor.columns, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
+    if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
     let av = &proof.aux_values;
 
     // Pointwise bindings against the committed aux (linear relations).
@@ -3602,47 +3591,47 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     if av[sel_gate_idx] != proof.gate_rel.final_evals[1] { return None; }
     if av[sel_d1_idx] != proof.d1_rel.final_evals[1] { return None; }
     if av[sel_d2_idx] != proof.d2_rel.final_evals[1] { return None; }
-    let mut d2_q2 = Goldilocks::ZERO;
-    let mut d2_tie = Goldilocks::ZERO;
-    let mut tie_gap = Goldilocks::ZERO;
+    let mut d2_q2 = Ef::ZERO;
+    let mut d2_tie = Ef::ZERO;
+    let mut tie_gap = Ef::ZERO;
     for b in 0..ARGMAX_D2_BITS {
-        d2_q2 = d2_q2 + Goldilocks::from_u64(1u64 << b) * av[2 + b];
-        d2_tie = d2_tie + Goldilocks::from_u64(1u64 << b) * av[2 + ARGMAX_D2_BITS + 2 + b];
+        d2_q2 = d2_q2 + ef_u64(1u64 << b) * av[2 + b];
+        d2_tie = d2_tie + ef_u64(1u64 << b) * av[2 + ARGMAX_D2_BITS + 2 + b];
     }
     let before_tie = av[2 + ARGMAX_D2_BITS];
     let sel_tie = av[2 + ARGMAX_D2_BITS + 1];
-    for b in 0..ARGMAX_TIE_BITS { tie_gap = tie_gap + Goldilocks::from_u64(1u64 << b) * av[2 + ARGMAX_D2_BITS + 2 + ARGMAX_D2_BITS + b]; }
+    for b in 0..ARGMAX_TIE_BITS { tie_gap = tie_gap + ef_u64(1u64 << b) * av[2 + ARGMAX_D2_BITS + 2 + ARGMAX_D2_BITS + b]; }
     if d2_q2 != v2 { return None; }
     if tie_gap != d2_tie - before_tie + sel_tie { return None; }
 
     // Final identities with closed-form known columns.
     let sel_z = |i: usize| av[sel_idx[i]];
-    let ev_bool = [mle::eq_poly(&q_bool, &z1), sel_z(0), av[before_bool_idx]];
-    if f1 != virtual_eval(&terms, &ev_bool) { return None; }
+    let ev_bool = [ef_eq_poly(&q_bool, &z1), sel_z(0), av[before_bool_idx]];
+    if f1 != efo::virtual_eval(&terms, &ev_bool) { return None; }
     let mut ev_bit = Vec::with_capacity(1 + bit_idx.len());
-    ev_bit.push(mle::eq_poly(&q_bit, &z2));
+    ev_bit.push(ef_eq_poly(&q_bit, &z2));
     for &i in &bit_idx { ev_bit.push(av[i]); }
-    if f2 != virtual_eval(&bit_terms, &ev_bit) { return None; }
-    let zi = |z: &[Goldilocks]| z[lgn..lgn + lgm].to_vec();
-    if f3 != virtual_eval(&[(Goldilocks::ONE, vec![0usize, 1usize])], &[mle::eq_poly(&r_rows, &zi(&z3)), sel_z(2)]) { return None; }
-    let known_before = mle::eq_poly(&r_rows, &zi(&z4)) * suffix_kernel_eval(&r_col, &z4[..lgn]);
-    if f4 != virtual_eval(&[(Goldilocks::ONE, vec![0usize, 1usize])], &[known_before, sel_z(3)]) { return None; }
-    let known_out = mle::eq_poly(&qo, &zi(&z5)) * mle_integer(&z5[..lgn]);
-    if f5 != virtual_eval(&[(Goldilocks::ONE, vec![0usize, 1usize])], &[known_out, sel_z(4)]) { return None; }
+    if f2 != efo::virtual_eval(&bit_terms, &ev_bit) { return None; }
+    let zi = |z: &[Ef]| z[lgn..lgn + lgm].to_vec();
+    if f3 != efo::virtual_eval(&[(Ef::ONE, vec![0usize, 1usize])], &[ef_eq_poly(&r_rows, &zi(&z3)), sel_z(2)]) { return None; }
+    let known_before = ef_eq_poly(&r_rows, &zi(&z4)) * suffix_kernel_eval(&r_col, &z4[..lgn]);
+    if f4 != efo::virtual_eval(&[(Ef::ONE, vec![0usize, 1usize])], &[known_before, sel_z(3)]) { return None; }
+    let known_out = ef_eq_poly(&qo, &zi(&z5)) * mle_integer(&z5[..lgn]);
+    if f5 != efo::virtual_eval(&[(Ef::ONE, vec![0usize, 1usize])], &[known_out, sel_z(4)]) { return None; }
     let x_z = *proof.thr_sum.final_evals.get(2)?;
-    let known_thr = mle::eq_poly(&qt, &zi(&z6));
-    if f6 != virtual_eval(&[(Goldilocks::ONE, vec![0usize, 1usize, 2usize])], &[known_thr, sel_z(5), x_z]) { return None; }
+    let known_thr = ef_eq_poly(&qt, &zi(&z6));
+    if f6 != efo::virtual_eval(&[(Ef::ONE, vec![0usize, 1usize, 2usize])], &[known_thr, sel_z(5), x_z]) { return None; }
 
     Some(vec![
-        EvalClaim { tensor_id: x, point: zg.clone(), value: proof.gate_rel.final_evals[2] },
-        EvalClaim { tensor_id: x, point: zd1.clone(), value: proof.d1_rel.final_evals[2] },
-        EvalClaim { tensor_id: x, point: zd2.clone(), value: proof.d2_rel.final_evals[2] },
-        EvalClaim { tensor_id: x, point: z6p, value: x_z },
-        EvalClaim { tensor_id: thr, point: row_of(&zd1), value: proof.d1_rel.final_evals[3] },
-        EvalClaim { tensor_id: thr, point: row_of(&zd2), value: proof.d2_rel.final_evals[3] },
-        EvalClaim { tensor_id: gate, point: zg.clone(), value: proof.gate_rel.final_evals[3] },
-        EvalClaim { tensor_id: d1, point: zd1.clone(), value: proof.d1_rel.final_evals[4] },
-        EvalClaim { tensor_id: d2, point: zd2.clone(), value: proof.d2_rel.final_evals[4] },
+        EfClaim { tensor_id: x, point: zg.clone(), value: proof.gate_rel.final_evals[2] },
+        EfClaim { tensor_id: x, point: zd1.clone(), value: proof.d1_rel.final_evals[2] },
+        EfClaim { tensor_id: x, point: zd2.clone(), value: proof.d2_rel.final_evals[2] },
+        EfClaim { tensor_id: x, point: z6p, value: x_z },
+        EfClaim { tensor_id: thr, point: row_of(&zd1), value: proof.d1_rel.final_evals[3] },
+        EfClaim { tensor_id: thr, point: row_of(&zd2), value: proof.d2_rel.final_evals[3] },
+        EfClaim { tensor_id: gate, point: zg.clone(), value: proof.gate_rel.final_evals[3] },
+        EfClaim { tensor_id: d1, point: zd1.clone(), value: proof.d1_rel.final_evals[4] },
+        EfClaim { tensor_id: d2, point: zd2.clone(), value: proof.d2_rel.final_evals[4] },
     ])
 }
 
@@ -3652,9 +3641,9 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
 /// every selector Boolean, exactly one selector per valid position (mask),
 /// padding selects nothing, and expert_of(pos) = Σ_e e·sel_e(pos) — which
 /// rules out duplicated, dropped and out-of-range routes.
-fn expert_routing_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec<usize>)> {
+fn expert_routing_terms(gamma: Ef, count: usize) -> Vec<(Ef, Vec<usize>)> {
     let mut terms = Vec::with_capacity(4 * count + 2);
-    let mut gp = Goldilocks::ONE;
+    let mut gp = Ef::ONE;
     for e in 0..count {
         terms.push((gp, vec![0usize, 1 + e, 1 + e])); // booleanity: eq·sel_e²
         terms.push((-gp, vec![0usize, 1 + e])); //              − eq·sel_e
@@ -3662,7 +3651,7 @@ fn expert_routing_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec
     }
     let tie_w = gp;
     for e in 0..count {
-        terms.push((tie_w * Goldilocks::from_u64(e as u64), vec![0usize, 1 + e]));
+        terms.push((tie_w * ef_u64(e as u64), vec![0usize, 1 + e]));
     }
     terms.push((-tie_w, vec![0usize, 1 + count])); // tie: − eq·expert_of
     let onehot_w = tie_w * gamma;
@@ -3675,42 +3664,42 @@ fn expert_routing_terms(gamma: Goldilocks, count: usize) -> Vec<(Goldilocks, Vec
 
 /// Evaluate a (possibly non-power-of-two) index tensor as a field column,
 /// zero-padded to the 2^point.len() domain. Used by the S7b index reductions.
-fn idx_eval(store: &Store, id: T, point: &[Goldilocks]) -> Option<Goldilocks> {
+fn idx_eval(store: &Store, id: T, point: &[Ef]) -> Option<Ef> {
     let xs = store.idx.get(id)?;
     let padded = 1usize.checked_shl(point.len() as u32)?;
     if xs.len() > padded { return None; }
-    let mut vals = vec![Goldilocks::ZERO; padded];
-    for (i, &v) in xs.iter().enumerate() { vals[i] = Goldilocks::from_u64(v as u64); }
-    Some(mle::eval(&vals, point))
+    let mut vals = vec![Ef::ZERO; padded];
+    for (i, &v) in xs.iter().enumerate() { vals[i] = ef_u64(v as u64); }
+    efo::eval_ef_slice(&vals, point)
 }
 
 /// Zero-extension factor Π_{b >= k}(1 - z_b) (padding coordinates absent).
 /// Returns ONE when the point already has k or fewer coordinates.
-fn zero_ext_factor(z: &[Goldilocks], k: usize) -> Goldilocks {
-    let mut acc = Goldilocks::ONE;
-    for b in k..z.len() { acc = acc * (Goldilocks::ONE - z[b]); }
+fn zero_ext_factor(z: &[Ef], k: usize) -> Ef {
+    let mut acc = Ef::ONE;
+    for b in k..z.len() { acc = acc * (Ef::ONE - z[b]); }
     acc
 }
 
 /// MLE of the deterministic validity mask (1 for pos < len) at `z`.
-fn expert_mask_eval(z: &[Goldilocks], len: usize) -> Goldilocks {
-    let eq = mle::eq_evals(z);
-    let mut acc = Goldilocks::ZERO;
+fn expert_mask_eval(z: &[Ef], len: usize) -> Ef {
+    let eq = efo::eq_evals(z);
+    let mut acc = Ef::ZERO;
     for pos in 0..len.min(eq.len()) { acc = acc + eq[pos]; }
     acc
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseGatherMatmulProof {
-    matmul: BatchedMatmulProof,
-    routing: VirtualProof,
+    matmul: zkie_core::common::ef_batched::EfBatchedMatmulProof,
+    routing: EfVirtualProof,
     /// Weight-side terminals, one per expert: MLE of the expert's K×N block
     /// at (ch_d, v). Authenticated by the manifest weight batch opening at the
     /// verifier-derived points.
-    table: Vec<Goldilocks>,
+    table: Vec<Ef>,
     /// Selector evaluations: E at ch_pos (the derived counts), then E at z.
-    aux_values: Vec<Goldilocks>,
-    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    aux_values: Vec<Ef>,
+    opening: EfBatchOpeningProof,
 }
 
 fn gather_matmul_dims(op: &Op) -> Option<(T, T, T, T, usize, usize, usize, usize)> {
@@ -3724,8 +3713,8 @@ fn gather_matmul_dims(op: &Op) -> Option<(T, T, T, T, usize, usize, usize, usize
     }
 }
 
-fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
-    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseGatherMatmulProof, Vec<EvalClaim>)>
+fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
+    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseGatherMatmulProof, Vec<EfClaim>)>
 {
     let (a, expert_of, w, c, s, k, n, e_count) = gather_matmul_dims(op)?;
     let lgk = k.trailing_zeros() as usize;
@@ -3756,8 +3745,8 @@ fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Goldilock
     if eof.iter().any(|&e| (e as usize) >= e_count) { return None; }
     let blocks = store.weight_blocks(w);
     if blocks.len() != e_count * k * n { return None; }
-    let streamed = bmm::stream_weights(eof, &blocks, s, e_count, k, n, &v, true);
-    let (matmul, ch) = bmm::prove_with_w_v(
+    let streamed = bmm::stream_weights_ef(eof, &blocks, s, e_count, k, n, &v, true);
+    let (matmul, ch) = zkie_core::common::ef_batched::prove_with_w_v(
         store.get(a), &streamed.w_v, store.get(c),
         s, k, n, &u, &v, transcript,
     );
@@ -3767,32 +3756,33 @@ fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Goldilock
 
     // Routing relation (commit 0): booleanity + one-hot + expert_of tie.
     let padded = 1usize.checked_shl(arity as u32)?;
-    let q_routing: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma = transcript.field();
+    let q_routing: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma = transcript.ef_field();
     let terms = expert_routing_terms(gamma, e_count);
-    let eq_routing = mle::eq_evals(&q_routing);
-    let mut xp = vec![Goldilocks::ZERO; padded];
+    let eq_routing = efo::eq_evals(&q_routing);
+    let mut xp = vec![Ef::ZERO; padded];
     {
         let xv = store.idx.get(expert_of)?;
         if xv.len() != s { return None; }
-        for pos in 0..s { xp[pos] = Goldilocks::from_u64(xv[pos] as u64); }
+        for pos in 0..s { xp[pos] = ef_u64(xv[pos] as u64); }
     }
-    let mut mask = vec![Goldilocks::ZERO; padded];
-    for pos in 0..s { mask[pos] = Goldilocks::ONE; }
-    let mut mles: Vec<&[Goldilocks]> = vec![&eq_routing];
-    for e in 0..e_count { mles.push(&aux.columns[e]); }
+    let mut mask = vec![Ef::ZERO; padded];
+    for pos in 0..s { mask[pos] = Ef::ONE; }
+    let aux_cols = lift_columns(&aux.columns);
+    let mut mles: Vec<&[Ef]> = vec![&eq_routing];
+    for e in 0..e_count { mles.push(aux_cols[e].as_slice()); }
     mles.push(&xp);
     mles.push(&mask);
-    let (routing, z) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    let (routing, z) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
 
     // counts = sel_e(ch_pos) (derived by the verifier from the aux opening).
     let chp = argmax_pad_point(ch_pos, arity);
     let mut counts = Vec::with_capacity(e_count);
-    for e in 0..e_count { counts.push(mle::eval(&aux.columns[e], &chp)); }
+    for e in 0..e_count { counts.push(ef_eval(&aux.columns[e], &chp)); }
     // table_e = W_e(ch_d, v) (expert-major block), recovered from the row
     // folds stored by the streaming pass: no second read of the weights.
     let table = match streamed.table_evals(ch_d) { Some(t) => t, None => return None };
-    let mut bound = Goldilocks::ZERO;
+    let mut bound = Ef::ZERO;
     for e in 0..e_count { bound = bound + counts[e] * table[e]; }
     if matmul.sumcheck.final_evals[1] != bound { return None; }
 
@@ -3805,17 +3795,9 @@ fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Goldilock
         idxs.push(e); points.push(chp.clone()); values.push(counts[e]);
     }
     for e in 0..e_count {
-        idxs.push(e); points.push(zp.clone()); values.push(mle::eval(&aux.columns[e], &zp));
+        idxs.push(e); points.push(zp.clone()); values.push(ef_eval(&aux.columns[e], &zp));
     }
-    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&i| aux.columns[i].clone()).collect();
-    let ctx = zkie_core::pcs::committed::BatchCtx {
-        commitment: aux.descriptor.commitment.clone(),
-        prover_data: aux.prover_data,
-        protocol: aux.protocol,
-        whir: aux.whir,
-        num_tables: aux.descriptor.columns,
-    };
-    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+    let opening = open_aux(aux, &idxs, &points, &values)?;
 
     let fe = &matmul.sumcheck.final_evals;
     if fe.len() != 3 || routing.final_evals.len() != e_count + 3 { return None; }
@@ -3825,26 +3807,26 @@ fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Goldilock
     // claim on the public index tensor uses the truncated point. The routing
     // virtual's endpoint fe[1+E] is the expert_of column evaluation at z.
     let pad = zero_ext_factor(&z, lgs);
-    if pad == Goldilocks::ZERO { return None; }
+    if pad == Ef::ZERO { return None; }
     let expert_eval = routing.final_evals[1 + e_count] * pad.inverse();
     let mut weight_claims = Vec::with_capacity(e_count);
     for e in 0..e_count {
         let mut p_e = v.clone();
         p_e.extend_from_slice(ch_d);
-        for bit in 0..lge { p_e.push(Goldilocks::from_u64(((e >> bit) & 1) as u64)); }
-        weight_claims.push(EvalClaim { tensor_id: w, point: p_e, value: table[e] });
+        for bit in 0..lge { p_e.push(ef_u64(((e >> bit) & 1) as u64)); }
+        weight_claims.push(EfClaim { tensor_id: w, point: p_e, value: table[e] });
     }
     let mut claims = vec![
-        EvalClaim { tensor_id: a, point: ch.clone(), value: fe[0] },
-        EvalClaim { tensor_id: expert_of_key, point: z[..lgs].to_vec(), value: expert_eval },
+        EfClaim { tensor_id: a, point: ch.clone(), value: fe[0] },
+        EfClaim { tensor_id: expert_of_key, point: z[..lgs].to_vec(), value: expert_eval },
     ];
     claims.extend(weight_claims);
     Some((ReverseGatherMatmulProof { matmul, routing, table, aux_values: values, opening }, claims))
 }
 
-fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     descriptor: &AuxDescriptor, proof: &ReverseGatherMatmulProof, transcript: &mut Transcript)
-    -> Option<Vec<EvalClaim>>
+    -> Option<Vec<EfClaim>>
 {
     let (a, expert_of, w, c, s, k, n, e_count) = gather_matmul_dims(op)?;
     let lgk = k.trailing_zeros() as usize;
@@ -3863,15 +3845,15 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks
     let (v, u) = (v.to_vec(), u.to_vec());
     if proof.matmul.claimed != vc || proof.matmul.sumcheck.final_evals.len() != 3 { return None; }
 
-    let (ok, ch) = bmm::verify(&proof.matmul, s, k, &u, transcript);
+    let (ok, ch) = zkie_core::common::ef_batched::verify(&proof.matmul, s, k, &u, transcript);
     if !ok || ch.len() != lgk + lgs { return None; }
     let ch_d = &ch[..lgk];
     let ch_pos = &ch[lgk..];
 
-    let q_routing: Vec<Goldilocks> = transcript.field_vec(arity);
-    let gamma = transcript.field();
+    let q_routing: Vec<Ef> = transcript.ef_field_vec(arity);
+    let gamma = transcript.ef_field();
     let terms = expert_routing_terms(gamma, e_count);
-    let (okr, z, fc) = verify_virtual(&proof.routing, &terms, Goldilocks::ZERO, arity, transcript);
+    let (okr, z, fc) = efo::verify_virtual(&proof.routing, &terms, Ef::ZERO, arity, transcript);
     if !okr { return None; }
     let fe = &proof.routing.final_evals;
     if fe.len() != e_count + 3 { return None; }
@@ -3883,41 +3865,37 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks
     let mut points = Vec::with_capacity(2 * e_count);
     for e in 0..e_count { idxs.push(e); points.push(chp.clone()); }
     for e in 0..e_count { idxs.push(e); points.push(zp.clone()); }
-    let (whir, protocol) = aux_batch_whir(descriptor)?;
-    if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-        &whir, &descriptor.commitment, &protocol, descriptor.columns,
-        &idxs, &points, &proof.aux_values, &proof.opening,
-    ) { return None; }
+    if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
 
     // counts are the ch_pos openings; the weight terminal is locked by the
     // sumcheck; the table values are the opened manifest weight blocks.
-    let mut bound = Goldilocks::ZERO;
+    let mut bound = Ef::ZERO;
     for e in 0..e_count { bound = bound + proof.aux_values[e] * proof.table[e]; }
     if proof.matmul.sumcheck.final_evals[1] != bound { return None; }
 
     // Routing endpoints: eq closed-form, selectors from the aux opening at z,
     // mask closed-form, expert_of carried by the virtual and re-issued as a
     // claim below.
-    if fe[0] != mle::eq_poly(&q_routing, &z) { return None; }
+    if fe[0] != ef_eq_poly(&q_routing, &z) { return None; }
     for e in 0..e_count {
         if fe[1 + e] != proof.aux_values[e_count + e] { return None; }
     }
     if fe[2 + e_count] != expert_mask_eval(&z, s) { return None; }
-    if fc != virtual_eval(&terms, fe) { return None; }
+    if fc != efo::virtual_eval(&terms, fe) { return None; }
 
     let expert_of_key = TensorKey::Index(expert_of).encoded()?;
     let pad = zero_ext_factor(&z, lgs);
-    if pad == Goldilocks::ZERO { return None; }
+    if pad == Ef::ZERO { return None; }
     let expert_eval = fe[1 + e_count] * pad.inverse();
     let mut claims = vec![
-        EvalClaim { tensor_id: a, point: ch.clone(), value: proof.matmul.sumcheck.final_evals[0] },
-        EvalClaim { tensor_id: expert_of_key, point: z[..lgs].to_vec(), value: expert_eval },
+        EfClaim { tensor_id: a, point: ch.clone(), value: proof.matmul.sumcheck.final_evals[0] },
+        EfClaim { tensor_id: expert_of_key, point: z[..lgs].to_vec(), value: expert_eval },
     ];
     for e in 0..e_count {
         let mut p_e = v.clone();
         p_e.extend_from_slice(ch_d);
-        for bit in 0..lge { p_e.push(Goldilocks::from_u64(((e >> bit) & 1) as u64)); }
-        claims.push(EvalClaim { tensor_id: w, point: p_e, value: proof.table[e] });
+        for bit in 0..lge { p_e.push(ef_u64(((e >> bit) & 1) as u64)); }
+        claims.push(EfClaim { tensor_id: w, point: p_e, value: proof.table[e] });
     }
     Some(claims)
 }
@@ -3938,25 +3916,25 @@ struct AuxDescriptor {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseLookupProof {
-    witness: FractionalProof,
+    witness: EfFractionalProof,
     /// Per-op table-side fractional proof (ungrouped paths). Grouped static
     /// lookups share one table-side tree at the group level; their per-op
     /// value is an empty placeholder (`layers.is_empty()`), kept as a plain
     /// field so ungrouped lookup bytes are unchanged by step (b).
-    table: FractionalProof,
-    output_index: Goldilocks,
-    witness_index: Goldilocks,
-    witness_value: Goldilocks,
+    table: EfFractionalProof,
+    output_index: Ef,
+    witness_index: Ef,
+    witness_value: Ef,
     /// Ungrouped: the table-side numerator leaf. Grouped: this op's
     /// multiplicity evaluation at the group identity challenge point.
-    multiplicity: Goldilocks,
-    table_value: Goldilocks,
-    padding: VirtualProof,
-    pairs_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    multiplicity: Ef,
+    table_value: Ef,
+    padding: EfVirtualProof,
+    pairs_opening: EfBatchOpeningProof,
     /// Ungrouped: opens the per-op multiplicity at [table num leaf, padding].
     /// Grouped: opens this op's multiplicity at [group identity point,
     /// padding].
-    multiplicity_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    multiplicity_opening: EfBatchOpeningProof,
     table_opening: Option<zkie_core::pcs::whir::Proof>,
 }
 
@@ -3970,9 +3948,9 @@ struct ReverseLookupProof {
 struct LookupGroupProof {
     table_id: T,
     members: Vec<usize>,
-    identity: VirtualProof,
-    aggregate_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
-    table: FractionalProof,
+    identity: EfVirtualProof,
+    aggregate_opening: EfBatchOpeningProof,
+    table: EfFractionalProof,
     /// Step (c): the one table opening of the group, at the shared table
     /// denominator leaf. Member Lookup proofs carry `table_opening = None`.
     table_opening: zkie_core::pcs::whir::Proof,
@@ -3984,44 +3962,44 @@ struct LookupGroupProof {
 /// field for canonical bytes; the value itself is authenticated once at the
 /// group level in step (c)).
 struct LookupGroupProveCtx {
-    alpha: Goldilocks,
-    beta: Goldilocks,
+    alpha: Ef,
+    beta: Ef,
     members: Vec<usize>,
-    identity_point: Vec<Goldilocks>,
-    member_evals: Vec<Goldilocks>,
-    table_eval: Goldilocks,
-    table_final_num: Goldilocks,
-    table_final_den: Goldilocks,
+    identity_point: Vec<Ef>,
+    member_evals: Vec<Ef>,
+    table_eval: Ef,
+    table_final_num: Ef,
+    table_final_den: Ef,
 }
 
 /// Verifier-side group context. `table_eval` is the group table opening's
 /// authenticated value at the shared table denominator leaf; the group leaf
 /// relation has already been checked in the group phase.
 struct LookupGroupVerifyCtx {
-    alpha: Goldilocks,
-    beta: Goldilocks,
+    alpha: Ef,
+    beta: Ef,
     members: Vec<usize>,
-    identity_point: Vec<Goldilocks>,
-    member_evals: Vec<Goldilocks>,
-    table_eval: Goldilocks,
-    table_final_num: Goldilocks,
-    table_final_den: Goldilocks,
+    identity_point: Vec<Ef>,
+    member_evals: Vec<Ef>,
+    table_eval: Ef,
+    table_final_num: Ef,
+    table_final_den: Ef,
 }
 
 struct LookupGroupMemberProve<'a> {
-    alpha: Goldilocks,
-    beta: Goldilocks,
-    identity_point: &'a [Goldilocks],
-    member_eval: Goldilocks,
-    table_eval: Goldilocks,
+    alpha: Ef,
+    beta: Ef,
+    identity_point: &'a [Ef],
+    member_eval: Ef,
+    table_eval: Ef,
 }
 
 struct LookupGroupMemberVerify<'a> {
-    alpha: Goldilocks,
-    beta: Goldilocks,
-    identity_point: &'a [Goldilocks],
-    member_eval: Goldilocks,
-    table_eval: Goldilocks,
+    alpha: Ef,
+    beta: Ef,
+    identity_point: &'a [Ef],
+    member_eval: Ef,
+    table_eval: Ef,
 }
 
 struct PreparedAux {
@@ -4034,11 +4012,11 @@ struct PreparedAux {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseProjectionProof {
-    matmul: MatmulProof,
-    bias: Goldilocks,
-    remainder_bits: Vec<Goldilocks>,
-    booleanity: VirtualProof,
-    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    matmul: EfMatmulProof,
+    bias: Ef,
+    remainder_bits: Vec<Ef>,
+    booleanity: EfVirtualProof,
+    opening: EfBatchOpeningProof,
 }
 
 fn projection_aux_specs(ops: &[Op]) -> Option<Vec<(usize, usize, usize, usize)>> {
@@ -4208,10 +4186,10 @@ const ARGMAX_D2_COL: usize = 2;
 const ARGMAX_TIE_COL: usize = ARGMAX_D2_COL + ARGMAX_D2_BITS;
 
 /// MLE of the integer column `j` at a point: `sum_k 2^k z[k]`.
-fn mle_integer(point: &[Goldilocks]) -> Goldilocks {
-    let mut out = Goldilocks::ZERO;
+fn mle_integer(point: &[Ef]) -> Ef {
+    let mut out = Ef::ZERO;
     for (k, &z) in point.iter().enumerate() {
-        out = out + Goldilocks::from_u64(1u64 << k) * z;
+        out = out + ef_u64(1u64 << k) * z;
     }
     out
 }
@@ -4219,22 +4197,22 @@ fn mle_integer(point: &[Goldilocks]) -> Goldilocks {
 /// Closed form of `H(r, z) = sum_{j,k} eq(r,j) eq(z,k) [k > j]`.
 /// The highest differing bit decides the comparison: at bit t the higher bits
 /// are equal and `z_t = 1`, `r_t = 0`. Bits are little-endian (bit 0 = LSB).
-fn known_sel_terms() -> Vec<(Goldilocks, Vec<usize>)> {
-    vec![(Goldilocks::ONE, vec![0usize, 1usize])]
+fn known_sel_terms() -> Vec<(Ef, Vec<usize>)> {
+    vec![(Ef::ONE, vec![0usize, 1usize])]
 }
 
-fn prove_known_sel_sum(known: &[Goldilocks], sel: &[Goldilocks], target: Goldilocks,
-    transcript: &mut Transcript) -> (VirtualProof, Vec<Goldilocks>)
+fn prove_known_sel_sum(known: &[Ef], sel: &[Ef], target: Ef,
+    transcript: &mut Transcript) -> (EfVirtualProof, Vec<Ef>)
 {
-    prove_virtual(&[known, sel], &known_sel_terms(), target, transcript)
+    efo::prove_virtual(&[known, sel], &known_sel_terms(), target, transcript)
 }
 
-fn suffix_kernel_eval(r: &[Goldilocks], z: &[Goldilocks]) -> Goldilocks {
-    let mut out = Goldilocks::ZERO;
-    let mut higher_equal = Goldilocks::ONE;
+fn suffix_kernel_eval(r: &[Ef], z: &[Ef]) -> Ef {
+    let mut out = Ef::ZERO;
+    let mut higher_equal = Ef::ONE;
     for t in (0..r.len()).rev() {
-        let eq_t = r[t] * z[t] + (Goldilocks::ONE - r[t]) * (Goldilocks::ONE - z[t]);
-        out = out + higher_equal * z[t] * (Goldilocks::ONE - r[t]);
+        let eq_t = r[t] * z[t] + (Ef::ONE - r[t]) * (Ef::ONE - z[t]);
+        out = out + higher_equal * z[t] * (Ef::ONE - r[t]);
         higher_equal = higher_equal * eq_t;
     }
     out
@@ -4612,9 +4590,9 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
 struct ReverseReluProof {
     arity: usize,
     bit_commitment: zkie_core::pcs::whir::Commitment,
-    output: VirtualProof,
-    range: VirtualProof,
-    bit_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    output: EfVirtualProof,
+    range: EfVirtualProof,
+    bit_opening: EfBatchOpeningProof,
 }
 
 const RELU_BITS: usize = 23;
@@ -4626,36 +4604,36 @@ const GELU_BITS: usize = 25;
 const GELU_BOUND: i64 = 1 << 24;
 const GELU_XRANGE_BITS: usize = GELU_BITS;
 
-fn relu_range_terms(gamma: Goldilocks, bits: usize) -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn relu_range_terms(gamma: Ef, bits: usize) -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
     let bound = 1i64 << (bits - 1);
     let mut terms = Vec::new();
-    let mut power = Goldilocks::ONE;
+    let mut power = Ef::ONE;
     for j in 0..bits {
         terms.push((power, vec![0, j + 2, j + 2]));
         terms.push((neg * power, vec![0, j + 2]));
         power *= gamma;
     }
     terms.push((power, vec![0, 1]));
-    terms.push((power * Goldilocks::from_u64(bound as u64), vec![0]));
+    terms.push((power * ef_u64(bound as u64), vec![0]));
     for j in 0..bits {
-        terms.push((neg * power * Goldilocks::from_u64(1u64 << j), vec![0, j + 2]));
+        terms.push((neg * power * ef_u64(1u64 << j), vec![0, j + 2]));
     }
     terms
 }
 
-fn unpad_relu_claim(point: &[Goldilocks], value: Goldilocks, input_arity: usize)
-    -> Option<(Vec<Goldilocks>, Goldilocks)>
+fn unpad_relu_claim(point: &[Ef], value: Ef, input_arity: usize)
+    -> Option<(Vec<Ef>, Ef)>
 {
     if point.len() < input_arity { return None; }
-    let factor = point[input_arity..].iter().fold(Goldilocks::ONE, |a, &v| a * (Goldilocks::ONE - v));
-    if factor == Goldilocks::ZERO { return None; }
+    let factor = point[input_arity..].iter().fold(Ef::ONE, |a, &v| a * (Ef::ONE - v));
+    if factor == Ef::ZERO { return None; }
     Some((point[..input_arity].to_vec(), value * factor.inverse()))
 }
 
-fn projection_boolean_terms(columns: usize, gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
-    let mut power = Goldilocks::ONE;
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+fn projection_boolean_terms(columns: usize, gamma: Ef) -> Vec<(Ef, Vec<usize>)> {
+    let mut power = Ef::ONE;
+    let neg = Ef::ZERO - Ef::ONE;
     let mut terms = Vec::new();
     for j in 0..columns {
         terms.push((power, vec![0, j + 1, j + 1]));
@@ -4665,37 +4643,44 @@ fn projection_boolean_terms(columns: usize, gamma: Goldilocks) -> Vec<(Goldilock
     terms
 }
 
-fn open_aux(aux: PreparedAux, idxs: &[usize], points: &[Vec<Goldilocks>], values: &[Goldilocks])
-    -> Option<zkie_core::pcs::batch_open::BatchOpeningProof>
+fn open_aux(aux: PreparedAux, idxs: &[usize], points: &[Vec<Ef>], values: &[Ef])
+    -> Option<EfBatchOpeningProof>
 {
-    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&j| aux.columns[j].clone()).collect();
-    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: aux.descriptor.commitment, prover_data: aux.prover_data, protocol: aux.protocol, whir: aux.whir, num_tables: aux.descriptor.columns };
-    zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, idxs, &tensors, points, values).ok()
+    // One base-field tensor per unique table, first-appearance order.
+    let mut unique = Vec::new();
+    for &j in idxs {
+        if !unique.contains(&j) { unique.push(j); }
+    }
+    let tensors: Vec<Vec<Goldilocks>> = unique.iter().map(|&j| aux.columns[j].clone()).collect();
+    prove_batch_open_committed_ef(
+        &aux.whir, &aux.descriptor.commitment, &aux.protocol, aux.descriptor.columns,
+        aux.prover_data, idxs, tensors, points, values,
+    ).ok()
 }
 
-fn verify_aux_open(aux: &AuxDescriptor, idxs: &[usize], points: &[Vec<Goldilocks>], values: &[Goldilocks], proof: &zkie_core::pcs::batch_open::BatchOpeningProof) -> bool {
+fn verify_aux_open(aux: &AuxDescriptor, idxs: &[usize], points: &[Vec<Ef>], values: &[Ef], proof: &EfBatchOpeningProof) -> bool {
     let padded = match 1usize.checked_shl(aux.arity as u32) { Some(v) => v, None => return false };
     let vars = match aux.columns.checked_mul(padded).and_then(usize::checked_next_power_of_two) { Some(v) => v.trailing_zeros() as usize, None => return false };
     let whir = match verifier_whir(vars) { Some(w) => w, None => return false };
     let protocol = whir.batch_opening_protocol(aux.columns, aux.arity);
-    zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &aux.commitment, &protocol, aux.columns, idxs, points, values, proof)
+    verify_batch_open_committed_ef(&whir, &aux.commitment, &protocol, aux.columns, idxs, points, values, proof)
 }
 
-fn lookup_index_eval(point: &[Goldilocks]) -> Goldilocks {
-    point.iter().enumerate().fold(Goldilocks::ZERO, |v, (j, &p)| v + Goldilocks::from_u64(1u64 << j) * p)
+fn lookup_index_eval(point: &[Ef]) -> Ef {
+    point.iter().enumerate().fold(Ef::ZERO, |v, (j, &p)| v + ef_u64(1u64 << j) * p)
 }
 
 /// Prover-side fraction-tree root (the same addition tree `prove_fractional`
 /// builds). Used only for local fail-closed consistency checks; the verifier
 /// always derives roots by replaying the proof.
-fn fraction_root(mut num: Vec<Goldilocks>, mut den: Vec<Goldilocks>) -> Option<(Goldilocks, Goldilocks)> {
+fn fraction_root(mut num: Vec<Ef>, mut den: Vec<Ef>) -> Option<(Ef, Ef)> {
     if num.len() != den.len() || !num.len().is_power_of_two() || num.len() < 2 { return None; }
     while num.len() > 1 {
         let half = num.len() / 2;
         let (nl, nh) = num.split_at(half);
         let (dl, dh) = den.split_at(half);
-        let next_n: Vec<Goldilocks> = (0..half).map(|i| nl[i] * dh[i] + nh[i] * dl[i]).collect();
-        let next_d: Vec<Goldilocks> = (0..half).map(|i| dl[i] * dh[i]).collect();
+        let next_n: Vec<Ef> = (0..half).map(|i| nl[i] * dh[i] + nh[i] * dl[i]).collect();
+        let next_d: Vec<Ef> = (0..half).map(|i| dl[i] * dh[i]).collect();
         num = next_n;
         den = next_d;
     }
@@ -4704,9 +4689,9 @@ fn fraction_root(mut num: Vec<Goldilocks>, mut den: Vec<Goldilocks>) -> Option<(
 
 /// Virtual identity `eq(z,x) * (M(x) - sum_i m_i(x)) == 0` over the padded
 /// table domain. mles = [eq, M, m_0, ..., m_{k-1}].
-fn lookup_identity_terms(members: usize) -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    let mut terms = vec![(Goldilocks::ONE, vec![0usize, 1])];
+fn lookup_identity_terms(members: usize) -> Vec<(Ef, Vec<usize>)> {
+    let neg = Ef::ZERO - Ef::ONE;
+    let mut terms = vec![(Ef::ONE, vec![0usize, 1])];
     for i in 0..members { terms.push((neg, vec![0, i + 2])); }
     terms
 }
@@ -4726,7 +4711,7 @@ fn prove_lookup_groups(
     model: &TrustedModelManifest,
     transcript: &mut Transcript,
     aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>,
-    lookup_groups: &std::collections::BTreeMap<T, (Goldilocks, Goldilocks)>,
+    lookup_groups: &std::collections::BTreeMap<T, (Ef, Ef)>,
 ) -> Option<(Vec<LookupGroupProof>, std::collections::BTreeMap<T, LookupGroupProveCtx>)> {
     let groups = static_lookup_groups(ops, model)?;
     if groups.len() != lookup_groups.len()
@@ -4761,38 +4746,42 @@ fn prove_lookup_groups(
         transcript.absorb_u64(tid as u64);
         transcript.absorb_u64(members.len() as u64);
         for &oi in &members { transcript.absorb_u64(oi as u64); }
-        let z = transcript.field_vec(arity);
-        let eq = mle::eq_evals(&z);
-        let mut mles: Vec<&[Goldilocks]> = vec![&eq, &m_aux.columns[0]];
+        let z = transcript.ef_field_vec(arity);
+        let eq = efo::eq_evals(&z);
+        let m_aux_col = ef_lift(&m_aux.columns[0]);
+        let mut mles: Vec<&[Ef]> = vec![&eq, &m_aux_col];
+        let mut member_cols: Vec<Vec<Ef>> = Vec::with_capacity(members.len());
         for &oi in &members {
             let ma = aux.get(&(oi, AuxRole::LookupMultiplicity))?;
             if ma.descriptor.len != table_len || ma.descriptor.arity != arity || ma.columns.len() != 1
                 || ma.columns[0].len() != padded { return None; }
-            mles.push(&ma.columns[0]);
+            member_cols.push(ef_lift(&ma.columns[0]));
         }
+        for c in &member_cols { mles.push(c.as_slice()); }
         let terms = lookup_identity_terms(members.len());
-        let (identity, identity_point) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+        let (identity, identity_point) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
         if identity.final_evals.len() != members.len() + 2
-            || identity.final_evals[0] != mle::eq_poly(&z, &identity_point)
-            || virtual_eval(&terms, &identity.final_evals) != Goldilocks::ZERO { return None; }
+            || identity.final_evals[0] != ef_eq_poly(&z, &identity_point)
+            || efo::virtual_eval(&terms, &identity.final_evals) != Ef::ZERO { return None; }
         for (i, mle_col) in mles[1..].iter().enumerate() {
-            if identity.final_evals[1 + i] != mle::eval(mle_col, &identity_point) { return None; }
+            if identity.final_evals[1 + i] != efo::eval_ef_slice(mle_col, &identity_point)? { return None; }
         }
         transcript.absorb(b"zkie-lookup-group-table-v1");
         let m_agg: Vec<u64> = m_aux.columns[0].iter().map(|&v| to_i64(v) as u64).collect();
         let table_bytes = (table_values.len() * std::mem::size_of::<Goldilocks>()) as u64;
         store.o7_table_side_trees.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
-        let table_proof = prove_lookup_table(&m_agg, table_values, alpha, beta, transcript);
-        let (t_num_point, t_num, t_den_point, t_den) = fractional_leaf(&table_proof);
-        if t_num != mle::eval(&m_aux.columns[0], &t_num_point) { return None; }
-        let table_eval = mle::eval(table_values, &t_den_point);
+        let (table_num_tree, table_den_tree) = zkie_core::common::ef_logup::build_lookup_table_num_den(&m_agg, table_values, alpha, beta);
+        store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
+        let (table_final_num, table_final_den) = fraction_root(table_num_tree.clone(), table_den_tree.clone())?;
+        let table_proof = zkie_core::common::ef_logup::prove_fractional(
+            table_num_tree, table_den_tree, transcript);
+        let (t_num_point, t_num, t_den_point, t_den) = zkie_core::common::ef_logup::fractional_leaf(&table_proof);
+        if t_num != ef_eval(&m_aux.columns[0], &t_num_point) { return None; }
+        let table_eval = ef_eval(table_values, &t_den_point);
         store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
         if t_den != alpha + lookup_index_eval(&t_den_point) + beta * table_eval { return None; }
-        let (table_num_tree, table_den_tree) = build_lookup_table_num_den(&m_agg, table_values, alpha, beta);
-        store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
-        let (table_final_num, table_final_den) = fraction_root(table_num_tree, table_den_tree)?;
-        if table_final_den == Goldilocks::ZERO { return None; }
+        if table_final_den == Ef::ZERO { return None; }
         let aggregate_opening = open_aux(m_aux, &[0, 0],
             &[identity_point.clone(), t_num_point.clone()],
             &[identity.final_evals[1], t_num])?;
@@ -4800,7 +4789,7 @@ fn prove_lookup_groups(
             Some((_, committed)) => {
                 let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90,
                     zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90));
-                whir.open(committed.prover_data.clone(), &committed.protocol, &t_den_point)
+                whir.open_ef(committed.prover_data.clone(), &committed.protocol, &t_den_point)
             }
             None => {
                 let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
@@ -4810,7 +4799,7 @@ fn prove_lookup_groups(
                     != bincode::serialize(model.lookup_roots.get(&tid)?).ok()? { return None; }
                 store.o7_table_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
-                whir.open(committed.prover_data, &committed.protocol, &t_den_point)
+                whir.open_ef(committed.prover_data, &committed.protocol, &t_den_point)
             }
         };
         if opened != table_eval { return None; }
@@ -4846,7 +4835,7 @@ fn verify_lookup_groups(
     model: &TrustedModelManifest,
     transcript: &mut Transcript,
     aux: &[AuxDescriptor],
-    lookup_groups: &std::collections::BTreeMap<T, (Goldilocks, Goldilocks)>,
+    lookup_groups: &std::collections::BTreeMap<T, (Ef, Ef)>,
     proofs: &[LookupGroupProof],
 ) -> Option<std::collections::BTreeMap<T, LookupGroupVerifyCtx>> {
     let groups = static_lookup_groups(ops, model)?;
@@ -4869,20 +4858,19 @@ fn verify_lookup_groups(
         transcript.absorb_u64(tid as u64);
         transcript.absorb_u64(members.len() as u64);
         for &oi in &members { transcript.absorb_u64(oi as u64); }
-        let z = transcript.field_vec(arity);
+        let z = transcript.ef_field_vec(arity);
         let terms = lookup_identity_terms(members.len());
         let evals_len = members.len() + 2;
         if gp.identity.final_evals.len() != evals_len { return None; }
-        let (ok, identity_point, final_value) = verify_virtual(&gp.identity, &terms, Goldilocks::ZERO, arity, transcript);
-        if !ok || final_value != Goldilocks::ZERO { return None; }
-        if gp.identity.final_evals[0] != mle::eq_poly(&z, &identity_point)
-            || final_value != virtual_eval(&terms, &gp.identity.final_evals) { return None; }
+        let (ok, identity_point, final_value) = efo::verify_virtual(&gp.identity, &terms, Ef::ZERO, arity, transcript);
+        if !ok || final_value != Ef::ZERO { return None; }
+        if gp.identity.final_evals[0] != ef_eq_poly(&z, &identity_point)
+            || final_value != efo::virtual_eval(&terms, &gp.identity.final_evals) { return None; }
         transcript.absorb(b"zkie-lookup-group-table-v1");
-        let tc = verify_fractional_chain_core(&gp.table, arity, transcript)?;
-        if tc.final_den == Goldilocks::ZERO { return None; }
-        let (whir, protocol) = aux_batch_whir(m_desc)?;
-        if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &m_desc.commitment,
-            &protocol, 1, &[0, 0], &[identity_point.clone(), tc.q_num.clone()],
+        let tc = zkie_core::common::ef_logup::verify_fractional_chain_core(&gp.table, arity, transcript)?;
+        if tc.final_den == Ef::ZERO { return None; }
+        if !verify_aux_open(m_desc, &[0, 0],
+            &[identity_point.clone(), tc.q_num.clone()],
             &[gp.identity.final_evals[1], tc.num_leaf], &gp.aggregate_opening) { return None; }
         // Step (c): one table opening per group, at the shared denominator
         // leaf. The opened value is bound by the group leaf relation; the
@@ -4890,7 +4878,7 @@ fn verify_lookup_groups(
         let root = model.lookup_roots.get(&tid)?;
         let whir = verifier_whir(arity)?;
         let protocol = whir.opening_protocol(arity, 1);
-        let table_eval = whir.verify(root, &gp.table_opening, &protocol, &tc.q_den).ok()?;
+        let table_eval = whir.verify_ef(root, &gp.table_opening, &protocol, &tc.q_den).ok()?;
         if tc.den_leaf != alpha + lookup_index_eval(&tc.q_den) + beta * table_eval { return None; }
         ctxs.insert(tid, LookupGroupVerifyCtx {
             alpha, beta, members,
@@ -4909,12 +4897,12 @@ fn verify_lookup_groups(
 /// aggregated LogUp identity sum_i S_i == T (each witness tree root is
 /// w_i.final_num / w_i.final_den and the shared table tree root is
 /// t_num / t_den). For one member it reduces to the per-lookup cross-product.
-fn lookup_group_relation(roots: &[(Goldilocks, Goldilocks)], table_num: Goldilocks, table_den: Goldilocks) -> bool {
+fn lookup_group_relation(roots: &[(Ef, Ef)], table_num: Ef, table_den: Ef) -> bool {
     if roots.is_empty() { return false; }
-    if roots.iter().any(|&(_, d)| d == Goldilocks::ZERO) || table_den == Goldilocks::ZERO { return false; }
-    let mut den_prod = Goldilocks::ONE;
+    if roots.iter().any(|&(_, d)| d == Ef::ZERO) || table_den == Ef::ZERO { return false; }
+    let mut den_prod = Ef::ONE;
     for &(_, d) in roots { den_prod *= d; }
-    let mut num_sum = Goldilocks::ZERO;
+    let mut num_sum = Ef::ZERO;
     for i in 0..roots.len() {
         let mut term = roots[i].0;
         for (j, &(_, d)) in roots.iter().enumerate() {
@@ -4925,50 +4913,51 @@ fn lookup_group_relation(roots: &[(Goldilocks, Goldilocks)], table_num: Goldiloc
     num_sum * table_den == table_num * den_prod
 }
 
-fn lookup_prefix_eval(len: usize, point: &[Goldilocks]) -> Goldilocks {
-    if point.len() >= usize::BITS as usize { return Goldilocks::ZERO; }
-    if len >= (1usize << point.len()) { return Goldilocks::ONE; }
-    let mut equal = Goldilocks::ONE;
-    let mut less = Goldilocks::ZERO;
+fn lookup_prefix_eval(len: usize, point: &[Ef]) -> Ef {
+    if point.len() >= usize::BITS as usize { return Ef::ZERO; }
+    if len >= (1usize << point.len()) { return Ef::ONE; }
+    let mut equal = Ef::ONE;
+    let mut less = Ef::ZERO;
     for j in (0..point.len()).rev() {
         if ((len >> j) & 1) != 0 {
-            less += equal * (Goldilocks::ONE - point[j]);
+            less += equal * (Ef::ONE - point[j]);
             equal *= point[j];
         } else {
-            equal *= Goldilocks::ONE - point[j];
+            equal *= Ef::ONE - point[j];
         }
     }
     less
 }
 
-fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
+fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
     pairs: PreparedAux, multiplicity: PreparedAux, model: &TrustedModelManifest, dynamic_table: bool,
     group: Option<LookupGroupMemberProve<'_>>, transcript: &mut Transcript)
-    -> Option<(ReverseLookupProof, Vec<EvalClaim>, (Goldilocks, Goldilocks))>
+    -> Option<(ReverseLookupProof, Vec<EfClaim>, (Ef, Ef))>
 {
     let (idx, out, table_id) = match op { Op::Lookup { idx, out, table } => (*idx, *out, *table), _ => return None };
     let xs = store.idx.get(idx)?;
     let ys = store.get(out);
     if point.len() != pairs.descriptor.len.trailing_zeros() as usize { return None; }
-    let mut output_point = point.to_vec(); output_point.resize(pairs.descriptor.arity, Goldilocks::ZERO);
-    let output_index = mle::eval(&pairs.columns[0], &output_point);
-    if mle::eval(&pairs.columns[1], &output_point) != value { return None; }
-    transcript.absorb_field(output_index);
+    let mut output_point = point.to_vec(); output_point.resize(pairs.descriptor.arity, Ef::ZERO);
+    let output_index = ef_eval(&pairs.columns[0], &output_point);
+    if ef_eval(&pairs.columns[1], &output_point) != value { return None; }
+    transcript.absorb_ef(output_index);
     // Deep O7 (a): grouped static-lookup ops share the group (α, β) derived
     // before the reverse DAG; dynamic/identity/plain paths keep the per-op
     // squeeze (two field() calls at this position).
     let (alpha, beta) = match &group {
         Some(g) => (g.alpha, g.beta),
-        None => (transcript.field(), transcript.field()),
+        None => (transcript.ef_field(), transcript.ef_field()),
     };
     let (witness, _, _, w_num_col, w_den_col) =
-        prove_lookup_witness_batch_columns(&[xs.as_slice()], &[ys], alpha, beta, transcript);
+        zkie_core::common::ef_logup::prove_lookup_witness_batch_columns(
+            &[xs.as_slice()], &[ys], alpha, beta, transcript);
     let (w_final_num, w_final_den) = fraction_root(w_num_col, w_den_col)?;
-    if w_final_den == Goldilocks::ZERO { return None; }
-    let (w_num_point, w_num, w_den_point, w_den) = fractional_leaf(&witness);
+    if w_final_den == Ef::ZERO { return None; }
+    let (w_num_point, w_num, w_den_point, w_den) = zkie_core::common::ef_logup::fractional_leaf(&witness);
     if w_num != lookup_prefix_eval(xs.len(), &w_num_point) { return None; }
-    let witness_index = mle::eval(&pairs.columns[0], &w_den_point);
-    let witness_value = mle::eval(&pairs.columns[1], &w_den_point);
+    let witness_index = ef_eval(&pairs.columns[0], &w_den_point);
+    let witness_value = ef_eval(&pairs.columns[1], &w_den_point);
     if w_den != alpha + witness_index + beta * witness_value { return None; }
 
     // Deep O7 (b)/(c): grouped static lookup. The table-side fraction tree,
@@ -4977,13 +4966,14 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
     // and opens its own multiplicity column at the shared identity point.
     if let Some(g) = &group {
         if multiplicity.descriptor.columns != 1 || multiplicity.descriptor.arity != g.identity_point.len() { return None; }
-        transcript.absorb_fields(&[witness_index, witness_value, g.member_eval]);
-        let q = transcript.field_vec(multiplicity.descriptor.arity);
-        let eq = mle::eq_evals(&q);
-        let mut padding_mask = vec![Goldilocks::ZERO; multiplicity.columns[0].len()];
-        for v in padding_mask.iter_mut().skip(multiplicity.descriptor.len) { *v = Goldilocks::ONE; }
-        let padding_terms = vec![(Goldilocks::ONE, vec![0, 1, 2])];
-        let (padding, padding_point) = prove_virtual(&[&eq, &multiplicity.columns[0], &padding_mask], &padding_terms, Goldilocks::ZERO, transcript);
+        transcript.absorb_efs(&[witness_index, witness_value, g.member_eval]);
+        let q = transcript.ef_field_vec(multiplicity.descriptor.arity);
+        let eq = efo::eq_evals(&q);
+        let mult_cols = lift_columns(&multiplicity.columns);
+        let mut padding_mask = vec![Ef::ZERO; multiplicity.columns[0].len()];
+        for v in padding_mask.iter_mut().skip(multiplicity.descriptor.len) { *v = Ef::ONE; }
+        let padding_terms = vec![(Ef::ONE, vec![0, 1, 2])];
+        let (padding, padding_point) = efo::prove_virtual(&[&eq, &mult_cols[0], &padding_mask], &padding_terms, Ef::ZERO, transcript);
         let padding_value = padding.final_evals[1];
         let pair_idxs = [0, 1, 0, 1];
         let pair_points = vec![output_point.clone(), output_point.clone(), w_den_point.clone(), w_den_point];
@@ -4992,10 +4982,10 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
         let multiplicity_opening = open_aux(multiplicity, &[0, 0],
             &[g.identity_point.to_vec(), padding_point],
             &[g.member_eval, padding_value])?;
-        let mut claims = vec![EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index }];
+        let mut claims = vec![EfClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index }];
         let proof = ReverseLookupProof {
             witness,
-            table: FractionalProof { layers: Vec::new() },
+            table: EfFractionalProof { layers: Vec::new() },
             output_index,
             witness_index,
             witness_value,
@@ -5028,20 +5018,23 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
     let table_bytes = (table_values.len() * std::mem::size_of::<Goldilocks>()) as u64;
     store.o7_table_side_trees.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
-    let table = prove_lookup_table(&m, &table_values, alpha, beta, transcript);
-    let (t_num_point, t_num, t_den_point, t_den) = fractional_leaf(&table);
-    let mult_eval = mle::eval(&multiplicity.columns[0], &t_num_point);
-    let table_eval = mle::eval(&table_values, &t_den_point);
+    let (tnum, tden) = zkie_core::common::ef_logup::build_lookup_table_num_den(
+        &m, table_values, alpha, beta);
+    let table = zkie_core::common::ef_logup::prove_fractional(tnum, tden, transcript);
+    let (t_num_point, t_num, t_den_point, t_den) = zkie_core::common::ef_logup::fractional_leaf(&table);
+    let mult_eval = ef_eval(&multiplicity.columns[0], &t_num_point);
+    let table_eval = ef_eval(&table_values, &t_den_point);
     store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
     if t_num != mult_eval
         || t_den != alpha + lookup_index_eval(&t_den_point) + beta * table_eval { return None; }
-    transcript.absorb_fields(&[witness_index, witness_value, mult_eval, table_eval]);
-    let q = transcript.field_vec(multiplicity.descriptor.arity);
-    let eq = mle::eq_evals(&q);
-    let mut padding_mask = vec![Goldilocks::ZERO; multiplicity.columns[0].len()];
-    for v in padding_mask.iter_mut().skip(multiplicity.descriptor.len) { *v = Goldilocks::ONE; }
-    let padding_terms = vec![(Goldilocks::ONE, vec![0, 1, 2])];
-    let (padding, padding_point) = prove_virtual(&[&eq, &multiplicity.columns[0], &padding_mask], &padding_terms, Goldilocks::ZERO, transcript);
+    transcript.absorb_efs(&[witness_index, witness_value, mult_eval, table_eval]);
+    let q = transcript.ef_field_vec(multiplicity.descriptor.arity);
+    let eq = efo::eq_evals(&q);
+    let mult_cols = lift_columns(&multiplicity.columns);
+    let mut padding_mask = vec![Ef::ZERO; multiplicity.columns[0].len()];
+    for v in padding_mask.iter_mut().skip(multiplicity.descriptor.len) { *v = Ef::ONE; }
+    let padding_terms = vec![(Ef::ONE, vec![0, 1, 2])];
+    let (padding, padding_point) = efo::prove_virtual(&[&eq, &mult_cols[0], &padding_mask], &padding_terms, Ef::ZERO, transcript);
     let padding_value = padding.final_evals[1];
     let pair_idxs = [0, 1, 0, 1];
     let pair_points = vec![output_point.clone(), output_point.clone(), w_den_point.clone(), w_den_point];
@@ -5060,8 +5053,7 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
         let arity = values.len().trailing_zeros() as usize;
         let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
         let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
-        let (opening, opened) =
-            whir.open(committed.prover_data.clone(), &committed.protocol, &t_den_point);
+        let (opening, opened) = whir.open_ef(committed.prover_data.clone(), &committed.protocol, &t_den_point);
         if opened != table_eval { return None; }
         Some(opening)
     } else {
@@ -5072,43 +5064,43 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
         let arity = table_values.len().trailing_zeros() as usize;
         let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
         let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
-        let committed = zkie_core::pcs::committed::commit(&whir, &table_values);
+        let committed = zkie_core::pcs::committed::commit(&whir, table_values);
         if bincode::serialize(model.lookup_roots.get(&table_id)?).ok()? != bincode::serialize(&committed.commitment).ok()? { return None; }
-        let (opening, opened) = whir.open(committed.prover_data, &committed.protocol, &t_den_point);
+        let (opening, opened) = whir.open_ef(committed.prover_data, &committed.protocol, &t_den_point);
         if opened != table_eval { return None; }
         Some(opening)
     };
     if table_opening.is_some() {
         store.o7_table_openings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    let mut claims = vec![EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index }];
+    let mut claims = vec![EfClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index }];
     if dynamic_table {
-        claims.push(EvalClaim { tensor_id: TensorKey::Field(table_id).encoded()?, point: t_den_point, value: table_eval });
+        claims.push(EfClaim { tensor_id: TensorKey::Field(table_id).encoded()?, point: t_den_point, value: table_eval });
     }
     Some((ReverseLookupProof { witness, table, output_index, witness_index, witness_value, multiplicity: mult_eval, table_value: table_eval, padding, pairs_opening, multiplicity_opening, table_opening }, claims, (w_final_num, w_final_den)))
 }
 
-fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs: &AuxDescriptor,
+fn verify_reverse_lookup(op: &Op, point: &[Ef], value: Ef, pairs: &AuxDescriptor,
     multiplicity: &AuxDescriptor, model: &TrustedModelManifest, dynamic_table: bool,
     group: Option<LookupGroupMemberVerify<'_>>,
     proof: &ReverseLookupProof, transcript: &mut Transcript)
-    -> Option<(Vec<EvalClaim>, (Goldilocks, Goldilocks))>
+    -> Option<(Vec<EfClaim>, (Ef, Ef))>
 {
     let (idx, table_id) = match op { Op::Lookup { idx, table, .. } => (*idx, *table), _ => return None };
     if point.len() != pairs.len.trailing_zeros() as usize { return None; }
-    transcript.absorb_field(proof.output_index);
+    transcript.absorb_ef(proof.output_index);
     // Must match the prover: grouped static lookups use the pre-derived
     // group (α, β); other paths keep the per-op squeeze.
     let (alpha, beta) = match &group {
         Some(g) => (g.alpha, g.beta),
-        None => (transcript.field(), transcript.field()),
+        None => (transcript.ef_field(), transcript.ef_field()),
     };
-    let witness = verify_fractional_chain_core(&proof.witness, pairs.arity, transcript)?;
-    if witness.final_den == Goldilocks::ZERO
+    let witness = zkie_core::common::ef_logup::verify_fractional_chain_core(&proof.witness, pairs.arity, transcript)?;
+    if witness.final_den == Ef::ZERO
         || witness.num_leaf != lookup_prefix_eval(pairs.len, &witness.q_num)
         || witness.den_leaf != alpha + proof.witness_index + beta * proof.witness_value { return None; }
     let roots = (witness.final_num, witness.final_den);
-    let mut output_point = point.to_vec(); output_point.resize(pairs.arity, Goldilocks::ZERO);
+    let mut output_point = point.to_vec(); output_point.resize(pairs.arity, Ef::ZERO);
 
     if let Some(g) = &group {
         // Deep O7 (b): grouped op. The table-side tree is group-level, so the
@@ -5120,13 +5112,13 @@ fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs
             || proof.multiplicity != g.member_eval
             || proof.table_value != g.table_eval
             || proof.table_opening.is_some() { return None; }
-        transcript.absorb_fields(&[proof.witness_index, proof.witness_value, proof.multiplicity]);
+        transcript.absorb_efs(&[proof.witness_index, proof.witness_value, proof.multiplicity]);
         if proof.padding.final_evals.len() != 3 { return None; }
-        let q = transcript.field_vec(multiplicity.arity);
-        let padding_terms = vec![(Goldilocks::ONE, vec![0, 1, 2])];
-        let (ok, padding_point, padding_final) = verify_virtual(&proof.padding, &padding_terms, Goldilocks::ZERO, multiplicity.arity, transcript);
-        if !ok || padding_final != mle::eq_poly(&q, &padding_point) * proof.padding.final_evals[1]
-            * (Goldilocks::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) { return None; }
+        let q = transcript.ef_field_vec(multiplicity.arity);
+        let padding_terms = vec![(Ef::ONE, vec![0, 1, 2])];
+        let (ok, padding_point, padding_final) = efo::verify_virtual(&proof.padding, &padding_terms, Ef::ZERO, multiplicity.arity, transcript);
+        if !ok || padding_final != ef_eq_poly(&q, &padding_point) * proof.padding.final_evals[1]
+            * (Ef::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) { return None; }
         let points = vec![output_point.clone(), output_point, witness.q_den.clone(), witness.q_den];
         let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
         if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
@@ -5135,22 +5127,22 @@ fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs
                 &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) { return None; }
         // Step (c): no per-member table opening; the group already verified
         // the single opening and checked the shared leaf relation.
-        let claims = vec![EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: proof.output_index }];
+        let claims = vec![EfClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: proof.output_index }];
         return Some((claims, roots));
     }
 
-    let table = verify_fractional_chain_core(&proof.table, multiplicity.arity, transcript)?;
-    if table.final_den == Goldilocks::ZERO
+    let table = zkie_core::common::ef_logup::verify_fractional_chain_core(&proof.table, multiplicity.arity, transcript)?;
+    if table.final_den == Ef::ZERO
         || witness.final_num * table.final_den != table.final_num * witness.final_den
         || table.num_leaf != proof.multiplicity
         || table.den_leaf != alpha + lookup_index_eval(&table.q_den) + beta * proof.table_value { return None; }
-    transcript.absorb_fields(&[proof.witness_index, proof.witness_value, proof.multiplicity, proof.table_value]);
+    transcript.absorb_efs(&[proof.witness_index, proof.witness_value, proof.multiplicity, proof.table_value]);
     if proof.padding.final_evals.len() != 3 { return None; }
-    let q = transcript.field_vec(multiplicity.arity);
-    let padding_terms = vec![(Goldilocks::ONE, vec![0, 1, 2])];
-    let (ok, padding_point, padding_final) = verify_virtual(&proof.padding, &padding_terms, Goldilocks::ZERO, multiplicity.arity, transcript);
-    if !ok || padding_final != mle::eq_poly(&q, &padding_point) * proof.padding.final_evals[1]
-        * (Goldilocks::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) { return None; }
+    let q = transcript.ef_field_vec(multiplicity.arity);
+    let padding_terms = vec![(Ef::ONE, vec![0, 1, 2])];
+    let (ok, padding_point, padding_final) = efo::verify_virtual(&proof.padding, &padding_terms, Ef::ZERO, multiplicity.arity, transcript);
+    if !ok || padding_final != ef_eq_poly(&q, &padding_point) * proof.padding.final_evals[1]
+        * (Ef::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) { return None; }
     let points = vec![output_point.clone(), output_point, witness.q_den.clone(), witness.q_den];
     let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
     if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
@@ -5165,17 +5157,17 @@ fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs
         let opening = proof.table_opening.as_ref()?;
         let whir = verifier_whir(multiplicity.arity)?;
         let protocol = whir.opening_protocol(multiplicity.arity, 1);
-        if whir.verify(root, opening, &protocol, &table.q_den).ok() != Some(proof.table_value) { return None; }
+        if whir.verify_ef(root, opening, &protocol, &table.q_den).ok() != Some(proof.table_value) { return None; }
     }
-    let mut claims = vec![EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: proof.output_index }];
+    let mut claims = vec![EfClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: proof.output_index }];
     if dynamic_table {
-        claims.push(EvalClaim { tensor_id: TensorKey::Field(table_id).encoded()?, point: table.q_den.clone(), value: proof.table_value });
+        claims.push(EfClaim { tensor_id: TensorKey::Field(table_id).encoded()?, point: table.q_den.clone(), value: proof.table_value });
     }
     Some((claims, roots))
 }
 
-fn prove_reverse_projection(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
-    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseProjectionProof, Vec<EvalClaim>)>
+fn prove_reverse_projection(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseProjectionProof, Vec<EfClaim>)>
 {
     let (x, w, bias, out, m, k, n, shift) = match op {
         Op::Projection { x, w, bias, out, m, k, n, shift, .. } => {
@@ -5187,12 +5179,12 @@ fn prove_reverse_projection(store: &Store, op: &Op, point: &[Goldilocks], value:
     let nl = n.trailing_zeros() as usize;
     if point.len() != nl + m.trailing_zeros() as usize { return None; }
     let (v, u) = point.split_at(nl);
-    let mut padded_point = point.to_vec(); padded_point.resize(aux.descriptor.arity, Goldilocks::ZERO);
-    let bit_evals: Vec<_> = aux.columns.iter().map(|c| mle::eval(c, &padded_point)).collect();
-    let remainder = bit_evals.iter().enumerate().fold(Goldilocks::ZERO, |acc, (j, &b)| acc + Goldilocks::from_u64(1u64 << j) * b);
-    let bias_eval = mle::eval(store.get(bias), point);
-    transcript.absorb_field(bias_eval);
-    transcript.absorb_fields(&bit_evals);
+    let mut padded_point = point.to_vec(); padded_point.resize(aux.descriptor.arity, Ef::ZERO);
+    let bit_evals: Vec<_> = aux.columns.iter().map(|c| ef_eval(c, &padded_point)).collect();
+    let remainder = bit_evals.iter().enumerate().fold(Ef::ZERO, |acc, (j, &b)| acc + ef_u64(1u64 << j) * b);
+    let bias_eval = ef_eval(store.get(bias), point);
+    transcript.absorb_ef(bias_eval);
+    transcript.absorb_efs(&bit_evals);
     // O6: reuse the forward `x @ w` product when the bound prover cached it
     // (bounded by the store's byte budget); otherwise recompute (controlled
     // fallback). The weight is materialized once and shared by both uses.
@@ -5211,35 +5203,34 @@ fn prove_reverse_projection(store: &Store, op: &Op, point: &[Goldilocks], value:
         }
     };
     let at = transpose(store.get(x), m, k);
-    let (matmul, ch) = matmul_prove(&at, wv.as_ref(), h, m, k, n, u, v, transcript);
-    let half = Goldilocks::from_u64(1u64 << (shift - 1));
-    let scale = Goldilocks::from_u64(1u64 << shift);
+    let (matmul, ch) = zkie_core::common::ef_matmul::prove(&at, wv.as_ref(), h, m, k, n, u, v, transcript);
+    let half = ef_u64(1u64 << (shift - 1));
+    let scale = ef_u64(1u64 << shift);
     if matmul.claimed - remainder + half != scale * (value - bias_eval) { return None; }
-    transcript.absorb_field(matmul.sumcheck.f_eval);
-    transcript.absorb_field(matmul.sumcheck.h_eval);
-    let q = transcript.field_vec(aux.descriptor.arity);
-    let gamma = transcript.field();
-    let eq = mle::eq_evals(&q);
-    let mut mles: Vec<&[Goldilocks]> = vec![&eq];
-    mles.extend(aux.columns.iter().map(Vec::as_slice));
+    transcript.absorb_ef(matmul.sumcheck.f_eval);
+    transcript.absorb_ef(matmul.sumcheck.h_eval);
+    let q = transcript.ef_field_vec(aux.descriptor.arity);
+    let gamma = transcript.ef_field();
+    let eq = efo::eq_evals(&q);
+    let aux_ef = lift_columns(&aux.columns);
+    let mut mles: Vec<&[Ef]> = vec![&eq];
+    mles.extend(aux_ef.iter().map(Vec::as_slice));
     let terms = projection_boolean_terms(aux.descriptor.columns, gamma);
-    let (booleanity, bool_point) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    let (booleanity, bool_point) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
     let mut idxs: Vec<usize> = (0..aux.descriptor.columns).collect();
     idxs.extend(0..aux.descriptor.columns);
     let mut points = vec![padded_point; aux.descriptor.columns];
     points.extend((0..aux.descriptor.columns).map(|_| bool_point.clone()));
     let mut values = bit_evals.clone(); values.extend_from_slice(&booleanity.final_evals[1..]);
-    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&i| aux.columns[i].clone()).collect();
-    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: aux.descriptor.commitment.clone(), prover_data: aux.prover_data, protocol: aux.protocol, whir: aux.whir, num_tables: aux.descriptor.columns };
-    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+    let opening = open_aux(aux, &idxs, &points, &values)?;
     let mut xp = ch.clone(); xp.extend_from_slice(u);
     let mut wp = v.to_vec(); wp.extend_from_slice(&ch);
-    let leaves = vec![EvalClaim { tensor_id: x, point: xp, value: matmul.sumcheck.f_eval }, EvalClaim { tensor_id: w, point: wp, value: matmul.sumcheck.h_eval }, EvalClaim { tensor_id: bias, point: point.to_vec(), value: bias_eval }];
+    let leaves = vec![EfClaim { tensor_id: x, point: xp, value: matmul.sumcheck.f_eval }, EfClaim { tensor_id: w, point: wp, value: matmul.sumcheck.h_eval }, EfClaim { tensor_id: bias, point: point.to_vec(), value: bias_eval }];
     Some((ReverseProjectionProof { matmul, bias: bias_eval, remainder_bits: bit_evals, booleanity, opening }, leaves))
 }
 
-fn verify_reverse_projection(op: &Op, point: &[Goldilocks], value: Goldilocks, aux: &AuxDescriptor,
-    proof: &ReverseProjectionProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+fn verify_reverse_projection(op: &Op, point: &[Ef], value: Ef, aux: &AuxDescriptor,
+    proof: &ReverseProjectionProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
 {
     let (x, w, bias, m, k, n, shift) = match op {
         Op::Projection { x, w, bias, m, k, n, shift, .. } => (*x, *w, *bias, *m, *k, *n, *shift),
@@ -5250,37 +5241,37 @@ fn verify_reverse_projection(op: &Op, point: &[Goldilocks], value: Goldilocks, a
     let nl = n.trailing_zeros() as usize;
     if point.len() != nl + m.trailing_zeros() as usize { return None; }
     let (v, u) = point.split_at(nl);
-    let remainder = proof.remainder_bits.iter().enumerate().fold(Goldilocks::ZERO, |acc, (j, &b)| acc + Goldilocks::from_u64(1u64 << j) * b);
-    transcript.absorb_field(proof.bias);
-    transcript.absorb_fields(&proof.remainder_bits);
-    let (ok, ch) = matmul_verify(&proof.matmul, k.trailing_zeros() as usize, transcript);
-    if !ok || proof.matmul.claimed - remainder + Goldilocks::from_u64(1u64 << (shift - 1)) != Goldilocks::from_u64(1u64 << shift) * (value - proof.bias) { return None; }
-    transcript.absorb_field(proof.matmul.sumcheck.f_eval);
-    transcript.absorb_field(proof.matmul.sumcheck.h_eval);
-    let q = transcript.field_vec(aux.arity);
-    let gamma = transcript.field();
+    let remainder = proof.remainder_bits.iter().enumerate().fold(Ef::ZERO, |acc, (j, &b)| acc + ef_u64(1u64 << j) * b);
+    transcript.absorb_ef(proof.bias);
+    transcript.absorb_efs(&proof.remainder_bits);
+    let (ok, ch) = zkie_core::common::ef_matmul::verify(&proof.matmul, k.trailing_zeros() as usize, transcript);
+    if !ok || proof.matmul.claimed - remainder + ef_u64(1u64 << (shift - 1)) != ef_u64(1u64 << shift) * (value - proof.bias) { return None; }
+    transcript.absorb_ef(proof.matmul.sumcheck.f_eval);
+    transcript.absorb_ef(proof.matmul.sumcheck.h_eval);
+    let q = transcript.ef_field_vec(aux.arity);
+    let gamma = transcript.ef_field();
     let terms = projection_boolean_terms(aux.columns, gamma);
-    let (ok, bool_point, final_value) = verify_virtual(&proof.booleanity, &terms, Goldilocks::ZERO, aux.arity, transcript);
+    let (ok, bool_point, final_value) = efo::verify_virtual(&proof.booleanity, &terms, Ef::ZERO, aux.arity, transcript);
     if !ok { return None; }
-    let mut evals = proof.booleanity.final_evals.clone(); evals[0] = mle::eq_poly(&q, &bool_point);
-    if final_value != virtual_eval(&terms, &evals) { return None; }
+    let mut evals = proof.booleanity.final_evals.clone(); evals[0] = ef_eq_poly(&q, &bool_point);
+    if final_value != efo::virtual_eval(&terms, &evals) { return None; }
     let padded = 1usize.checked_shl(aux.arity as u32)?;
     let vars = aux.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
     let whir = verifier_whir(vars)?;
     let protocol = whir.batch_opening_protocol(aux.columns, aux.arity);
-    let mut padded_point = point.to_vec(); padded_point.resize(aux.arity, Goldilocks::ZERO);
+    let mut padded_point = point.to_vec(); padded_point.resize(aux.arity, Ef::ZERO);
     let mut idxs: Vec<usize> = (0..aux.columns).collect(); idxs.extend(0..aux.columns);
     let mut points = vec![padded_point; aux.columns]; points.extend((0..aux.columns).map(|_| bool_point.clone()));
     let mut values = proof.remainder_bits.clone(); values.extend_from_slice(&proof.booleanity.final_evals[1..]);
-    if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &aux.commitment, &protocol, aux.columns, &idxs, &points, &values, &proof.opening) { return None; }
+    if !verify_aux_open(aux, &idxs, &points, &values, &proof.opening) { return None; }
     let mut xp = ch.clone(); xp.extend_from_slice(u);
     let mut wp = v.to_vec(); wp.extend_from_slice(&ch);
-    Some(vec![EvalClaim { tensor_id: x, point: xp, value: proof.matmul.sumcheck.f_eval }, EvalClaim { tensor_id: w, point: wp, value: proof.matmul.sumcheck.h_eval }, EvalClaim { tensor_id: bias, point: point.to_vec(), value: proof.bias }])
+    Some(vec![EfClaim { tensor_id: x, point: xp, value: proof.matmul.sumcheck.f_eval }, EfClaim { tensor_id: w, point: wp, value: proof.matmul.sumcheck.h_eval }, EfClaim { tensor_id: bias, point: point.to_vec(), value: proof.bias }])
 }
 
-fn prove_reverse_relu(input: &[Goldilocks], point: &[Goldilocks], value: Goldilocks,
+fn prove_reverse_relu(input: &[Goldilocks], point: &[Ef], value: Ef,
     bits: usize, transcript: &mut Transcript)
-    -> Option<(ReverseReluProof, Vec<(Vec<Goldilocks>, Goldilocks)>)>
+    -> Option<(ReverseReluProof, Vec<(Vec<Ef>, Ef)>)>
 {
     if bits < 2 || bits > 31 { return None; }
     let bound = 1i64 << (bits - 1);
@@ -5298,7 +5289,7 @@ fn prove_reverse_relu(input: &[Goldilocks], point: &[Goldilocks], value: Goldilo
         let encoded = (signed + bound) as u64;
         for j in 0..bits { bit_cols[j][i] = Goldilocks::from_u64((encoded >> j) & 1); }
     }
-    if mle::eval(&output_values, point) != value { return None; }
+    if ef_eval(&output_values, point) != value { return None; }
     let num_vars = bits.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
     let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
     let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
@@ -5306,34 +5297,41 @@ fn prove_reverse_relu(input: &[Goldilocks], point: &[Goldilocks], value: Goldilo
     let (commitment, prover_data, protocol, batch_whir) = whir.commit_batch(&refs);
     transcript.absorb(b"zkie-relu-bits-v1");
     transcript.absorb(&bincode::serialize(&commitment).ok()?);
-    let mut padded_point = point.to_vec(); padded_point.resize(arity, Goldilocks::ZERO);
-    let eq = mle::eq_evals(&padded_point);
-    let terms_out = vec![(Goldilocks::ONE, vec![0, 1, 2])];
-    let (output, out_point) = prove_virtual(&[&eq, &x, &bit_cols[bits - 1]], &terms_out, value, transcript);
-    transcript.absorb_fields(&output.final_evals);
-    let q = transcript.field_vec(arity);
-    let gamma = transcript.field();
-    let eq_range = mle::eq_evals(&q);
-    let mut mles: Vec<&[Goldilocks]> = vec![&eq_range, &x];
-    mles.extend(bit_cols.iter().map(Vec::as_slice));
+    let mut padded_point = point.to_vec(); padded_point.resize(arity, Ef::ZERO);
+    let eq = efo::eq_evals(&padded_point);
+    let x_ef = ef_lift(&x);
+    let bit_cols_ef = lift_columns(&bit_cols);
+    let terms_out = vec![(Ef::ONE, vec![0, 1, 2])];
+    let (output, out_point) = efo::prove_virtual(&[&eq, &x_ef, &bit_cols_ef[bits - 1]], &terms_out, value, transcript);
+    transcript.absorb_efs(&output.final_evals);
+    let q = transcript.ef_field_vec(arity);
+    let gamma = transcript.ef_field();
+    let eq_range = efo::eq_evals(&q);
+    let mut mles: Vec<&[Ef]> = vec![&eq_range, &x_ef];
+    mles.extend(bit_cols_ef.iter().map(Vec::as_slice));
     let terms_range = relu_range_terms(gamma, bits);
-    let (range, range_point) = prove_virtual(&mles, &terms_range, Goldilocks::ZERO, transcript);
+    let (range, range_point) = efo::prove_virtual(&mles, &terms_range, Ef::ZERO, transcript);
     let mut idxs = vec![bits - 1];
     idxs.extend(0..bits);
     let mut points = vec![out_point.clone()];
     points.extend((0..bits).map(|_| range_point.clone()));
     let mut values = vec![output.final_evals[2]];
     values.extend_from_slice(&range.final_evals[2..]);
-    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&j| bit_cols[j].clone()).collect();
-    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: commitment.clone(), prover_data, protocol, whir: batch_whir, num_tables: bits };
-    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+    // The batch contract wants one tensor per unique table, first-appearance
+    // order: bits-1 first, then 0..bits-1.
+    let mut unique = vec![bits - 1];
+    unique.extend(0..(bits - 1));
+    let tensors: Vec<Vec<Goldilocks>> = unique.iter().map(|&j| bit_cols[j].clone()).collect();
+    let opening = prove_batch_open_committed_ef(
+        &batch_whir, &commitment, &protocol, bits, prover_data,
+        &idxs, tensors, &points, &values).ok()?;
     let claims = vec![unpad_relu_claim(&out_point, output.final_evals[1], input_arity)?, unpad_relu_claim(&range_point, range.final_evals[1], input_arity)?];
     Some((ReverseReluProof { arity, bit_commitment: commitment, output, range, bit_opening: opening }, claims))
 }
 
-fn verify_reverse_relu(proof: &ReverseReluProof, point: &[Goldilocks], value: Goldilocks,
+fn verify_reverse_relu(proof: &ReverseReluProof, point: &[Ef], value: Ef,
     bits: usize, transcript: &mut Transcript)
-    -> Option<Vec<(Vec<Goldilocks>, Goldilocks)>>
+    -> Option<Vec<(Vec<Ef>, Ef)>>
 {
     if bits < 2 || bits > 31 { return None; }
     let bound = 1i64 << (bits - 1);
@@ -5343,39 +5341,39 @@ fn verify_reverse_relu(proof: &ReverseReluProof, point: &[Goldilocks], value: Go
     let len = 1usize.checked_shl(proof.arity as u32)?;
     transcript.absorb(b"zkie-relu-bits-v1");
     transcript.absorb(&bincode::serialize(&proof.bit_commitment).ok()?);
-    let mut padded_point = point.to_vec(); padded_point.resize(proof.arity, Goldilocks::ZERO);
-    let terms_out = vec![(Goldilocks::ONE, vec![0, 1, 2])];
-    let (ok, out_point, final_out) = verify_virtual(&proof.output, &terms_out, value, proof.arity, transcript);
-    if !ok || final_out != mle::eq_poly(&padded_point, &out_point) * proof.output.final_evals[1] * proof.output.final_evals[2] { return None; }
-    transcript.absorb_fields(&proof.output.final_evals);
-    let q = transcript.field_vec(proof.arity);
-    let gamma = transcript.field();
+    let mut padded_point = point.to_vec(); padded_point.resize(proof.arity, Ef::ZERO);
+    let terms_out = vec![(Ef::ONE, vec![0, 1, 2])];
+    let (ok, out_point, final_out) = efo::verify_virtual(&proof.output, &terms_out, value, proof.arity, transcript);
+    if !ok || final_out != ef_eq_poly(&padded_point, &out_point) * proof.output.final_evals[1] * proof.output.final_evals[2] { return None; }
+    transcript.absorb_efs(&proof.output.final_evals);
+    let q = transcript.ef_field_vec(proof.arity);
+    let gamma = transcript.ef_field();
     let terms_range = relu_range_terms(gamma, bits);
-    let (ok, range_point, final_range) = verify_virtual(&proof.range, &terms_range, Goldilocks::ZERO, proof.arity, transcript);
+    let (ok, range_point, final_range) = efo::verify_virtual(&proof.range, &terms_range, Ef::ZERO, proof.arity, transcript);
     if !ok { return None; }
     let mut evals = proof.range.final_evals.clone();
-    evals[0] = mle::eq_poly(&q, &range_point);
-    if final_range != virtual_eval(&terms_range, &evals) { return None; }
+    evals[0] = ef_eq_poly(&q, &range_point);
+    if final_range != efo::virtual_eval(&terms_range, &evals) { return None; }
     let num_vars = bits.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
     let whir = verifier_whir(num_vars)?;
     let protocol = whir.batch_opening_protocol(bits, proof.arity);
     let mut idxs = vec![bits - 1]; idxs.extend(0..bits);
     let mut points = vec![out_point.clone()]; points.extend((0..bits).map(|_| range_point.clone()));
     let mut values = vec![proof.output.final_evals[2]]; values.extend_from_slice(&proof.range.final_evals[2..]);
-    if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &proof.bit_commitment, &protocol, bits, &idxs, &points, &values, &proof.bit_opening) { return None; }
+    if !verify_batch_open_committed_ef(&whir, &proof.bit_commitment, &protocol, bits, &idxs, &points, &values, &proof.bit_opening) { return None; }
     Some(vec![unpad_relu_claim(&out_point, proof.output.final_evals[1], input_arity)?, unpad_relu_claim(&range_point, proof.range.final_evals[1], input_arity)?])
 }
 
-fn absorb_reverse_claim(transcript: &mut Transcript, id: T, point: &[Goldilocks], value: Goldilocks) {
+fn absorb_reverse_claim(transcript: &mut Transcript, id: T, point: &[Ef], value: Ef) {
     transcript.absorb(b"zkie-reverse-claim-v1");
     transcript.absorb_u64(id as u64);
     transcript.absorb_u64(point.len() as u64);
-    transcript.absorb_fields(point);
-    transcript.absorb_field(value);
+    transcript.absorb_efs(point);
+    transcript.absorb_ef(value);
 }
 
-fn reverse_setup(ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript)
-    -> Option<std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>>>
+fn reverse_setup(ops: &[Op], seeds: &[EfClaim], transcript: &mut Transcript)
+    -> Option<std::collections::BTreeMap<T, Vec<(Vec<Ef>, Ef)>>>
 {
     let mut producers = std::collections::BTreeMap::new();
     for (i, op) in ops.iter().enumerate() {
@@ -5391,24 +5389,24 @@ fn reverse_setup(ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript)
     transcript.absorb(b"zkie-reverse-dag-v1");
     absorb_statement(transcript, ops, ops.len());
     transcript.absorb_u64(seeds.len() as u64);
-    let mut claims = std::collections::BTreeMap::<T, Vec<(Vec<Goldilocks>, Goldilocks)>>::new();
+    let mut claims = std::collections::BTreeMap::<T, Vec<(Vec<Ef>, Ef)>>::new();
     for c in seeds {
         transcript.absorb_u64(c.tensor_id as u64);
         transcript.absorb_u64(c.point.len() as u64);
-        transcript.absorb_fields(&c.point);
-        transcript.absorb_field(c.value);
+        transcript.absorb_efs(&c.point);
+        transcript.absorb_ef(c.value);
         claims.entry(c.tensor_id).or_default().push((c.point.clone(), c.value));
     }
     Some(claims)
 }
 
-pub fn prove_reverse_dag(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript) -> Option<ReverseDagProof> {
+pub fn prove_reverse_dag(store: &Store, ops: &[Op], seeds: &[EfClaim], transcript: &mut Transcript) -> Option<ReverseDagProof> {
     prove_reverse_dag_inner(store, ops, seeds, transcript, &mut std::collections::BTreeMap::new(), None, None, None, &std::collections::BTreeMap::new())
         .map(|(proof, _leaves)| proof)
 }
 
 
-fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>, lookup_groups: &std::collections::BTreeMap<T, (Goldilocks, Goldilocks)>) -> Option<(ReverseDagProof, Vec<EvalClaim>)> {
+fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>, lookup_groups: &std::collections::BTreeMap<T, (Ef, Ef)>) -> Option<(ReverseDagProof, Vec<EfClaim>)> {
     let replayed = execution.and_then(|e| replay_index_columns(ops, e));
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
@@ -5421,7 +5419,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
     } else {
         prove_lookup_groups(store, ops, model?, transcript, aux, lookup_groups)?
     };
-    let mut group_roots: std::collections::BTreeMap<T, Vec<(Goldilocks, Goldilocks)>> =
+    let mut group_roots: std::collections::BTreeMap<T, Vec<(Ef, Ef)>> =
         std::collections::BTreeMap::new();
     let mut steps = Vec::new();
     for (op_index, op) in ops.iter().enumerate().rev() {
@@ -5430,7 +5428,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
             let cs = match claims.remove(&id) { Some(c) => c, None => continue };
             transcript.absorb_u64(id as u64);
             let (merge, point, value) = if cs.len() == 1 { (None, cs[0].0.clone(), cs[0].1) } else {
-                let (p, v) = prove_same_poly(reverse_tensor_values(store, id)?.as_ref(), &cs, transcript);
+                let (p, v) = efo::prove_same_poly(reverse_tensor_values(store, id)?.as_ref(), &cs, transcript);
                 let point = p.merged_point.clone();
                 (Some(p), point, v)
             };
@@ -5520,7 +5518,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::Scale { proof }
             }
             Op::Argmax { .. } => {
-                let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
+                let pairs: Vec<(T, Vec<Ef>, Ef)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
                 let prepared_aux = aux.remove(&(op_index, AuxRole::ArgmaxWitness))?;
                 let reduced = prove_reverse_argmax(store, op, &pairs, prepared_aux, transcript);
                 let (proof, incoming) = reduced?;
@@ -5531,7 +5529,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::Argmax { proof }
             }
             Op::GatherMatMul { .. } => {
-                let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
+                let pairs: Vec<(T, Vec<Ef>, Ef)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
                 let prepared_aux = aux.remove(&(op_index, AuxRole::ExpertRouting))?;
                 let (proof, incoming) = prove_reverse_gather_matmul(store, op, &pairs, prepared_aux, transcript)?;
                 for c in incoming {
@@ -5552,7 +5550,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::Gather { proof }
             }
             Op::TopKSelect { .. } => {
-                let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter()
+                let pairs: Vec<(T, Vec<Ef>, Ef)> = out_claims.iter()
                     .map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
                 let witness = aux.remove(&(op_index, AuxRole::TopKSelectWitness))?;
                 let thr_aux = aux.remove(&(op_index, AuxRole::TopKSelectThr))?;
@@ -5568,7 +5566,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::TopKSelect { proof }
             }
             Op::Scatter { .. } => {
-                let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter()
+                let pairs: Vec<(T, Vec<Ef>, Ef)> = out_claims.iter()
                     .map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
                 let auxp = aux.remove(&(op_index, AuxRole::ScatterRouting))?;
                 let order_auxp = aux.remove(&(op_index, AuxRole::ScatterOrder))?;
@@ -5625,7 +5623,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 } else {
                     let av = idx_eval(store, *a, &point)?;
                     let bv = idx_eval(store, *b, &point)?;
-                    if Goldilocks::from_u64(*scale as u64) * av + bv != value { return None; }
+                    if ef_u64(*scale as u64) * av + bv != value { return None; }
                     let certified_out = certified.map_or(false, |c| c.contains(&out_key));
                     if !certified_out {
                         // S7c bound path: the input claims are authenticated
@@ -5661,7 +5659,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                     if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
                     let bv = idx_eval(store, *base, r_hi)?;
                     let jval = mle_integer(&point[..b_log]);
-                    if value != Goldilocks::from_u64(*b as u64) * bv + jval { return None; }
+                    if value != ef_u64(*b as u64) * bv + jval { return None; }
                     bv
                 };
                 let key = TensorKey::Index(*base).encoded()?;
@@ -5681,7 +5679,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 let lb = base_len.checked_next_power_of_two()?.trailing_zeros() as usize;
                 if point.len() < lb { return None; }
                 let f = zero_ext_factor(&point, lb);
-                if f == Goldilocks::ZERO { return None; }
+                if f == Ef::ZERO { return None; }
                 let r_trunc = &point[..lb];
                 let bv = idx_eval(store, *base, r_trunc)?;
                 if value != f * bv { return None; }
@@ -5699,8 +5697,8 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::Relu { proof }
             }
             Op::Add { a, b, .. } => {
-                let av = mle::eval(store.get(*a), &point);
-                let bv = mle::eval(store.get(*b), &point);
+                let av = ef_eval(store.get(*a), &point);
+                let bv = ef_eval(store.get(*b), &point);
                 if av + bv != value { return None; }
                 absorb_reverse_claim(transcript, *a, &point, av);
                 absorb_reverse_claim(transcript, *b, &point, bv);
@@ -5715,7 +5713,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 let (v, u) = point.split_at(nl);
                 let at = transpose(store.get(*a), *m, *k);
                 let bv = store.materialize(*b);
-                let (proof, ch) = matmul_prove(&at, bv.as_ref(), store.get(*c), *m, *k, *n, u, v, transcript);
+                let (proof, ch) = zkie_core::common::ef_matmul::prove(&at, bv.as_ref(), store.get(*c), *m, *k, *n, u, v, transcript);
                 if proof.claimed != value { return None; }
                 let mut ap = ch.clone(); ap.extend_from_slice(u);
                 let mut bp = v.to_vec(); bp.extend_from_slice(&ch);
@@ -5751,16 +5749,16 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
     // needs that replay just to collect them. No transcript or proof bytes
     // change (the replay was read-only).
     let leaves = claims.into_iter().flat_map(|(tensor_id, cs)| {
-        cs.into_iter().map(move |(point, value)| EvalClaim { tensor_id, point, value })
+        cs.into_iter().map(move |(point, value)| EfClaim { tensor_id, point, value })
     }).collect();
     Some((ReverseDagProof { steps }, leaves))
 }
 
-pub fn verify_reverse_dag(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>> {
+pub fn verify_reverse_dag(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>> {
     verify_reverse_dag_inner(ops, seeds, proof, transcript, &[], None, None, None, &std::collections::BTreeMap::new())
 }
 
-fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript, aux: &[AuxDescriptor], model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>, lookup_groups: &std::collections::BTreeMap<T, (Goldilocks, Goldilocks)>) -> Option<Vec<EvalClaim>> {
+fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagProof, transcript: &mut Transcript, aux: &[AuxDescriptor], model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>, lookup_groups: &std::collections::BTreeMap<T, (Ef, Ef)>) -> Option<Vec<EfClaim>> {
     let replayed = execution.and_then(|e| replay_index_columns(ops, e));
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
@@ -5788,7 +5786,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
     } else {
         verify_lookup_groups(ops, model?, transcript, aux, lookup_groups, group_proofs)?
     };
-    let mut group_roots: std::collections::BTreeMap<T, Vec<(Goldilocks, Goldilocks)>> =
+    let mut group_roots: std::collections::BTreeMap<T, Vec<(Ef, Ef)>> =
         std::collections::BTreeMap::new();
     let mut steps = step_slice.iter();
     for (op_index, op) in ops.iter().enumerate().rev() {
@@ -5801,16 +5799,16 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
         let step = steps.next()?;
         if step.outputs.len() != local.len() { return None; }
         let mut point = Vec::new();
-        let mut value = Goldilocks::ZERO;
+        let mut value = Ef::ZERO;
         let mut first = true;
-        let mut merged_out: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
+        let mut merged_out: Vec<(T, Vec<Ef>, Ef)> = Vec::new();
         for (id, cs) in local {
             let stored = step.outputs.iter().find(|o| o.tensor_id == id)?;
             transcript.absorb_u64(id as u64);
             let (p, v) = if cs.len() == 1 {
                 if stored.merge.is_some() { return None; }
                 cs[0].clone()
-            } else { verify_same_poly(stored.merge.as_ref()?, &cs, transcript)? };
+            } else { efo::verify_same_poly(stored.merge.as_ref()?, &cs, transcript)? };
             if stored.point != p || stored.value != v { return None; }
             absorb_reverse_claim(transcript, id, &p, v);
             merged_out.push((id, p.clone(), v));
@@ -5954,7 +5952,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 } else {
                     let certified_out = certified.map_or(false, |c| c.contains(&out_key));
                     if !certified_out && execution.is_none() { return None; }
-                    if Goldilocks::from_u64(*scale as u64) * *_av + *_bv != value { return None; }
+                    if ef_u64(*scale as u64) * *_av + *_bv != value { return None; }
                     for (id, val) in [(*a, *_av), (*b, *_bv)] {
                         let key = TensorKey::Index(id).encoded()?;
                         absorb_reverse_claim(transcript, key, &point, val);
@@ -5974,7 +5972,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 } else {
                     if !certified.map_or(false, |c| c.contains(&out_key)) { return None; }
                     let jval = mle_integer(&point[..b_log]);
-                    if value != Goldilocks::from_u64(*b as u64) * *_bv + jval { return None; }
+                    if value != ef_u64(*b as u64) * *_bv + jval { return None; }
                     *_bv
                 };
                 let key = TensorKey::Index(*base).encoded()?;
@@ -5987,7 +5985,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 let lb = base_len.checked_next_power_of_two()?.trailing_zeros() as usize;
                 if point.len() < lb { return None; }
                 let f = zero_ext_factor(&point, lb);
-                if f == Goldilocks::ZERO { return None; }
+                if f == Ef::ZERO { return None; }
                 if value != f * *bv { return None; }
                 let key = TensorKey::Index(*base).encoded()?;
                 absorb_reverse_claim(transcript, key, &point[..lb], *bv);
@@ -6011,7 +6009,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 let nl = n.trailing_zeros() as usize;
                 if point.len() != nl + m.trailing_zeros() as usize || proof.claimed != value { return None; }
                 let (v, u) = point.split_at(nl);
-                let (ok, ch) = matmul_verify(proof, k.trailing_zeros() as usize, transcript);
+                let (ok, ch) = zkie_core::common::ef_matmul::verify(proof, k.trailing_zeros() as usize, transcript);
                 if !ok { return None; }
                 let mut ap = ch.clone(); ap.extend_from_slice(u);
                 let mut bp = v.to_vec(); bp.extend_from_slice(&ch);
@@ -6033,7 +6031,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
         if !lookup_group_relation(roots, ctx.table_final_num, ctx.table_final_den) { return None; }
     }
     if group_roots.len() != group_ctxs.len() { return None; }
-    Some(claims.into_iter().flat_map(|(tensor_id, cs)| cs.into_iter().map(move |(point, value)| EvalClaim { tensor_id, point, value })).collect())
+    Some(claims.into_iter().flat_map(|(tensor_id, cs)| cs.into_iter().map(move |(point, value)| EfClaim { tensor_id, point, value })).collect())
 }
 
 /// Where the per-op fractional proofs (permutation / gather) run. On the
@@ -10316,9 +10314,9 @@ pub fn commit_model_weights(
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct WeightBatchOpening {
     pub table_idxs: Vec<usize>,
-    pub points: Vec<Vec<Goldilocks>>,
-    pub claimed: Vec<Goldilocks>,
-    pub proof: Option<zkie_core::pcs::batch_open::BatchOpeningProof>,
+    pub points: Vec<Vec<Ef>>,
+    pub claimed: Vec<Ef>,
+    pub proof: Option<EfBatchOpeningProof>,
 }
 
 /// A multiplicity-column opening for one lookup table side, plus the table
@@ -10616,15 +10614,15 @@ fn prove_committed_shard_dag_inner(
         // Claim points are zero-extended to the batch arity (small weights
         // are committed zero-padded; the padded MLE agrees with the raw
         // evaluation at the extended point).
-        let points: Vec<Vec<Goldilocks>> = claims
+        let points: Vec<Vec<Ef>> = claims
             .iter()
             .map(|(_, pt, _)| {
-                let mut p = pt.clone();
-                p.resize(cw.arity, Goldilocks::ZERO);
+                let mut p = ef_lift(pt);
+                p.resize(cw.arity, Ef::ZERO);
                 p
             })
             .collect();
-        let claimed: Vec<Goldilocks> = claims.iter().map(|(_, _, ev)| *ev).collect();
+        let claimed: Vec<Ef> = claims.iter().map(|(_, _, ev)| Ef::from(*ev)).collect();
 
         // Verifier-side batch commitment (no prover data); prover-side Whir is
         // reconstructed below from the same params.
@@ -10669,14 +10667,13 @@ fn prove_committed_shard_dag_inner(
             .iter()
             .map(|(ti, _, _)| group_tensors[bi][*ti].clone())
             .collect();
-        let proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-            ctx,
-            &table_idxs,
-            &tensors,
-            &points,
-            &claimed,
-        )
-        .expect("honest batch-open");
+        let (unique, _) = zkie_core::pcs::batch_open::claim_groups(&table_idxs);
+        let unique_tensors: Vec<Vec<Goldilocks>> =
+            unique.iter().map(|&t| tensors[t].clone()).collect();
+        let proof = prove_batch_open_committed_ef(
+            &ctx.whir, &ctx.commitment, &ctx.protocol, ctx.num_tables, ctx.prover_data,
+            &table_idxs, unique_tensors, &points, &claimed,
+        ).expect("honest EF batch-open");
         weight_batch_openings.push(WeightBatchOpening {
             table_idxs,
             points,
@@ -10947,7 +10944,7 @@ fn prove_committed_shard_dag_inner(
                             ts.absorb(&bincode::serialize(&wb.commitment).unwrap());
                         }
                         let r: Vec<Goldilocks> = ts.field_vec(arity);
-                        let x_hat = embedding_x_hat(&tokens, base, d, &r);
+                        let x_hat = embedding_x_hat_base(&tokens, base, d, &r);
                         let opening = zkie_core::pcs::batch_open::prove_batch_open_committed(
                             &g.x_ctx,
                             &[ti],
@@ -11748,9 +11745,9 @@ impl BoundExecutionProof {
 /// or a forged prompt-row position) is rejected.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct BoundSelOpening {
-    pub points: Vec<Vec<Goldilocks>>,
-    pub claimed: Vec<Goldilocks>,
-    pub opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    pub points: Vec<Vec<Ef>>,
+    pub claimed: Vec<Ef>,
+    pub opening: EfBatchOpeningProof,
 }
 
 /// S6 (bound path): the embedding lookup's index witness column (LookupPairs
@@ -11760,9 +11757,9 @@ pub struct BoundSelOpening {
 /// committed computation.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct BoundTokenBinding {
-    pub point: Vec<Goldilocks>,
-    pub claimed: Goldilocks,
-    pub opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    pub point: Vec<Ef>,
+    pub claimed: Ef,
+    pub opening: EfBatchOpeningProof,
 }
 
 /// S7b: exactly replay every index tensor that is a deterministic function
@@ -11849,12 +11846,12 @@ fn replay_index_columns(ops: &[Op], execution: &TrustedExecution)
 }
 
 /// Evaluate a replayed u32 column over its zero-padded 2^point.len() domain.
-fn replay_eval(col: &[u32], point: &[Goldilocks]) -> Option<Goldilocks> {
+fn replay_eval(col: &[u32], point: &[Ef]) -> Option<Ef> {
     let padded = 1usize.checked_shl(point.len() as u32)?;
     if col.len() > padded { return None; }
     let mut vals = vec![Goldilocks::ZERO; padded];
     for (i, &v) in col.iter().enumerate() { vals[i] = Goldilocks::from_u64(v as u64); }
-    Some(mle::eval(&vals, point))
+    efo::mle_eval_at_ef(&vals, point)
 }
 
 /// S7b: index tensors whose u32 domain the verifier can certify. A tensor is
@@ -12252,8 +12249,8 @@ fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<
     Some(locations)
 }
 
-fn group_reverse_weights(model: &TrustedModelManifest, ops: &[Op], leaves: &[EvalClaim])
-    -> Option<Vec<Vec<(usize, Vec<Goldilocks>, Goldilocks)>>>
+fn group_reverse_weights(model: &TrustedModelManifest, ops: &[Op], leaves: &[EfClaim])
+    -> Option<Vec<Vec<(usize, Vec<Ef>, Ef)>>>
 {
     let locations = trusted_weight_locations(model, ops)?;
     let mut groups = vec![Vec::new(); model.batches.len()];
@@ -12261,7 +12258,7 @@ fn group_reverse_weights(model: &TrustedModelManifest, ops: &[Op], leaves: &[Eva
         if let Some(&(bi, ti)) = locations.get(&c.tensor_id) {
             let batch = &model.batches[bi];
             if c.point.len() > batch.arity { return None; }
-            let mut point = c.point.clone(); point.resize(batch.arity, Goldilocks::ZERO);
+            let mut point = c.point.clone(); point.resize(batch.arity, Ef::ZERO);
             groups[bi].push((ti, point, c.value));
         }
     }
@@ -12269,7 +12266,7 @@ fn group_reverse_weights(model: &TrustedModelManifest, ops: &[Op], leaves: &[Eva
 }
 
 fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &TrustedExecution, aux: &[AuxDescriptor])
-    -> Option<(Transcript, Vec<EvalClaim>)>
+    -> Option<(Transcript, Vec<EfClaim>)>
 {
     let mut writes = std::collections::BTreeSet::new();
     let mut reads = std::collections::BTreeSet::new();
@@ -12299,9 +12296,9 @@ fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &Trusted
     let mut seeds = Vec::new();
     for (&tensor_id, tensor) in &execution.outputs {
         if !tensor.len().is_power_of_two() { return None; }
-        let point = transcript.field_vec(tensor.len().trailing_zeros() as usize);
-        let value = mle::eval(tensor, &point);
-        seeds.push(EvalClaim { tensor_id, point, value });
+        let point = transcript.ef_field_vec(tensor.len().trailing_zeros() as usize);
+        let value = efo::mle_eval_at_ef(tensor, &point)?;
+        seeds.push(EfClaim { tensor_id, point, value });
     }
     Some((transcript, seeds))
 }
@@ -12332,7 +12329,7 @@ fn token_binding_challenge(
     ops_per_shard: usize,
     aux: &[AuxDescriptor],
     arity: usize,
-) -> Vec<Goldilocks> {
+) -> Vec<Ef> {
     let mut ts = Transcript::new(b"zkie-committed-public-v1");
     ts.absorb(&bincode::serialize(statement).unwrap());
     ts.absorb(&bincode::serialize(model).unwrap());
@@ -12341,7 +12338,7 @@ fn token_binding_challenge(
     for a in aux {
         ts.absorb(&bincode::serialize(a).unwrap());
     }
-    ts.field_vec(arity)
+    ts.ef_field_vec(arity)
 }
 
 /// S6 (bound prove): per-Argmax selector openings on the ArgmaxWitness aux
@@ -12377,17 +12374,20 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
             if outs.len() != *m { return None; }
             let arity = auxp.descriptor.arity;
             let cols0 = &auxp.columns[0];
-            let mut points = Vec::with_capacity(*m);
-            let claimed = vec![Goldilocks::ONE; *m];
+            let mut points: Vec<Vec<Ef>> = Vec::with_capacity(*m);
+            let claimed = vec![Ef::ONE; *m];
             for i in 0..*m {
                 let col = outs[i] as usize;
                 if col >= *n { return None; }
                 let idx = i * *n + col;
-                points.push((0..arity).map(|b| Goldilocks::from_u64(((idx >> b) & 1) as u64)).collect());
+                points.push((0..arity).map(|b| ef_u64(((idx >> b) & 1) as u64)).collect());
             }
             let idxs = vec![0usize; *m];
-            let tensors: Vec<Vec<Goldilocks>> = (0..*m).map(|_| cols0.clone()).collect();
-            let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(aux_ctx(auxp)?, &idxs, &tensors, &points, &claimed).ok()?;
+            let tensors: Vec<Vec<Goldilocks>> = vec![cols0.clone()];
+            let ctx = aux_ctx(auxp)?;
+            let opening = prove_batch_open_committed_ef(
+                &ctx.whir, &ctx.commitment, &ctx.protocol, ctx.num_tables, ctx.prover_data,
+                &idxs, tensors, &points, &claimed).ok()?;
             sel_openings.push(BoundSelOpening { points, claimed, opening });
         }
     }
@@ -12399,9 +12399,12 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
         let arity = auxp.descriptor.arity;
         // The challenge binds the COMPLETE trusted statement (public
         // statement + model + execution + graph + aux commitments).
-        let r: Vec<Goldilocks> = token_binding_challenge(statement, model, execution, ops, ops_per_shard, aux, arity);
-        let claimed = mle::eval(x_col, &r);
-        let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(aux_ctx(auxp)?, &[0usize], &[x_col.clone()], &[r.clone()], &[claimed]).ok()?;
+        let r: Vec<Ef> = token_binding_challenge(statement, model, execution, ops, ops_per_shard, aux, arity);
+        let claimed = ef_eval(x_col, &r);
+        let ctx = aux_ctx(auxp)?;
+        let opening = prove_batch_open_committed_ef(
+            &ctx.whir, &ctx.commitment, &ctx.protocol, ctx.num_tables, ctx.prover_data,
+            &[0usize], vec![x_col.clone()], &[r.clone()], &[claimed]).ok()?;
         Some(BoundTokenBinding { point: r, claimed, opening })
     })();
     Some((sel_openings, token_binding))
@@ -12533,8 +12536,8 @@ pub fn prove_committed_shard_dag_bound(
     let mut weight_openings = Vec::with_capacity(groups.len());
     for (bi, entries) in groups.iter().enumerate() {
         let table_idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
-        let points: Vec<Vec<Goldilocks>> = entries.iter().map(|e| e.1.clone()).collect();
-        let claimed: Vec<Goldilocks> = entries.iter().map(|e| e.2).collect();
+        let points: Vec<Vec<Ef>> = entries.iter().map(|e| e.1.clone()).collect();
+        let claimed: Vec<Ef> = entries.iter().map(|e| e.2).collect();
         if entries.is_empty() {
             weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: None });
             continue;
@@ -12577,7 +12580,10 @@ pub fn prove_committed_shard_dag_bound(
         eprintln!("O5-metrics batch={} claims={} unique={} moved_bytes={} cloned_bytes=0 tables={}",
             bi, table_idxs.len(), unique_tables.len(), moved_bytes, cw.num_tables);
         let t_open = std::time::Instant::now();
-        let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_unique_owned(ctx, &table_idxs, opened, &points, &claimed).ok()?;
+        let opening = prove_batch_open_committed_ef(
+            &ctx.whir, &ctx.commitment, &ctx.protocol, ctx.num_tables,
+            ctx.prover_data, &table_idxs, opened, &points, &claimed,
+        ).ok()?;
         let open_ms = t_open.elapsed().as_secs_f64() * 1e3;
         let rss_open = current_rss_kb();
         eprintln!("O5-phases mat_ms={:.1} restore_ms={:.1} open_ms={:.1} rss_now_mat={} rss_now_restore={} rss_now_clone={} rss_now_open={} hwm={}",
@@ -12642,7 +12648,7 @@ pub fn verify_committed_shard_dag_bound(
             if padded == 0 || c.point.len() != padded.trailing_zeros() as usize { return false; }
             let mut vals = vec![Goldilocks::ZERO; padded];
             for (i, &v) in tensor.iter().enumerate() { vals[i] = v; }
-            if mle::eval(&vals, &c.point) != c.value { return false; }
+            if ef_eval(&vals, &c.point) != c.value { return false; }
         } else {
             // Field tensors follow the same zero-extension convention: a
             // non-power-of-two length is evaluated over the zero-padded
@@ -12653,15 +12659,15 @@ pub fn verify_committed_shard_dag_bound(
             if padded == 0 || c.point.len() != padded.trailing_zeros() as usize { return false; }
             let mut vals = vec![Goldilocks::ZERO; padded];
             for (i, &v) in tensor.iter().enumerate() { vals[i] = v; }
-            if mle::eval(&vals, &c.point) != c.value { return false; }
+            if ef_eval(&vals, &c.point) != c.value { return false; }
         }
     }
     let groups = match group_reverse_weights(model, ops, &leaves) { Some(g) => g, None => return false };
     if proof.weight_openings.len() != groups.len() { return false; }
     for (bi, (opening, entries)) in proof.weight_openings.iter().zip(&groups).enumerate() {
         let idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
-        let points: Vec<Vec<Goldilocks>> = entries.iter().map(|e| e.1.clone()).collect();
-        let values: Vec<Goldilocks> = entries.iter().map(|e| e.2).collect();
+        let points: Vec<Vec<Ef>> = entries.iter().map(|e| e.1.clone()).collect();
+        let values: Vec<Ef> = entries.iter().map(|e| e.2).collect();
         if opening.table_idxs != idxs || opening.points != points || opening.claimed != values { return false; }
         match (&opening.proof, entries.is_empty()) {
             (None, true) => {},
@@ -12671,7 +12677,7 @@ pub fn verify_committed_shard_dag_bound(
                     Some(w) => w, None => return false,
                 };
                 let protocol = whir.batch_opening_protocol(batch.num_tables, batch.arity);
-                if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &batch.commitment, &protocol, batch.num_tables, &idxs, &points, &values, p) { return false; }
+                if !verify_batch_open_committed_ef(&whir, &batch.commitment, &protocol, batch.num_tables, &idxs, &points, &values, p) { return false; }
             }
             _ => return false,
         }
@@ -12697,18 +12703,17 @@ pub fn verify_committed_shard_dag_bound(
             Some(d) => d, None => return false,
         };
         let arity = descriptor.arity;
-        let mut points = Vec::with_capacity(m);
+        let mut points: Vec<Vec<Ef>> = Vec::with_capacity(m);
         for i in 0..m {
             let col = to_i64(argmax_vals[i]);
             if col < 0 || (col as usize) >= n { return false; }
             let idx = i * n + col as usize;
-            points.push((0..arity).map(|b| Goldilocks::from_u64(((idx >> b) & 1) as u64)).collect());
+            points.push((0..arity).map(|b| ef_u64(((idx >> b) & 1) as u64)).collect());
         }
         if so.points != points { return false; }
-        if so.claimed.iter().any(|&c| c != Goldilocks::ONE) { return false; }
-        let (whir, protocol) = match aux_batch_whir(descriptor) { Some(v) => v, None => return false };
+        if so.claimed.iter().any(|&c| c != Ef::ONE) { return false; }
         let idxs = vec![0usize; m];
-        if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &descriptor.commitment, &protocol, descriptor.columns, &idxs, &points, &so.claimed, &so.opening) { return false; }
+        if !verify_aux_open(descriptor, &idxs, &points, &so.claimed, &so.opening) { return false; }
     }
     // S6 (bound): language-model sequence checks + embedding token binding.
     // The caller's prompt/response are authoritative; the proof never
@@ -12758,14 +12763,13 @@ pub fn verify_committed_shard_dag_bound(
         }
         // Shared derivation: binds the COMPLETE trusted statement before
         // sampling r (public statement + model + execution + graph + aux).
-        let r: Vec<Goldilocks> = token_binding_challenge(statement, model, execution, ops, ops_per_shard, &proof.aux, descriptor.arity);
+        let r: Vec<Ef> = token_binding_challenge(statement, model, execution, ops, ops_per_shard, &proof.aux, descriptor.arity);
         if tb.point != r { return false; }
         let x_hat = embedding_x_hat(&tokens, base, d, &r);
         if tb.claimed != x_hat {
             return false; // proof-carried claimed value must match the recomputed one
         }
-        let (whir, protocol) = match aux_batch_whir(descriptor) { Some(v) => v, None => return false };
-        if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &descriptor.commitment, &protocol, descriptor.columns, &[0usize], &[r], &[x_hat], &tb.opening) { return false; }
+        if !verify_aux_open(descriptor, &[0usize], &[r], &[x_hat], &tb.opening) { return false; }
     }
     true
 }
@@ -12804,964 +12808,7 @@ pub fn verify_committed_shard_dag(
     false
 }
 
-fn verify_committed_shard_dag_inner(
-    tables: &[&[Goldilocks]],
-    ops: &[Op],
-    ops_per_shard: usize,
-    _whir: &zkie_core::pcs::whir::Whir,
-    proof: &CommittedShardDagProof,
-    statement: &PublicStatement,
-    trusted_model: &TrustedModelManifest,
-    extra_claims: &[EvalClaim],
-) -> bool {
-    if !trusted_model.matches_proof(ops, proof) {
-        return false;
-    }
-    let st = VerifierStatement::new(tables, ops, ops_per_shard);
-    let ranges = shard_ranges(ops.len(), ops_per_shard);
-    if proof.shards.len() != ranges.len()
-        || proof.boundary_tensors.len() != proof.boundary_commitments.len()
-        || proof.boundary_tensors.len() != proof.cross_binds.len()
-    {
-        return false;
-    }
-    let shards = &proof.shards;
-    // 1. Shard replays (committed mode) — every shard's claim set is BUILT
-    // locally from the op verifications (S2), never read from the proof.
-    let mut master = Transcript::new(b"zkie-shard-dag-v1");
-    absorb_statement(&mut master, ops, ops_per_shard);
-    let shard_claims: Vec<Option<Vec<EvalClaim>>> = ranges
-        .par_iter()
-        .enumerate()
-        .map(|(i, &(s, e))| {
-            let mut child = master.clone();
-            child.absorb_u64(i as u64);
-            verify_shard_precomputed_inner(tables, &ops[s..e], &shards[i], &mut child, FracMode::Committed)
-        })
-        .collect();
-    if shard_claims.iter().any(|c| c.is_none()) {
-        return false;
-    }
-    // 2. Boundary (cross-shard) set rebuilt from the local claims; the
-    // committed cross-binds are verified against those local claims.
-    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
-        std::collections::BTreeMap::new();
-    let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
-        std::collections::BTreeMap::new();
-    for (si, claims) in shard_claims.iter().enumerate() {
-        for c in claims.as_ref().unwrap() {
-            by_tensor
-                .entry(c.tensor_id)
-                .or_default()
-                .push((c.point.clone(), c.value));
-            tensor_shards.entry(c.tensor_id).or_default().insert(si);
-        }
-    }
-    let mut expected_boundary: Vec<T> = Vec::new();
-    for (t, _) in &by_tensor {
-        if tensor_shards.get(t).map(|s| s.len()).unwrap_or(0) > 1 {
-            expected_boundary.push(*t);
-        }
-    }
-    if expected_boundary != proof.boundary_tensors {
-        return false;
-    }
-    let mut bind_ts = Transcript::new(b"zkie-committed-binds-v1");
-    absorb_statement(&mut bind_ts, ops, ops_per_shard);
-    for (i, &t) in proof.boundary_tensors.iter().enumerate() {
-        if !verify_committed_cross_bind(
-            &proof.boundary_commitments[i],
-            &by_tensor[&t],
-            &proof.cross_binds[i],
-            &mut bind_ts,
-        ) {
-            return false;
-        }
-    }
-    // 3. Weight batches (S2): every locally claimed weight tensor must be
-    // opened against its batch commitment — right tensor, right point, right
-    // value, right root. The expected opening entries are rebuilt from the
-    // local claims via the proof's `weight_locs` mapping, and an opening must
-    // carry EXACTLY those entries. Batches with no claimed tensors may be
-    // empty (unused weights); an empty list can never skip a non-empty one.
-    if proof.weight_batch_openings.len() != proof.weight_batches.len() {
-        return false;
-    }
-    let weights: std::collections::HashSet<T> = st.weight_tensors().into_iter().collect();
-    let entry_key =
-        |e: &(usize, Vec<Goldilocks>, Goldilocks)| -> Vec<u8> { bincode::serialize(e).unwrap() };
-    let mut batch_entries: Vec<Vec<(usize, Vec<Goldilocks>, Goldilocks)>> =
-        vec![Vec::new(); proof.weight_batches.len()];
-    for claims in shard_claims.iter() {
-        for c in claims.as_ref().unwrap() {
-            if !weights.contains(&c.tensor_id) {
-                continue;
-            }
-            let (bi, ti) = match proof.weight_locs.get(&c.tensor_id) {
-                Some(&loc) => loc,
-                None => return false, // claimed weight with no batch opening
-            };
-            if bi >= proof.weight_batches.len() || ti >= proof.weight_batches[bi].num_tables {
-                return false;
-            }
-            if c.point.len() > proof.weight_batches[bi].arity {
-                return false;
-            }
-            let mut pt = c.point.clone();
-            pt.resize(proof.weight_batches[bi].arity, Goldilocks::ZERO);
-            batch_entries[bi].push((ti, pt, c.value));
-        }
-    }
-    for c in extra_claims {
-        if !weights.contains(&c.tensor_id) { continue; }
-        let (bi, ti) = match proof.weight_locs.get(&c.tensor_id) {
-            Some(&loc) => loc,
-            None => return false,
-        };
-        if bi >= proof.weight_batches.len() || ti >= proof.weight_batches[bi].num_tables
-            || c.point.len() > proof.weight_batches[bi].arity { return false; }
-        let mut point = c.point.clone();
-        point.resize(proof.weight_batches[bi].arity, Goldilocks::ZERO);
-        batch_entries[bi].push((ti, point, c.value));
-    }
-    for (bi, opening) in proof.weight_batch_openings.iter().enumerate() {
-        let entries = &batch_entries[bi];
-        if opening.table_idxs.len() != opening.points.len()
-            || opening.table_idxs.len() != opening.claimed.len()
-        {
-            return false;
-        }
-        match (&opening.proof, entries.is_empty()) {
-            (None, true) => {
-                // Unused weight group: no claims, no opening (allowed).
-                if !opening.table_idxs.is_empty() {
-                    return false;
-                }
-            }
-            (Some(_), false) => {
-                // Point-set comparison: the opening must carry exactly the
-                // claims of this batch (multiset).
-                let mut expected: Vec<Vec<u8>> = entries.iter().map(entry_key).collect();
-                expected.sort();
-                let mut got: Vec<Vec<u8>> = opening
-                    .table_idxs
-                    .iter()
-                    .zip(opening.points.iter())
-                    .zip(opening.claimed.iter())
-                    .map(|((ti, pt), ev)| bincode::serialize(&(ti, pt.clone(), ev)).unwrap())
-                    .collect();
-                got.sort();
-                if expected != got {
-                    return false;
-                }
-                let batch = &proof.weight_batches[bi];
-                let whir = match batch.whir.try_whir(90) { Some(w) => w, None => return false };
-                let protocol = whir.opening_protocol(batch.arity, batch.num_tables);
-                if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-                    &whir,
-                    &batch.commitment,
-                    &protocol,
-                    batch.num_tables,
-                    &opening.table_idxs,
-                    &opening.points,
-                    &opening.claimed,
-                    opening.proof.as_ref().unwrap(),
-                ) {
-                    return false;
-                }
-            }
-            _ => return false, // claims with no opening, or opening with no claims
-        }
-    }
-    // 4. Fractional replays FIRST — every leaf is derived from the checked
-    // chains (S2); the opening checks below compare against them.
-    let mut witness_leaves: Vec<FractionalChainClaims> = Vec::new();
-    let mut table_leaves: Vec<FractionalChainClaims> = Vec::new();
-    {
-        let mut ts = Transcript::new(b"zkie-committed-frac-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
-        for batch in &proof.witness_batches {
-            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
-        }
-        let mut ti = 0usize;
-        for (si, shard) in shards.iter().enumerate() {
-            ts.absorb_u64(si as u64);
-            for tc in &shard.table_columns {
-                if ti >= proof.table_openings.len() {
-                    return false;
-                }
-                let to = &proof.table_openings[ti];
-                if tc.table != to.table {
-                    return false;
-                }
-                ts.absorb(&bincode::serialize(&to.commitment).unwrap());
-                if st.is_identity_table(to.table) {
-                    ts.absorb_u64(0);
-                } else {
-                    match &to.table_commitment {
-                        Some(c) => ts.absorb(&bincode::serialize(c).unwrap()),
-                        None => return false,
-                    }
-                }
-                ti += 1;
-            }
-        }
-        if ti != proof.table_openings.len() {
-            return false;
-        }
-        // S3: each column's fractional depth comes from its committed
-        // column length (the witness batch arity / the m-column arity).
-        let mut shard_wc_off: Vec<usize> = Vec::with_capacity(shards.len() + 1);
-        shard_wc_off.push(0);
-        for shard in shards.iter() {
-            let next = shard_wc_off.last().unwrap() + shard.witness_columns.len();
-            shard_wc_off.push(next);
-        }
-        let total_witness_cols: usize = shards.iter().map(|s| s.witness_columns.len()).sum();
-        if proof.witness_locations.len() != total_witness_cols {
-            return false;
-        }
-        for (si, shard) in shards.iter().enumerate() {
-            for (ci, wc) in shard.witness_columns.iter().enumerate() {
-                if ts.field() != wc.alpha || ts.field() != wc.beta {
-                    return false;
-                }
-                let loc = &proof.witness_locations[shard_wc_off[si] + ci];
-                if loc.x_batch >= proof.witness_batches.len() {
-                    return false;
-                }
-                let t_w = proof.witness_batches[loc.x_batch].arity;
-                match verify_fractional_chain_core(&wc.proof, t_w, &mut ts) {
-                    Some(leaf) => witness_leaves.push(leaf),
-                    None => return false,
-                }
-            }
-        }
-        let mut ti_frac = 0usize;
-        for shard in shards.iter() {
-            for tc in &shard.table_columns {
-                let t_t = proof.table_openings[ti_frac].arity;
-                match verify_fractional_chain_core(&tc.proof, t_t, &mut ts) {
-                    Some(leaf) => table_leaves.push(leaf),
-                    None => {
-                        return false;
-                    }
-                }
-                ti_frac += 1;
-            }
-        }
-        // The witness/table pairing is per shard by column index; the split
-        // cross relation uses the DERIVED roots, and zero denominators are
-        // rejected explicitly (S3: no vacuous 0/0).
-        let mut w_off = 0usize;
-        for shard in shards.iter() {
-            for i in 0..shard.witness_columns.len() {
-                let wc = &witness_leaves[w_off + i];
-                let tc = &table_leaves[w_off + i];
-                if wc.final_den == Goldilocks::ZERO || tc.final_den == Goldilocks::ZERO {
-                    return false;
-                }
-                if wc.final_num * tc.final_den != tc.final_num * wc.final_den {
-                    return false;
-                }
-            }
-            w_off += shard.witness_columns.len();
-        }
-    }
-    // 5. Witness columns: batch openings verified against their commitments
-    // and compared with the DERIVED leaves (x/y at q_den, num at q_num).
-    if proof.witness_batches.len() != proof.witness_batch_openings.len() {
-        return false;
-    }
-    let total_witness_cols: usize = shards.iter().map(|s| s.witness_columns.len()).sum();
-    if proof.witness_locations.len() != total_witness_cols {
-        return false;
-    }
-    for (bi, opening) in proof.witness_batch_openings.iter().enumerate() {
-        if opening.table_idxs.len() != opening.points.len()
-            || opening.table_idxs.len() != opening.claimed.len()
-        {
-            return false;
-        }
-        let batch = &proof.witness_batches[bi];
-        let whir = match batch.whir.try_whir(90) { Some(w) => w, None => return false };
-        let protocol = whir.opening_protocol(batch.arity, batch.num_tables);
-        if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &whir,
-            &batch.commitment,
-            &protocol,
-            batch.num_tables,
-            &opening.table_idxs,
-            &opening.points,
-            &opening.claimed,
-            &opening.proof,
-        ) {
-            return false;
-        }
-    }
-    {
-        let mut gid = 0usize;
-        for shard in shards.iter() {
-            for wc in &shard.witness_columns {
-                let wl = &witness_leaves[gid];
-                let (q_num, num_leaf, q_den, den_leaf) =
-                    (&wl.q_num, &wl.num_leaf, &wl.q_den, &wl.den_leaf);
-                let loc = &proof.witness_locations[gid];
-                let (x_open, y_open, num_open) = match (
-                    proof.witness_batch_openings.get(loc.x_batch),
-                    proof.witness_batch_openings.get(loc.y_batch),
-                    proof.witness_batch_openings.get(loc.num_batch),
-                ) {
-                    (Some(x), Some(y), Some(n)) => (x, y, n),
-                    _ => return false,
-                };
-                if loc.x_table >= x_open.points.len()
-                    || loc.y_table >= y_open.points.len()
-                    || loc.num_table >= num_open.points.len()
-                {
-                    return false;
-                }
-                // x/y must sit on the derived DEN leaf point, num on the NUM
-                // leaf point with the derived num leaf value.
-                if x_open.points[loc.x_table] != *q_den || y_open.points[loc.y_table] != *q_den {
-                    return false;
-                }
-                if num_open.points[loc.num_table] != *q_num {
-                    return false;
-                }
-                if num_open.claimed[loc.num_table] != *num_leaf {
-                    return false;
-                }
-                let eval_x = x_open.claimed[loc.x_table];
-                let eval_y = y_open.claimed[loc.y_table];
-                if wc.alpha + eval_x + wc.beta * eval_y != *den_leaf {
-                    return false;
-                }
-                gid += 1;
-            }
-        }
-    }
-    // 6. Table side (S2, the four opening elements): the m-column opening must
-    // sit on the DERIVED num leaf point with the derived num leaf value; the
-    // table must be opened at the derived den leaf point with the den relation
-    // checked there; the identity decision comes from the statement tables.
-    {
-        let mut ti = 0usize;
-        for shard in shards.iter() {
-            for _tc in &shard.table_columns {
-                let tl = &table_leaves[ti];
-                let (q_num_t, a_t, q_den_t, b_t) =
-                    (&tl.q_num, &tl.num_leaf, &tl.q_den, &tl.den_leaf);
-                let to = &proof.table_openings[ti];
-                let bw = match verifier_whir(to.arity) { Some(w) => w, None => return false };
-                let protocol = bw.opening_protocol(to.arity, 1);
-                if to.point != *q_num_t || to.claimed != *a_t {
-                    return false;
-                }
-                if bw.verify(&to.commitment, &to.opening, &protocol, &to.point).ok()
-                    != Some(to.claimed)
-                {
-                    return false;
-                }
-                if to.den_point != *q_den_t {
-                    return false;
-                }
-                let is_ident = st.is_identity_table(to.table);
-                let den_table_eval = if is_ident {
-                    if trusted_model.identity_tables.get(&to.table).copied() != tables.get(to.table).map(|t| t.len())
-                        || trusted_model.lookup_roots.contains_key(&to.table)
-                        || to.table_commitment.is_some()
-                        || to.table_opening.is_some()
-                        || to.den_table_opening.is_some()
-                    {
-                        return false;
-                    }
-                    let mut den_idx = Goldilocks::ZERO;
-                    for (k, &pk) in q_den_t.iter().enumerate() {
-                        den_idx = den_idx + Goldilocks::from_u64(1u64 << k) * pk;
-                    }
-                    den_idx
-                } else {
-                    let (tc_, to2) = match (&to.table_commitment, &to.table_opening) {
-                        (Some(c), Some(o)) => (c, o),
-                        _ => return false,
-                    };
-                    let trusted_root = match trusted_model.lookup_roots.get(&to.table) {
-                        Some(root) => root,
-                        None => return false,
-                    };
-                    if bincode::serialize(trusted_root).ok() != bincode::serialize(tc_).ok() {
-                        return false;
-                    }
-                    if bw.verify(tc_, to2, &protocol, &to.point).ok() != Some(to.table_eval) {
-                        return false;
-                    }
-                    let (dc, do2) = match (&to.table_commitment, &to.den_table_opening) {
-                        (Some(c), Some(o)) => (c, o),
-                        _ => return false,
-                    };
-                    if bw.verify(dc, do2, &protocol, &to.den_point).ok()
-                        != Some(to.den_table_eval)
-                    {
-                        return false;
-                    }
-                    to.den_table_eval
-                };
-                let mut den_idx = Goldilocks::ZERO;
-                for (k, &pk) in q_den_t.iter().enumerate() {
-                    den_idx = den_idx + Goldilocks::from_u64(1u64 << k) * pk;
-                }
-                if to.alpha + den_idx + to.beta * den_table_eval != *b_t {
-                    return false;
-                }
-                ti += 1;
-            }
-        }
-    }
-    // 7. Permutations: frac replays first (collecting derived leaves), then
-    // the opening-vs-leaf comparisons.
-    if proof.perm_batches.len() != proof.perm_batch_openings.len() {
-        return false;
-    }
-    let mut perm_leaves: Vec<(FractionalChainClaims, FractionalChainClaims)> = Vec::new();
-    {
-        let mut ts = Transcript::new(b"zkie-committed-perm-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
-        for batch in &proof.perm_batches {
-            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
-        }
-        let perm_op_count: usize = shards
-            .iter()
-            .map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Scatter(_))).count())
-            .sum();
-        if proof.perm_locations.len() != perm_op_count {
-            return false;
-        }
-        let mut pgid = 0usize;
-        for shard in shards.iter() {
-            for op in &shard.ops {
-                if let OpProof::Scatter(sp) = op {
-                    let alpha = ts.field();
-                    if alpha != sp.perm.alpha {
-                        return false;
-                    }
-                    // S3: the permutation depth comes from the committed
-                    // column length (the perm batch arity).
-                    let t = proof.perm_batches[proof.perm_locations[pgid].a_batch].arity;
-                    let la = match verify_fractional_chain_core(&sp.perm.a_side, t, &mut ts) {
-                        Some(l) => l,
-                        None => return false,
-                    };
-                    let lb = match verify_fractional_chain_core(&sp.perm.b_side, t, &mut ts) {
-                        Some(l) => l,
-                        None => return false,
-                    };
-                    if la.final_den == Goldilocks::ZERO || lb.final_den == Goldilocks::ZERO {
-                        return false;
-                    }
-                    perm_leaves.push((la, lb));
-                    pgid += 1;
-                }
-            }
-        }
-    }
-    {
-        let total: usize = shards
-            .iter()
-            .map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Scatter(_))).count())
-            .sum();
-        if proof.perm_locations.len() != total {
-            return false;
-        }
-    }
-    for (bi, opening) in proof.perm_batch_openings.iter().enumerate() {
-        if opening.table_idxs.len() != opening.points.len()
-            || opening.table_idxs.len() != opening.claimed.len()
-        {
-            return false;
-        }
-        let batch = &proof.perm_batches[bi];
-        let whir = match batch.whir.try_whir(90) { Some(w) => w, None => return false };
-        let protocol = whir.opening_protocol(batch.arity, batch.num_tables);
-        if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &whir,
-            &batch.commitment,
-            &protocol,
-            batch.num_tables,
-            &opening.table_idxs,
-            &opening.points,
-            &opening.claimed,
-            &opening.proof,
-        ) {
-            return false;
-        }
-    }
-    {
-        let mut gid = 0usize;
-        for shard in shards.iter() {
-            for op in &shard.ops {
-                if let OpProof::Scatter(sp) = op {
-                    let loc = &proof.perm_locations[gid];
-                    let (la, lb) = &perm_leaves[gid];
-                    let (q_na, a_a, q_da, b_a) = (&la.q_num, &la.num_leaf, &la.q_den, &la.den_leaf);
-                    let (q_nb, a_b, q_db, b_b) = (&lb.q_num, &lb.num_leaf, &lb.q_den, &lb.den_leaf);
-                    let (a_open, b_open, num_open) = match (
-                        proof.perm_batch_openings.get(loc.a_batch),
-                        proof.perm_batch_openings.get(loc.b_batch),
-                        proof.perm_batch_openings.get(loc.num_batch),
-                    ) {
-                        (Some(a), Some(b), Some(n)) => (a, b, n),
-                        _ => return false,
-                    };
-                    if loc.a_table + 1 >= a_open.points.len()
-                        || loc.b_table + 1 >= b_open.points.len()
-                        || 2 * loc.num_table + 1 >= num_open.points.len()
-                    {
-                        return false;
-                    }
-                    // a/b columns: entry 2*ti at the num leaf point, 2*ti+1 at
-                    // the den leaf point. The num column (shared indicator):
-                    // q_num_a and q_num_b with the two derived num leaves.
-                    if a_open.points[loc.a_table] != *q_na
-                        || a_open.points[loc.a_table + 1] != *q_da
-                    {
-                        return false;
-                    }
-                    if b_open.points[loc.b_table] != *q_nb
-                        || b_open.points[loc.b_table + 1] != *q_db
-                    {
-                        return false;
-                    }
-                    if num_open.points[2 * loc.num_table] != *q_na
-                        || num_open.points[2 * loc.num_table + 1] != *q_nb
-                    {
-                        return false;
-                    }
-                    let nl_a = num_open.claimed[2 * loc.num_table];
-                    let nl_b = num_open.claimed[2 * loc.num_table + 1];
-                    if nl_a != *a_a || nl_b != *a_b {
-                        return false;
-                    }
-                    let eval_a = a_open.claimed[loc.a_table + 1];
-                    let eval_b = b_open.claimed[loc.b_table + 1];
-                    if *b_a != sp.perm.alpha - eval_a || *b_b != sp.perm.alpha - eval_b {
-                        return false;
-                    }
-                    gid += 1;
-                }
-            }
-        }
-    }
-    // 8. Gather: frac replays first (derived leaves), then the opening
-    // comparisons against the leaves and the product final evals.
-    if proof.gather_batches.len() != proof.gather_batch_openings.len() {
-        return false;
-    }
-    let mut gather_leaves: Vec<(FractionalChainClaims, FractionalChainClaims)> = Vec::new();
-    {
-        let mut ts = Transcript::new(b"zkie-committed-gather-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
-        for batch in proof.gather_batches.iter().take(proof.gather_indep_batches) {
-            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
-        }
-        for shard in shards.iter() {
-            for op in &shard.ops {
-                if let OpProof::Gather(sp) = op {
-                    let alpha = ts.field();
-                    let gamma: Vec<Goldilocks> = (0..sp.gamma.len()).map(|_| ts.field()).collect();
-                    if alpha != sp.alpha || gamma != sp.gamma {
-                        return false;
-                    }
-                }
-            }
-        }
-        for batch in proof.gather_batches.iter().skip(proof.gather_indep_batches) {
-            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
-        }
-        let gather_op_count: usize = shards
-            .iter()
-            .map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Gather(_))).count())
-            .sum();
-        if proof.gather_locations.len() != gather_op_count {
-            return false;
-        }
-        let mut ggid = 0usize;
-        for shard in shards.iter() {
-            for op in &shard.ops {
-                if let OpProof::Gather(sp) = op {
-                    // S3: each side's depth comes from its committed column
-                    // length (the gather batch arities).
-                    let loc = &proof.gather_locations[ggid];
-                    let t_src = proof.gather_batches[loc.num_source_batch].arity;
-                    let t_tgt = proof.gather_batches[loc.num_target_batch].arity;
-                    let ls = match verify_fractional_chain_core(&sp.source_side, t_src, &mut ts) {
-                        Some(l) => l,
-                        None => return false,
-                    };
-                    let lt = match verify_fractional_chain_core(&sp.target_side, t_tgt, &mut ts) {
-                        Some(l) => l,
-                        None => return false,
-                    };
-                    // Cross relation of the split gather (as on the plain
-                    // path), with explicit zero-denominator rejection (S3).
-                    if ls.final_den == Goldilocks::ZERO || lt.final_den == Goldilocks::ZERO {
-                        return false;
-                    }
-                    if ls.final_num * lt.final_den != lt.final_num * ls.final_den {
-                        return false;
-                    }
-                    gather_leaves.push((ls, lt));
-                    ggid += 1;
-                }
-            }
-        }
-    }
-    {
-        let total: usize = shards
-            .iter()
-            .map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Gather(_))).count())
-            .sum();
-        if proof.gather_locations.len() != total {
-            return false;
-        }
-    }
-    for (bi, opening) in proof.gather_batch_openings.iter().enumerate() {
-        if opening.table_idxs.len() != opening.points.len()
-            || opening.table_idxs.len() != opening.claimed.len()
-        {
-            return false;
-        }
-        let batch = &proof.gather_batches[bi];
-        let whir = match batch.whir.try_whir(90) { Some(w) => w, None => return false };
-        let protocol = whir.opening_protocol(batch.arity, batch.num_tables);
-        if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &whir,
-            &batch.commitment,
-            &protocol,
-            batch.num_tables,
-            &opening.table_idxs,
-            &opening.points,
-            &opening.claimed,
-            &opening.proof,
-        ) {
-            return false;
-        }
-    }
-    {
-        let mut gid = 0usize;
-        for (si, &(s, e)) in ranges.iter().enumerate() {
-            for (li, (op_st, op_pr)) in ops[s..e].iter().zip(shards[si].ops.iter()).enumerate() {
-                if let (Op::Gather { h, .. }, OpProof::Gather(sp)) = (op_st, op_pr) {
-                    let loc = &proof.gather_locations[gid];
-                    let (ls, lt) = &gather_leaves[gid];
-                    let (q_ns, a_s, q_ds, b_s) = (&ls.q_num, &ls.num_leaf, &ls.q_den, &ls.den_leaf);
-                    let (q_nt, a_t, q_dt, b_t) = (&lt.q_num, &lt.num_leaf, &lt.q_den, &lt.den_leaf);
-                    let h_log = h.trailing_zeros() as usize;
-                    let get = |batch: usize, table: usize| -> Option<(&Vec<usize>, &Vec<Vec<Goldilocks>>, &Vec<Goldilocks>)> {
-                        let o = proof.gather_batch_openings.get(batch)?;
-                        if table >= o.points.len() {
-                            { return None; }
-                        }
-                        Some((&o.table_idxs, &o.points, &o.claimed))
-                    };
-                    // ty 0: num_source at q_num_src, claimed == num leaf.
-                    let (_, pts, clm) = match get(loc.num_source_batch, loc.num_source_table) {
-                        Some(t) => t,
-                        None => return false,
-                    };
-                    if pts[loc.num_source_table] != *q_ns || clm[loc.num_source_table] != *a_s {
-                        return false;
-                    }
-                    // ty 1: den_source at q_den_src, claimed == den leaf, and
-                    // b_s == alpha - token_id(q_den_src restricted).
-                    let (_, pts, clm) = match get(loc.den_source_batch, loc.den_source_table) {
-                        Some(t) => t,
-                        None => return false,
-                    };
-                    if pts[loc.den_source_table] != *q_ds || clm[loc.den_source_table] != *b_s {
-                        return false;
-                    }
-                    let (_, tk_pts, tk_clm) = match get(loc.token_id_batch, loc.token_id_table) {
-                        Some(t) => t,
-                        None => return false,
-                    };
-                    let gate_arity = proof.gather_batches[loc.token_id_batch].arity;
-                    let mut tk_pt = q_ds[h_log..].to_vec();
-                    tk_pt.resize(gate_arity, Goldilocks::ZERO);
-                    if tk_pts[loc.token_id_table] != tk_pt {
-                        return false;
-                    }
-                    if *b_s != sp.alpha - tk_clm[loc.token_id_table] {
-                        return false;
-                    }
-                    // ty 2: weighted at r_prod_source == prod_source.fe[3].
-                    let (_, pts, clm) = match get(loc.weighted_batch, loc.weighted_table) {
-                        Some(t) => t,
-                        None => return false,
-                    };
-                    if pts[loc.weighted_table] != sp.r_prod_source
-                        || clm[loc.weighted_table] != sp.prod_source.final_evals[3]
-                    {
-                        return false;
-                    }
-                    // ty 3: num_target at q_num_tgt, claimed == num leaf.
-                    let (_, pts, clm) = match get(loc.num_target_batch, loc.num_target_table) {
-                        Some(t) => t,
-                        None => return false,
-                    };
-                    if pts[loc.num_target_table] != *q_nt || clm[loc.num_target_table] != *a_t {
-                        return false;
-                    }
-                    // ty 4: den_target at q_den_tgt, claimed == den leaf, and
-                    // b_t == alpha - t where t is the index value of the point.
-                    let (_, pts, clm) = match get(loc.den_target_batch, loc.den_target_table) {
-                        Some(t) => t,
-                        None => return false,
-                    };
-                    if pts[loc.den_target_table] != *q_dt || clm[loc.den_target_table] != *b_t {
-                        return false;
-                    }
-                    let mut t_idx = Goldilocks::ZERO;
-                    for (k, &pk) in q_dt[h_log..].iter().enumerate() {
-                        t_idx = t_idx + Goldilocks::from_u64(1u64 << k) * pk;
-                    }
-                    if *b_t != sp.alpha - t_idx {
-                        return false;
-                    }
-                    // ty 5: out at r_prod_target == prod_target.fe[3].
-                    let (_, pts, clm) = match get(loc.out_batch, loc.out_table) {
-                        Some(t) => t,
-                        None => return false,
-                    };
-                    if pts[loc.out_table] != sp.r_prod_target
-                        || clm[loc.out_table] != sp.prod_target.final_evals[3]
-                    {
-                        return false;
-                    }
-                    // ty 6: gate at r_prod_source[h_log..] (zero-padded to the
-                    // gate arity) == prod_source.fe[4].
-                    let (_, pts, clm) = match get(loc.gate_batch, loc.gate_table) {
-                        Some(t) => t,
-                        None => return false,
-                    };
-                    let gate_arity = proof.gather_batches[loc.gate_batch].arity;
-                    let mut gate_pt = sp.r_prod_source[h_log..].to_vec();
-                    gate_pt.resize(gate_arity, Goldilocks::ZERO);
-                    if pts[loc.gate_table] != gate_pt
-                        || clm[loc.gate_table] != sp.prod_source.final_evals[4]
-                    {
-                        return false;
-                    }
-                    gid += 1;
-                }
-            }
-        }
-    }
-    // 9. Argmax selection openings + S6 public bindings. The Argmax op's
-    // relation selector is bound to the SAME committed column at its derived
-    // claim point r (topk.r): sel(r) must open to the relation-bound eval, so
-    // the per-position openings cannot be manufactured from a different
-    // column. For language-model statements the per-position points are
-    // DERIVED from the public argmax (row i, column argmax[i]); the proof
-    // cannot choose which positions to open, and the claimed sequence is
-    // forced through the selector.
-    let argmax_ops: Vec<(usize, usize)> = ops
-        .iter()
-        .filter_map(|op| match op {
-            Op::Argmax { m, n, .. } => Some((*m, *n)),
-            _ => None,
-        })
-        .collect();
-    if proof.sel_openings.len() != argmax_ops.len() {
-        return false;
-    }
 
-    // S6 sequence checks (language-model statements only). The caller's
-    // confirmed prompt + response are authoritative; the proof's tokens /
-    // argmax must agree with them wherever the public data pins them.
-    let lm: Option<Vec<u32>> = match statement {
-        PublicStatement::Generic => None,
-        PublicStatement::LanguageModel {
-            prompt,
-            response,
-            next_token,
-        } => {
-            if argmax_ops.len() != 1 {
-                return false;
-            }
-            let (m, n) = argmax_ops[0];
-            let mut tokens = prompt.clone();
-            tokens.extend_from_slice(response);
-            if tokens.len() != m || proof.tokens != tokens || proof.argmax_t.len() != m {
-                return false;
-            }
-            for &t in &tokens {
-                if (t as usize) >= n {
-                    return false; // vocab range (padded vocab columns are masked)
-                }
-            }
-            for i in prompt.len().saturating_sub(1)..m.saturating_sub(1) {
-                if proof.argmax_t[i] != tokens[i + 1] {
-                    return false; // teacher forcing i = prompt_len-1 .. m-2
-                }
-            }
-            if let Some(nt) = next_token {
-                if proof.argmax_t[m - 1] != *nt {
-                    return false; // last row predicts a token outside the sequence
-                }
-            }
-            Some(tokens)
-        }
-    };
-
-    // S6 token binding (language-model statements only): the embedding
-    // lookup's index witness column is batch-opened at a fresh random point r
-    // with claimed x_hat(r), where x_hat is the MLE of the public expansion
-    // x_hat[i*D+d] = d*base + tokens[i]. The (batch, table) location must be
-    // the one derived from the statement, and r is re-derived on the same
-    // transcript as the prover.
-    if let Some(tokens) = &lm {
-        let loc = embedding_lookup_column(ops, ops_per_shard, &|len| {
-            find_identity_table_slices(tables, len)
-        });
-        let (si, ci) = match loc {
-            Some(l) => l,
-            None => return false,
-        };
-        let mut gid = 0usize;
-        for k in 0..si {
-            gid += proof.shards[k].witness_columns.len();
-        }
-        gid += ci;
-        if gid >= proof.witness_locations.len() {
-            return false;
-        }
-        let wl = &proof.witness_locations[gid];
-        let tb = match &proof.token_binding {
-            Some(tb) => tb,
-            None => return false,
-        };
-        if tb.batch != wl.x_batch || tb.table != wl.x_table {
-            return false;
-        }
-        if tb.batch >= proof.witness_batches.len() {
-            return false;
-        }
-        let wb = &proof.witness_batches[tb.batch];
-        if tb.table >= wb.num_tables {
-            return false;
-        }
-        let mut ts = Transcript::new(b"zkie-committed-public-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
-        for w in &proof.witness_batches {
-            ts.absorb(&bincode::serialize(&w.commitment).unwrap());
-        }
-        let r: Vec<Goldilocks> = ts.field_vec(wb.arity);
-        if tb.point != r {
-            return false;
-        }
-        let col_len = 1usize << wb.arity;
-        if col_len % tokens.len() != 0 {
-            return false;
-        }
-        let d = col_len / tokens.len();
-        if d == 0 {
-            return false;
-        }
-        let emb_table = match ops.iter().find_map(|op| match op {
-            Op::Lookup { table, .. } => Some(*table),
-            _ => None,
-        }) {
-            Some(t) => t,
-            None => return false,
-        };
-        if emb_table >= tables.len() || tables[emb_table].len() % d != 0 {
-            return false;
-        }
-        let base = tables[emb_table].len() / d;
-        if base != argmax_ops[0].1 {
-            return false; // the expansion base must equal the argmax column count
-        }
-        let x_hat = embedding_x_hat(tokens, base, d, &r);
-        if tb.claimed != x_hat {
-            return false; // proof-carried claimed value must match the recomputed one
-        }
-        let whir = match wb.whir.try_whir(90) { Some(w) => w, None => return false };
-        let protocol = whir.opening_protocol(wb.arity, wb.num_tables);
-        if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &whir,
-            &wb.commitment,
-            &protocol,
-            wb.num_tables,
-            &[tb.table],
-            &[r],
-            &[x_hat],
-            &tb.opening,
-        ) {
-            return false;
-        }
-    }
-
-    let mut kth = 0usize;
-    for (si, &(s, e)) in shard_ranges(ops.len(), ops_per_shard).iter().enumerate() {
-        for (li, op) in ops[s..e].iter().enumerate() {
-            if let Op::Argmax { m, n, .. } = op {
-                let so = &proof.sel_openings[kth];
-                kth += 1;
-                let ap = match &proof.shards[si].ops[li] {
-                    OpProof::Argmax(p) => p,
-                    _ => return false,
-                };
-                if so.points.is_empty() || so.openings.len() != so.points.len() || so.openings.len() != *m {
-                    return false;
-                }
-                let bw = match verifier_whir(so.arity) { Some(w) => w, None => return false };
-                let protocol = bw.opening_protocol(so.arity, 1);
-                // S6: same-column binding at the relation claim point r.
-                let mut r_pt = ap.topk.r.clone();
-                r_pt.resize(so.arity, Goldilocks::ZERO);
-                if so.r_point != r_pt
-                    || bw
-                        .verify(&so.commitment, &so.r_opening, &protocol, &r_pt)
-                        .ok()
-                        != Some(so.r_claimed)
-                    || so.r_claimed != ap.topk.gate_rel.final_evals[2]
-                {
-                    return false;
-                }
-                for i in 0..*m {
-                    let (point, opening) = match &lm {
-                        Some(_) => {
-                            // points derived from the public argmax
-                            let col = proof.argmax_t[i] as usize;
-                            if col >= *n {
-                                return false;
-                            }
-                            let idx = i * *n + col;
-                            let p: Vec<Goldilocks> = (0..so.arity)
-                                .map(|k| Goldilocks::from_u64(((idx >> k) & 1) as u64))
-                                .collect();
-                            if so.points[i] != p {
-                                return false;
-                            }
-                            (p, &so.openings[i])
-                        }
-                        None => (so.points[i].clone(), &so.openings[i]),
-                    };
-                    if bw
-                        .verify(&so.commitment, opening, &protocol, &point)
-                        .ok()
-                        != Some(Goldilocks::ONE)
-                    {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-
-    true
-}
 
 /// Deserialize a committed shard-DAG proof and verify it, root-only: the proof
 /// carries commitment roots and opening proofs, never the committed tensor data.
@@ -13845,7 +12892,26 @@ fn embedding_lookup_column(
 
 /// S6: evaluate the MLE of the public index expansion of the embedding lookup
 /// at `r`: x_hat[i*D + d] = d*base + tokens[i] (base = embedding table len / D).
-fn embedding_x_hat(tokens: &[u32], base: usize, d: usize, r: &[Goldilocks]) -> Goldilocks {
+fn embedding_x_hat(tokens: &[u32], base: usize, d: usize, r: &[Ef]) -> Ef {
+    let mut out = Ef::ZERO;
+    for (i, &t) in tokens.iter().enumerate() {
+        for k in 0..d {
+            let idx = i * d + k;
+            let mut eq = Ef::ONE;
+            for (bit, &rb) in r.iter().enumerate() {
+                let b = ef_u64(((idx >> bit) & 1) as u64);
+                eq = eq * (rb * b + (Ef::ONE - rb) * (Ef::ONE - b));
+            }
+            out = out + eq * ef_u64((k * base + t as usize) as u64);
+        }
+    }
+    out
+}
+
+/// Base-field variant used only by the permanently-closed legacy committed
+/// DAG prover (its verifier always returns `false`); the live bound path uses
+/// the EF version above.
+fn embedding_x_hat_base(tokens: &[u32], base: usize, d: usize, r: &[Goldilocks]) -> Goldilocks {
     let mut out = Goldilocks::ZERO;
     for (i, &t) in tokens.iter().enumerate() {
         for k in 0..d {
@@ -14694,7 +13760,7 @@ mod tests {
         let bytes = bincode::serialize(&proof).unwrap();
         let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
         for step in &mut forged.reverse.steps {
-            if let ReverseReduction::Scale { proof } = &mut step.reduction { proof.input_eval = Some(Goldilocks::ZERO); }
+            if let ReverseReduction::Scale { proof } = &mut step.reduction { proof.input_eval = Some(Ef::ZERO); }
         }
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
         let mut bad_out = execution.clone();
@@ -14730,17 +13796,17 @@ mod tests {
         let x = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
         let out = store.push(vec![Goldilocks::ZERO; 4]);
         let op = Op::Scale { x, out, factor: 0, shift: 1 };
-        let point = vec![Goldilocks::from_u64(2), Goldilocks::from_u64(5)];
+        let point = ef_lift(&[Goldilocks::from_u64(2), Goldilocks::from_u64(5)]);
         // rem_off = 0 is a legal range witness; the field identity then admits
         // value = (half - rem)/2^shift = 1/2, which is not the zero function.
-        let value = Goldilocks::ONE * Goldilocks::TWO.try_inverse().unwrap();
+        let value = Ef::from(Goldilocks::ONE * Goldilocks::TWO.try_inverse().unwrap());
         let zero_bits = vec![vec![Goldilocks::ZERO; 32]];
         let prover_aux = scale_aux(0, 4, zero_bits.clone());
         let verifier_aux = scale_aux(0, 4, zero_bits);
         let mut tp = Transcript::new(b"scale-zero-rebuilt");
         let (proof, claim) = prove_reverse_scale(&store, &op, &point, value, Some(prover_aux), &mut tp)
             .expect("a rebuilt proof for a nonzero field value is constructible");
-        assert_eq!(claim.value, mle::eval(store.get(x), &point));
+        assert_eq!(claim.value, ef_eval(store.get(x), &point));
         let mut tv = Transcript::new(b"scale-zero-rebuilt");
         assert!(verify_reverse_scale(&op, &point, value, Some(&verifier_aux.descriptor), &proof, &mut tv).is_none());
     }
@@ -14813,22 +13879,22 @@ mod tests {
         for l in 1usize..=4 {
             let n = 1usize << l;
             for rmask in 0..n {
-                let r: Vec<Goldilocks> = (0..l).map(|b| if (rmask >> b) & 1 == 1 { Goldilocks::ONE } else { Goldilocks::ZERO }).collect();
-                let eq_r = mle::eq_evals(&r);
+                let r: Vec<Ef> = (0..l).map(|b| if (rmask >> b) & 1 == 1 { Ef::ONE } else { Ef::ZERO }).collect();
+                let eq_r = efo::eq_evals(&r);
                 for zmask in 0..n {
-                    let z: Vec<Goldilocks> = (0..l).map(|b| if (zmask >> b) & 1 == 1 { Goldilocks::ONE } else { Goldilocks::ZERO }).collect();
-                    let eq_z = mle::eq_evals(&z);
-                    let mut direct = Goldilocks::ZERO;
+                    let z: Vec<Ef> = (0..l).map(|b| if (zmask >> b) & 1 == 1 { Ef::ONE } else { Ef::ZERO }).collect();
+                    let eq_z = efo::eq_evals(&z);
+                    let mut direct = Ef::ZERO;
                     for j in 0..n {
-                        let mut inner = Goldilocks::ZERO;
+                        let mut inner = Ef::ZERO;
                         for k in (j + 1)..n { inner = inner + eq_z[k]; }
                         direct = direct + eq_r[j] * inner;
                     }
                     assert_eq!(suffix_kernel_eval(&r, &z), direct, "l={} r={} z={}", l, rmask, zmask);
                     // Coefficient column at the basis index k: C(k) = sum_{j<k} eq(r,j).
-                    let mut prefix = Goldilocks::ZERO;
+                    let mut prefix = Ef::ZERO;
                     for k in 0..n {
-                        let mut expect = Goldilocks::ZERO;
+                        let mut expect = Ef::ZERO;
                         for j in 0..k { expect = expect + eq_r[j]; }
                         assert_eq!(prefix, expect, "prefix mismatch at k={}", k);
                         prefix = prefix + eq_r[k];
@@ -14850,57 +13916,57 @@ mod tests {
             Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO,
             Goldilocks::ONE, Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO,
         ];
-        let r_rows = vec![Goldilocks::from_u64(7)];
-        let r_col = vec![Goldilocks::from_u64(3), Goldilocks::from_u64(5)];
-        let eq_rows = mle::eq_evals(&r_rows);
-        let eq_col = mle::eq_evals(&r_col);
+        let r_rows = ef_lift(&[Goldilocks::from_u64(7)]);
+        let r_col = ef_lift(&[Goldilocks::from_u64(3), Goldilocks::from_u64(5)]);
+        let eq_rows = efo::eq_evals(&r_rows);
+        let eq_col = efo::eq_evals(&r_col);
         let terms = known_sel_terms();
 
         // out binding: K(i,j) = eq(r_rows,i) * j.
-        let mut known_out = vec![Goldilocks::ZERO; m * n];
+        let mut known_out = vec![Ef::ZERO; m * n];
         for i in 0..m {
             for j in 0..n {
-                known_out[i * n + j] = eq_rows[i] * Goldilocks::from_u64(j as u64);
+                known_out[i * n + j] = eq_rows[i] * ef_u64(j as u64);
             }
         }
-        let target_out = known_out.iter().zip(sel.iter()).fold(Goldilocks::ZERO, |a, (&k, &s)| a + k * s);
+        let target_out = known_out.iter().zip(sel.iter()).fold(Ef::ZERO, |a, (&k, &s)| a + k * Ef::from(s));
         let out_vec: Vec<Goldilocks> = (0..m).map(|i| Goldilocks::from_u64(if i == 0 { 0 } else { 1 })).collect();
-        assert_eq!(target_out, mle::eval(&out_vec, &r_rows));
+        assert_eq!(target_out, ef_eval(&out_vec, &r_rows));
         let mut tp = Transcript::new(b"argmax-out-binding");
-        let (proof, point) = prove_known_sel_sum(&known_out, &sel, target_out, &mut tp);
+        let (proof, point) = prove_known_sel_sum(&known_out, &ef_lift(&sel), target_out, &mut tp);
         let mut tv = Transcript::new(b"argmax-out-binding");
-        let (ok, point_v, final_claim) = verify_virtual(&proof, &terms, target_out, 3, &mut tv);
+        let (ok, point_v, final_claim) = efo::verify_virtual(&proof, &terms, target_out, 3, &mut tv);
         assert!(ok && point == point_v);
         let (z_j, z_i) = point.split_at(2);
-        let known_eval = mle::eq_poly(&r_rows, z_i) * mle_integer(z_j);
-        let sel_eval = mle::eval(&sel, &point);
-        assert_eq!(final_claim, virtual_eval(&terms, &[known_eval, sel_eval]));
+        let known_eval = efo::eq_poly(&r_rows, z_i).unwrap() * mle_integer(z_j);
+        let sel_eval = ef_eval(&sel, &point);
+        assert_eq!(final_claim, efo::virtual_eval(&terms, &[known_eval, sel_eval]));
 
         // before suffix relation: before(r_i,r_j) = sum_{i,k} eq(r_rows,i) C(k) sel(i,k),
         // with C(k) = sum_{j<k} eq(r_col,j).
-        let mut coeff = vec![Goldilocks::ZERO; n];
-        let mut acc = Goldilocks::ZERO;
+        let mut coeff = vec![Ef::ZERO; n];
+        let mut acc = Ef::ZERO;
         for k in 0..n {
             coeff[k] = acc;
             acc = acc + eq_col[k];
         }
-        let mut known_before = vec![Goldilocks::ZERO; m * n];
+        let mut known_before = vec![Ef::ZERO; m * n];
         for i in 0..m {
             for k in 0..n {
                 known_before[i * n + k] = eq_rows[i] * coeff[k];
             }
         }
-        let combined: Vec<Goldilocks> = r_col.iter().chain(r_rows.iter()).cloned().collect();
-        let target_before = mle::eval(&before, &combined);
+        let combined: Vec<Ef> = r_col.iter().chain(r_rows.iter()).cloned().collect();
+        let target_before = ef_eval(&before, &combined);
         let mut tp2 = Transcript::new(b"argmax-before-binding");
-        let (proof2, point2) = prove_known_sel_sum(&known_before, &sel, target_before, &mut tp2);
+        let (proof2, point2) = prove_known_sel_sum(&known_before, &ef_lift(&sel), target_before, &mut tp2);
         let mut tv2 = Transcript::new(b"argmax-before-binding");
-        let (ok2, point2_v, final2) = verify_virtual(&proof2, &terms, target_before, 3, &mut tv2);
+        let (ok2, point2_v, final2) = efo::verify_virtual(&proof2, &terms, target_before, 3, &mut tv2);
         assert!(ok2 && point2 == point2_v);
         let (z_k, z_i2) = point2.split_at(2);
-        let known2 = mle::eq_poly(&r_rows, z_i2) * suffix_kernel_eval(&r_col, z_k);
-        let sel_eval2 = mle::eval(&sel, &point2);
-        assert_eq!(final2, virtual_eval(&terms, &[known2, sel_eval2]));
+        let known2 = efo::eq_poly(&r_rows, z_i2).unwrap() * suffix_kernel_eval(&r_col, z_k);
+        let sel_eval2 = ef_eval(&sel, &point2);
+        assert_eq!(final2, efo::virtual_eval(&terms, &[known2, sel_eval2]));
     }
 
     #[test]
@@ -14916,34 +13982,34 @@ mod tests {
         ];
         for l in 0..=4usize {
             let n = 1usize << l;
-            let base: Vec<Goldilocks> = samples[l].iter().map(|&v| Goldilocks::from_u64(v)).collect();
-            let sevens: Vec<Goldilocks> = (0..l).map(|_| Goldilocks::from_u64(7)).collect();
-            let mut pairs: Vec<(Vec<Goldilocks>, Vec<Goldilocks>)> = Vec::new();
+            let base: Vec<Ef> = samples[l].iter().map(|&v| ef_u64(v)).collect();
+            let sevens: Vec<Ef> = (0..l).map(|_| ef_u64(7)).collect();
+            let mut pairs: Vec<(Vec<Ef>, Vec<Ef>)> = Vec::new();
             pairs.push((base.clone(), base.clone())); // r == z
             pairs.push((base.clone(), sevens.clone()));
             pairs.push((sevens.clone(), base.clone()));
             if l > 0 {
                 // Highest-bit boundary: equal low bits, differing top bit.
-                let mut hi0: Vec<Goldilocks> = (0..l).map(|b| Goldilocks::from_u64(3 + b as u64)).collect();
+                let mut hi0: Vec<Ef> = (0..l).map(|b| ef_u64(3 + b as u64)).collect();
                 let mut hi1 = hi0.clone();
-                hi0[l - 1] = Goldilocks::ZERO;
-                hi1[l - 1] = Goldilocks::ONE;
+                hi0[l - 1] = Ef::ZERO;
+                hi1[l - 1] = Ef::ONE;
                 pairs.push((hi0.clone(), hi1.clone()));
                 pairs.push((hi1, hi0));
             }
             for (pi, (r, z)) in pairs.into_iter().enumerate() {
-                let eq_r = mle::eq_evals(&r);
-                let eq_z = mle::eq_evals(&z);
-                let mut direct = Goldilocks::ZERO;
+                let eq_r = efo::eq_evals(&r);
+                let eq_z = efo::eq_evals(&z);
+                let mut direct = Ef::ZERO;
                 for j in 0..n {
                     for k in (j + 1)..n {
                         direct = direct + eq_r[j] * eq_z[k];
                     }
                 }
                 assert_eq!(suffix_kernel_eval(&r, &z), direct, "l={} pair={}", l, pi);
-                let mut prefix = Goldilocks::ZERO;
+                let mut prefix = Ef::ZERO;
                 for k in 0..n {
-                    let mut expect = Goldilocks::ZERO;
+                    let mut expect = Ef::ZERO;
                     for j in 0..k { expect = expect + eq_r[j]; }
                     assert_eq!(prefix, expect, "l={} pair={} k={}", l, pi, k);
                     prefix = prefix + eq_r[k];
@@ -15054,23 +14120,25 @@ mod tests {
             unweighted = unweighted + sel[p] * (Goldilocks::ONE - sel[p]);
         }
         assert_eq!(unweighted, Goldilocks::ZERO);
+        let sel_ef = ef_lift(&sel);
+        let before_ef = ef_lift(&before);
         let mut tp = Transcript::new(b"zkie-argmax-selbool-malicious");
-        let q: Vec<Goldilocks> = tp.field_vec(arity);
-        let eq = mle::eq_evals(&q);
-        let g = tp.field();
+        let q: Vec<Ef> = tp.ef_field_vec(arity);
+        let eq = efo::eq_evals(&q);
+        let g = tp.ef_field();
         let terms = argmax_sel_bool_terms(g);
         assert!(terms.iter().all(|(_, idxs)| idxs.first() == Some(&0usize)),
             "production sel_bool terms must be eq-weighted (index 0)");
-        let mles: Vec<&[Goldilocks]> = vec![&eq, &sel, &before];
-        let (proof, _z) = prove_virtual(&mles, &terms, Goldilocks::ZERO, &mut tp);
+        let mles: Vec<&[Ef]> = vec![&eq, &sel_ef, &before_ef];
+        let (proof, _z) = efo::prove_virtual(&mles, &terms, Ef::ZERO, &mut tp);
         let mut tv = Transcript::new(b"zkie-argmax-selbool-malicious");
-        let qv: Vec<Goldilocks> = tv.field_vec(arity);
-        let gv = tv.field();
+        let qv: Vec<Ef> = tv.ef_field_vec(arity);
+        let gv = tv.ef_field();
         assert_eq!(gv, g);
-        let (ok, zv, fc) = verify_virtual(&proof, &terms, Goldilocks::ZERO, arity, &mut tv);
+        let (ok, zv, fc) = efo::verify_virtual(&proof, &terms, Ef::ZERO, arity, &mut tv);
         if ok {
-            let ev = [mle::eq_poly(&qv, &zv), mle::eval(&sel, &zv), mle::eval(&before, &zv)];
-            assert_ne!(fc, virtual_eval(&terms, &ev),
+            let ev = [efo::eq_poly(&qv, &zv).unwrap(), ef_eval(&sel, &zv), ef_eval(&before, &zv)];
+            assert_ne!(fc, efo::virtual_eval(&terms, &ev),
                 "a non-boolean witness with vanishing unweighted sums must not certify the zero claim");
         }
     }
@@ -15091,22 +14159,23 @@ mod tests {
             unweighted = unweighted + bit[p] * (Goldilocks::ONE - bit[p]);
         }
         assert_eq!(unweighted, Goldilocks::ZERO);
+        let bit_ef = ef_lift(&bit);
         let mut tp = Transcript::new(b"zkie-argmax-bitbool-malicious");
-        let q: Vec<Goldilocks> = tp.field_vec(arity);
-        let eq = mle::eq_evals(&q);
-        let g = tp.field();
+        let q: Vec<Ef> = tp.ef_field_vec(arity);
+        let eq = efo::eq_evals(&q);
+        let g = tp.ef_field();
         let terms = argmax_bit_bool_terms(g, 1);
         assert!(terms.iter().all(|(_, idxs)| idxs.first() == Some(&0usize)),
             "production bit_bool terms must be eq-weighted (index 0)");
-        let mles: Vec<&[Goldilocks]> = vec![&eq, &bit];
-        let (proof, _z) = prove_virtual(&mles, &terms, Goldilocks::ZERO, &mut tp);
+        let mles: Vec<&[Ef]> = vec![&eq, &bit_ef];
+        let (proof, _z) = efo::prove_virtual(&mles, &terms, Ef::ZERO, &mut tp);
         let mut tv = Transcript::new(b"zkie-argmax-bitbool-malicious");
-        let qv: Vec<Goldilocks> = tv.field_vec(arity);
-        let _gv = tv.field();
-        let (ok, zv, fc) = verify_virtual(&proof, &terms, Goldilocks::ZERO, arity, &mut tv);
+        let qv: Vec<Ef> = tv.ef_field_vec(arity);
+        let _gv = tv.ef_field();
+        let (ok, zv, fc) = efo::verify_virtual(&proof, &terms, Ef::ZERO, arity, &mut tv);
         if ok {
-            let ev = [mle::eq_poly(&qv, &zv), mle::eval(&bit, &zv)];
-            assert_ne!(fc, virtual_eval(&terms, &ev),
+            let ev = [efo::eq_poly(&qv, &zv).unwrap(), ef_eval(&bit, &zv)];
+            assert_ne!(fc, efo::virtual_eval(&terms, &ev),
                 "a non-boolean bit witness with vanishing unweighted sums must not certify the zero claim");
         }
     }
@@ -15135,13 +14204,13 @@ mod tests {
     #[test]
     fn reverse_gelu_index_preserves_clamp_boundaries_and_negative_offset() {
         let input: Vec<_> = [-5, -2, -1, 1, 2, 3, 4, 5].into_iter().map(from_i64).collect();
-        let point = vec![Goldilocks::from_u64(2), Goldilocks::from_u64(3), Goldilocks::from_u64(4)];
+        let point = ef_lift(&[Goldilocks::from_u64(2), Goldilocks::from_u64(3), Goldilocks::from_u64(4)]);
         for (offset, expected) in [
             (2, vec![0, 0, 1, 3, 3, 3, 3, 3]),
             (-2, vec![0, 0, 0, 0, 0, 1, 2, 3]),
         ] {
             let expected: Vec<_> = expected.into_iter().map(from_i64).collect();
-            let value = mle::eval(&expected, &point);
+            let value = ef_eval(&expected, &point);
             let aux = build_gelu_range_aux(&input, 0, input.len(),
                 input.len().trailing_zeros().max(5) as usize).unwrap();
             let aux_desc = aux.descriptor.clone();
@@ -15149,7 +14218,7 @@ mod tests {
             let (proof, _) = prove_reverse_gelu_index(&input, offset, 4, &point, value, aux, &mut tp).unwrap();
             let mut tv = Transcript::new(b"gelu-boundaries");
             let leaves = verify_reverse_gelu_index(offset, 4, &point, value, Some(&aux_desc), &proof, &mut tv).unwrap();
-            assert!(leaves.iter().all(|(p, v)| mle::eval(&input, p) == *v));
+            assert!(leaves.iter().all(|(p, v)| ef_eval(&input, p) == *v));
         }
     }
 
@@ -15168,9 +14237,9 @@ mod tests {
 
     fn gelu_direct_roundtrip(input: &[Goldilocks], offset: i64, table_len: usize) -> bool {
         let arity = input.len().trailing_zeros() as usize;
-        let point = gelu_direct_point(arity);
+        let point = ef_lift(&gelu_direct_point(arity));
         let expected = gelu_direct_expected(input, offset, table_len);
-        let value = mle::eval(&expected, &point);
+        let value = ef_eval(&expected, &point);
         let aux = build_gelu_range_aux(input, 0, input.len(),
             input.len().trailing_zeros().max(5) as usize).unwrap();
         let desc = aux.descriptor.clone();
@@ -15178,7 +14247,7 @@ mod tests {
             &mut Transcript::new(b"gelu-bounds")).unwrap();
         let leaves = verify_reverse_gelu_index(offset, table_len, &point, value, Some(&desc), &proof,
             &mut Transcript::new(b"gelu-bounds")).unwrap();
-        leaves.iter().all(|(p, v)| mle::eval(input, p) == *v)
+        leaves.iter().all(|(p, v)| ef_eval(input, p) == *v)
     }
 
     /// Project ② step 1: the 25-bit signed domain [-2^24, 2^24) is accepted
@@ -15214,8 +14283,8 @@ mod tests {
     fn gelu_index_domain_wrap_and_contract_rejected() {
         let bound = 1i64 << 24;
         let good: Vec<_> = (0..8).map(from_i64).collect();
-        let point = gelu_direct_point(3);
-        let value = mle::eval(&gelu_direct_expected(&good, 0, 1), &point);
+        let point = ef_lift(&gelu_direct_point(3));
+        let value = ef_eval(&gelu_direct_expected(&good, 0, 1), &point);
         let aux = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
         let desc = aux.descriptor.clone();
         let (proof, _) = prove_reverse_gelu_index(&good, 0, 1, &point, value, aux,
@@ -15263,7 +14332,7 @@ mod tests {
         // / range virtual binding (the precommitted bits cannot be re-pointed
         // at a wrapped x).
         let mut forged = proof;
-        forged.x_range.final_evals[1] += Goldilocks::ONE;
+        forged.x_range.final_evals[1] += Ef::ONE;
         assert!(verify_reverse_gelu_index(0, 1, &point, value, Some(&desc), &forged,
             &mut Transcript::new(b"gelu-neg")).is_none(),
             "forged range x eval must be rejected");
@@ -15563,9 +14632,9 @@ mod tests {
         let pair_desc = pairs.descriptor.clone();
         let mult_desc = mult.descriptor.clone();
         let mut prover = Transcript::new(b"padded-identity-forgery");
-        let (proof, _, _) = prove_reverse_lookup(&store, &ops[0], &[], from_i64(3), pairs, mult, &model, false, None, &mut prover).unwrap();
+        let (proof, _, _) = prove_reverse_lookup(&store, &ops[0], &[], Ef::from(from_i64(3)), pairs, mult, &model, false, None, &mut prover).unwrap();
         let mut verifier = Transcript::new(b"padded-identity-forgery");
-        assert!(verify_reverse_lookup(&ops[0], &[], from_i64(3), &pair_desc, &mult_desc, &model, false, None, &proof, &mut verifier).is_none());
+        assert!(verify_reverse_lookup(&ops[0], &[], Ef::from(from_i64(3)), &pair_desc, &mult_desc, &model, false, None, &proof, &mut verifier).is_none());
     }
 
     #[test]
@@ -15595,8 +14664,8 @@ mod tests {
         let index = TensorKey::Index(0).encoded().unwrap();
         assert_ne!(field, index);
         let seeds = vec![
-            EvalClaim { tensor_id: field, point: vec![], value: from_i64(3) },
-            EvalClaim { tensor_id: index, point: vec![], value: from_i64(9) },
+            EfClaim { tensor_id: field, point: vec![], value: Ef::from(from_i64(3)) },
+            EfClaim { tensor_id: index, point: vec![], value: Ef::from(from_i64(9)) },
         ];
         let groups = reverse_setup(&[], &seeds, &mut Transcript::new(b"typed-keys")).unwrap();
         assert_eq!(groups.len(), 2);
@@ -15613,31 +14682,31 @@ mod tests {
         let out = store.push(vec![]);
         let ops = vec![Op::Add { a, b, c: z }, Op::MatMul { a: z, b: w, c: out, m: 2, k: 2, n: 2 }];
         forward_ops(&mut store, &ops);
-        let point = vec![Goldilocks::from_u64(3), Goldilocks::from_u64(5)];
-        let claim = EvalClaim { tensor_id: out, value: mle::eval(store.get(out), &point), point };
+        let point = ef_lift(&[Goldilocks::from_u64(3), Goldilocks::from_u64(5)]);
+        let claim = EfClaim { tensor_id: out, value: ef_eval(store.get(out), &point), point };
         let mut prover = Transcript::new(b"reverse-add-matmul");
         let proof = prove_reverse_dag(&store, &ops, &[claim.clone()], &mut prover).unwrap();
         let mut verifier = Transcript::new(b"reverse-add-matmul");
         let leaves = verify_reverse_dag(&ops, &[claim.clone()], &proof, &mut verifier).unwrap();
         assert!(!leaves.is_empty());
         assert!(leaves.iter().all(|leaf| [a, b, w].contains(&leaf.tensor_id)
-            && mle::eval(store.get(leaf.tensor_id), &leaf.point) == leaf.value));
+            && ef_eval(store.get(leaf.tensor_id), &leaf.point) == leaf.value));
         // A forged producer split can preserve its sum but must not match
         // the independently authenticated input tensors.
         let mut forged = prove_reverse_dag(&store, &ops, &[claim.clone()], &mut Transcript::new(b"reverse-add-matmul")).unwrap();
         for step in &mut forged.steps {
             if let ReverseReduction::Add { a, b } = &mut step.reduction {
-                *a += Goldilocks::ONE;
-                *b -= Goldilocks::ONE;
+                *a += Ef::ONE;
+                *b -= Ef::ONE;
             }
         }
         let mut verifier = Transcript::new(b"reverse-add-matmul");
         if let Some(bad_leaves) = verify_reverse_dag(&ops, &[claim.clone()], &forged, &mut verifier) {
-            assert!(bad_leaves.iter().any(|leaf| mle::eval(store.get(leaf.tensor_id), &leaf.point) != leaf.value));
+            assert!(bad_leaves.iter().any(|leaf| ef_eval(store.get(leaf.tensor_id), &leaf.point) != leaf.value));
         }
 
         let mut wrong = claim.clone();
-        wrong.value += Goldilocks::ONE;
+        wrong.value += Ef::ONE;
         let mut verifier = Transcript::new(b"reverse-add-matmul");
         assert!(verify_reverse_dag(&ops, &[wrong], &proof, &mut verifier).is_none());
     }
@@ -16149,19 +15218,19 @@ mod tests {
         let out = store.push(vec![]);
         let ops = vec![Op::Relu { x, out }];
         forward_ops(&mut store, &ops);
-        let point = vec![Goldilocks::ZERO, Goldilocks::ZERO];
-        let claim = EvalClaim { tensor_id: out, point, value: from_i64(5) };
+        let point = vec![Ef::ZERO, Ef::ZERO];
+        let claim = EfClaim { tensor_id: out, point, value: Ef::from(from_i64(5)) };
         let proof = prove_reverse_dag(&store, &ops, &[claim.clone()], &mut Transcript::new(b"reverse-relu")).unwrap();
         let leaves = verify_reverse_dag(&ops, &[claim.clone()], &proof, &mut Transcript::new(b"reverse-relu")).unwrap();
-        assert!(leaves.iter().all(|c| c.tensor_id == x && mle::eval(store.get(x), &c.point) == c.value));
+        assert!(leaves.iter().all(|c| c.tensor_id == x && ef_eval(store.get(x), &c.point) == c.value));
         let mut wrong_positive = claim.clone();
-        wrong_positive.value = Goldilocks::ZERO;
+        wrong_positive.value = Ef::ZERO;
         assert!(verify_reverse_dag(&ops, &[wrong_positive], &proof, &mut Transcript::new(b"reverse-relu")).is_none());
-        let wrong_negative = EvalClaim { tensor_id: out, point: vec![Goldilocks::ONE, Goldilocks::ZERO], value: from_i64(-5) };
+        let wrong_negative = EfClaim { tensor_id: out, point: vec![Ef::ONE, Ef::ZERO], value: Ef::from(from_i64(-5)) };
         assert!(prove_reverse_dag(&store, &ops, &[wrong_negative], &mut Transcript::new(b"reverse-relu")).is_none());
         store.get_mut(x)[0] = from_i64(bound);
         forward_ops(&mut store, &ops);
-        let out_of_range = EvalClaim { tensor_id: out, point: vec![Goldilocks::ZERO, Goldilocks::ZERO], value: from_i64(bound) };
+        let out_of_range = EfClaim { tensor_id: out, point: vec![Ef::ZERO, Ef::ZERO], value: Ef::from(from_i64(bound)) };
         assert!(prove_reverse_dag(&store, &ops, &[out_of_range], &mut Transcript::new(b"reverse-relu")).is_none());
     }
 
@@ -16555,8 +15624,8 @@ mod tests {
         let pow = Whir::required_pow_bits(arity, 90);
         let table_whir = Whir::with_params(arity, 90, pow);
         let commitment = commit(&table_whir, &padded);
-        let p_new: Vec<Goldilocks> = (0..arity).map(|_| rng.field()).collect();
-        let (open_new, ev_new) = table_whir.open(commitment.prover_data.clone(), &commitment.protocol, &p_new);
+        let p_new: Vec<Ef> = (0..arity).map(|_| rng.ef_field()).collect();
+        let (open_new, ev_new) = table_whir.open_ef(commitment.prover_data.clone(), &commitment.protocol, &p_new);
         let mut forged: BoundExecutionProof = bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
         let mut hit = false;
         for step in &mut forged.reverse.steps {
@@ -18069,7 +17138,7 @@ mod tests {
         let mut forged3: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
         for step in &mut forged3.reverse.steps {
             if let ReverseReduction::GatherMatMul { proof } = &mut step.reduction {
-                proof.table = vec![Goldilocks::from_u64(1), Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO];
+                proof.table = vec![ef_u64(1), Ef::ZERO, Ef::ZERO, Ef::ZERO];
                 proof.matmul.sumcheck.final_evals[1] = proof.aux_values[0];
             }
         }
@@ -18131,25 +17200,28 @@ mod tests {
             let mut mask = vec![Goldilocks::ZERO; len];
             for pos in 0..s_pos { mask[pos] = Goldilocks::ONE; }
             let mut tp = Transcript::new(b"zkie-s7-routing-relation");
-            let q: Vec<Goldilocks> = tp.field_vec(arity);
-            let eq = mle::eq_evals(&q);
-            let gamma = tp.field();
+            let q: Vec<Ef> = tp.ef_field_vec(arity);
+            let eq = efo::eq_evals(&q);
+            let gamma = tp.ef_field();
             let terms = expert_routing_terms(gamma, e_count);
-            let mut mles: Vec<&[Goldilocks]> = vec![&eq];
-            for c in &cols { mles.push(c); }
-            mles.push(&expert_col);
-            mles.push(&mask);
-            let (proof, z) = prove_virtual(&mles, &terms, Goldilocks::ZERO, &mut tp);
+            let cols_ef = lift_columns(&cols);
+            let expert_ef = ef_lift(&expert_col);
+            let mask_ef = ef_lift(&mask);
+            let mut mles: Vec<&[Ef]> = vec![&eq];
+            for c in &cols_ef { mles.push(c); }
+            mles.push(&expert_ef);
+            mles.push(&mask_ef);
+            let (proof, z) = efo::prove_virtual(&mles, &terms, Ef::ZERO, &mut tp);
             let mut tv = Transcript::new(b"zkie-s7-routing-relation");
-            let _q: Vec<Goldilocks> = tv.field_vec(arity);
-            let _g: Goldilocks = tv.field();
-            let (ok, zv, fc) = verify_virtual(&proof, &terms, Goldilocks::ZERO, arity, &mut tv);
+            let _q: Vec<Ef> = tv.ef_field_vec(arity);
+            let _g: Ef = tv.ef_field();
+            let (ok, zv, fc) = efo::verify_virtual(&proof, &terms, Ef::ZERO, arity, &mut tv);
             let clean = ok && {
-                let mut ev = vec![mle::eq_poly(&q, &zv)];
-                for c in &cols { ev.push(mle::eval(c, &zv)); }
-                ev.push(mle::eval(&expert_col, &zv));
-                ev.push(mle::eval(&mask, &zv));
-                fc == virtual_eval(&terms, &ev)
+                let mut ev = vec![efo::eq_poly(&q, &zv).unwrap()];
+                for c in &cols { ev.push(ef_eval(c, &zv)); }
+                ev.push(ef_eval(&expert_col, &zv));
+                ev.push(ef_eval(&mask, &zv));
+                fc == efo::virtual_eval(&terms, &ev)
             };
             (clean, z)
         };
@@ -19044,21 +18116,21 @@ mod tests {
     /// malicious prover can also supply matching claimed values; only the
     /// relation/broadcast checks then stand between it and acceptance.
     fn topk_test_outs(op: &Op, wcols: &[Vec<Goldilocks>], tcols: &[Vec<Goldilocks>],
-        arity: usize, lgm: usize, thr_arity: usize) -> Vec<(T, Vec<Goldilocks>, Goldilocks)> {
+        arity: usize, lgm: usize, thr_arity: usize) -> Vec<(T, Vec<Ef>, Ef)> {
         let (_x, sel, thr, gate, d1, d2, _m, _n, _k) = topk_dims(op).unwrap();
-        let qs: Vec<Goldilocks> = (0..arity).map(|b| Goldilocks::from_u64(1 + (b as u64) % 5)).collect();
-        let qg: Vec<Goldilocks> = (0..arity).map(|b| Goldilocks::from_u64(2 + (b as u64) % 3)).collect();
-        let qd: Vec<Goldilocks> = (0..arity).map(|b| Goldilocks::from_u64(3 + (b as u64) % 4)).collect();
-        let q2: Vec<Goldilocks> = (0..arity).map(|b| Goldilocks::from_u64(4 + (b as u64) % 2)).collect();
-        let qt: Vec<Goldilocks> = (0..lgm).map(|b| Goldilocks::from_u64(5 + (b as u64) % 3)).collect();
-        let pe = |v: &[Goldilocks], p: &[Goldilocks]| mle::eval(v, &argmax_pad_point(p, arity));
+        let qs: Vec<Ef> = (0..arity).map(|b| ef_u64(1 + (b as u64) % 5)).collect();
+        let qg: Vec<Ef> = (0..arity).map(|b| ef_u64(2 + (b as u64) % 3)).collect();
+        let qd: Vec<Ef> = (0..arity).map(|b| ef_u64(3 + (b as u64) % 4)).collect();
+        let q2: Vec<Ef> = (0..arity).map(|b| ef_u64(4 + (b as u64) % 2)).collect();
+        let qt: Vec<Ef> = (0..lgm).map(|b| ef_u64(5 + (b as u64) % 3)).collect();
+        let pe = |v: &[Goldilocks], p: &[Ef]| ef_eval(v, &argmax_pad_point(p, arity));
         let vs = pe(&wcols[TK_SEL_COL], &qs);
         let vg = pe(&wcols[TK_GATE_COL], &qg);
-        let mut vd = Goldilocks::ZERO;
-        for b in 0..TK_RANGE_BITS { vd = vd + Goldilocks::from_u64(1u64 << b) * pe(&wcols[TK_D1_COL + b], &qd); }
-        let mut v2 = Goldilocks::ZERO;
-        for b in 0..TK_RANGE_BITS { v2 = v2 + Goldilocks::from_u64(1u64 << b) * pe(&wcols[TK_D2S_COL + b], &q2); }
-        let vt = mle::eval(&tcols[0], &argmax_pad_point(&qt, thr_arity));
+        let mut vd = Ef::ZERO;
+        for b in 0..TK_RANGE_BITS { vd = vd + ef_u64(1u64 << b) * pe(&wcols[TK_D1_COL + b], &qd); }
+        let mut v2 = Ef::ZERO;
+        for b in 0..TK_RANGE_BITS { v2 = v2 + ef_u64(1u64 << b) * pe(&wcols[TK_D2S_COL + b], &q2); }
+        let vt = ef_eval(&tcols[0], &argmax_pad_point(&qt, thr_arity));
         vec![(sel, qs, vs), (thr, qt, vt), (gate, qg, vg), (d1, qd, vd), (d2, q2, v2)]
     }
 
@@ -20237,14 +19309,14 @@ mod tests {
         let odesc = scatter_order.descriptor.clone();
         let tk = TensorKey::Index(token_id).encoded().unwrap();
         let ek = TensorKey::Index(expert_of).encoded().unwrap();
-        let q_tok: Vec<Goldilocks> = (0..lb).map(|b| Goldilocks::from_u64(2 + (b as u64) % 3)).collect();
-        let q_exp: Vec<Goldilocks> = (0..lb).map(|b| Goldilocks::from_u64(3 + (b as u64) % 4)).collect();
+        let q_tok: Vec<Ef> = (0..lb).map(|b| ef_u64(2 + (b as u64) % 3)).collect();
+        let q_exp: Vec<Ef> = (0..lb).map(|b| ef_u64(3 + (b as u64) % 4)).collect();
         let p_tok = argmax_pad_point(&q_tok, arity);
         let p_exp = argmax_pad_point(&q_exp, arity);
-        let mut v_tok = Goldilocks::ZERO;
-        for t in 0..m { v_tok = v_tok + Goldilocks::from_u64(t as u64) * mle::eval(&cols[t], &p_tok); }
-        let mut v_exp = Goldilocks::ZERO;
-        for e in 0..n { v_exp = v_exp + Goldilocks::from_u64(e as u64) * mle::eval(&cols[m + e], &p_exp); }
+        let mut v_tok = Ef::ZERO;
+        for t in 0..m { v_tok = v_tok + ef_u64(t as u64) * ef_eval(&cols[t], &p_tok); }
+        let mut v_exp = Ef::ZERO;
+        for e in 0..n { v_exp = v_exp + ef_u64(e as u64) * ef_eval(&cols[m + e], &p_exp); }
         let sout = vec![(tk, q_tok, v_tok), (ek, q_exp, v_exp)];
 
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-scatter-dup");
@@ -23003,7 +22075,7 @@ mod tests {
         if let Some(w) = p.weight_openings.first_mut() {
             w.table_idxs.push(usize::MAX);
             w.points.push(Vec::new());
-            w.claimed.push(Goldilocks::ZERO);
+            w.claimed.push(Ef::ZERO);
         }
         check("out-of-range weight table index", &p);
         let mut p = decode();
@@ -23019,7 +22091,7 @@ mod tests {
         let mut p = decode();
         for s in &mut p.reverse.steps {
             for o in &mut s.outputs {
-                o.point.push(Goldilocks::ONE);
+                o.point.push(Ef::ONE);
                 o.merge = None;
             }
         }

@@ -391,6 +391,26 @@ pub fn mle_eval_at_ef(values: &[Goldilocks], point: &[Ef]) -> Option<Ef> {
     Some(buf[0])
 }
 
+/// Evaluate an EF-valued MLE at an EF point (length-checked).
+pub fn eval_ef_slice(values: &[Ef], point: &[Ef]) -> Option<Ef> {
+    let t = point.len();
+    if t >= usize::BITS as usize || values.len() != 1usize.checked_shl(t as u32)? {
+        return None;
+    }
+    let mut buf = values.to_vec();
+    let mut size = buf.len();
+    for &p in point {
+        let half = size / 2;
+        for i in 0..half {
+            let a = buf[2 * i];
+            let b = buf[2 * i + 1];
+            buf[i] = a + p * (b - a);
+        }
+        size = half;
+    }
+    Some(buf[0])
+}
+
 /// EF same-poly merge over a base-field MLE.
 pub fn prove_same_poly(
     f: &[Goldilocks],
