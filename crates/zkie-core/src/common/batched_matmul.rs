@@ -95,9 +95,20 @@ pub fn verify(
     u: &[Goldilocks],
     transcript: &mut Transcript,
 ) -> (bool, Vec<Goldilocks>) {
-    assert_eq!(u.len(), s.trailing_zeros() as usize);
+    // O4: for the row-major (pos*K + d) layout with power-of-two S and K, the
+    // public broadcast selector eq_b[pos*K + d] = eq_u[pos] is independent of
+    // the low d variables. Its MLE at the sumcheck challenge ch is therefore
+    // eq_u evaluated at the high position variables ch[logK..]; the verifier
+    // needs no S*K expansion. Non-power-of-two shapes fail closed: padding
+    // must already be expressed by the caller's masked/zeroed domain, not by
+    // truncating coordinates here.
+    if !s.is_power_of_two() || !k.is_power_of_two() {
+        return (false, Vec::new());
+    }
+    if u.len() != s.trailing_zeros() as usize {
+        return (false, Vec::new());
+    }
     let eq_u = mle::eq_evals(u);
-    let eq_b = broadcast_eq(&eq_u, k);
     let (ok, ch, final_claim) = verify_virtual(
         &proof.sumcheck,
         &terms(),
@@ -108,7 +119,11 @@ pub fn verify(
     if !ok {
         return (false, ch);
     }
-    let eq_final = mle::eval(&eq_b, &ch);
+    let k_bits = k.trailing_zeros() as usize;
+    if ch.len() != (s * k).trailing_zeros() as usize || ch.len() < k_bits {
+        return (false, ch);
+    }
+    let eq_final = mle::eval(&eq_u, &ch[k_bits..]);
     let final_evals = vec![
         proof.sumcheck.final_evals[0],
         proof.sumcheck.final_evals[1],
@@ -941,6 +956,49 @@ mod gather_matmul_proof_tests {
         }
         let (ok2, _) = verify_gather_matmul(&bad, s, k, &u, &mut tv2);
         assert!(!ok2);
+    }
+}
+
+#[cfg(test)]
+mod o4_tests {
+    use super::*;
+    use crate::common::field::{ChallengeSource, XorShift64};
+
+    /// O4: the closed form eq_u(ch[logK..]) must equal the full S*K broadcast
+    /// column evaluated at ch, for several power-of-two shapes and random
+    /// points (including K=1 and S=1).
+    #[test]
+    fn broadcast_eq_closed_form_matches_expansion() {
+        let mut rng = XorShift64::new(0x04A4);
+        for (s, k) in [(1usize, 1usize), (2, 4), (8, 16), (32, 64), (4, 1), (1, 8)] {
+            let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize)
+                .map(|_| rng.field())
+                .collect();
+            let sk_bits = (s * k).trailing_zeros() as usize;
+            let ch: Vec<Goldilocks> = (0..sk_bits).map(|_| rng.field()).collect();
+            let eq_u = mle::eq_evals(&u);
+            let full = broadcast_eq(&eq_u, k);
+            let full_eval = mle::eval(&full, &ch);
+            let k_bits = k.trailing_zeros() as usize;
+            let closed = mle::eval(&eq_u, &ch[k_bits..]);
+            assert_eq!(full_eval, closed, "closed form mismatch for s={s}, k={k}");
+        }
+    }
+
+    /// Non-power-of-two layouts are outside the closed-form contract and must
+    /// fail closed rather than truncating coordinates.
+    #[test]
+    fn verify_rejects_non_power_of_two_shapes() {
+        let proof = BatchedMatmulProof {
+            claimed: Goldilocks::ZERO,
+            sumcheck: VirtualProof { rounds: Vec::new(), final_evals: Vec::new() },
+        };
+        let mut t = Transcript::new(b"o4-shape");
+        let (ok, _) = verify(&proof, 3, 4, &[], &mut t);
+        assert!(!ok, "s=3 must fail closed");
+        let mut t = Transcript::new(b"o4-shape");
+        let (ok, _) = verify(&proof, 4, 3, &[], &mut t);
+        assert!(!ok, "k=3 must fail closed");
     }
 }
 
