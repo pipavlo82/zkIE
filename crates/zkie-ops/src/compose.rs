@@ -1931,6 +1931,45 @@ struct ReverseScaleVecProof {
     scale_arity: usize,
 }
 
+/// Shift>0 ScaleVec (project ② step 2b): one eq-weighted virtual over the
+/// unpadded position domain (L >= 32) proving
+///   eq*(x*scale_b - out*2^shift + 2^(shift-1) - sum_j 2^j bits_j) = 0
+/// plus gamma-weighted booleanity of the precommitted remainder bits, with
+/// the out endpoint bound by S4 same_poly. The remainder is in [0,2^shift),
+/// i.e. ties-up rounding. `remainder_bits` are the bit evals at the virtual
+/// point; `opening` authenticates them against the precommitted aux.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseScaleVecShiftedProof {
+    prod: VirtualProof,
+    bind: SamePolyProof,
+    scale_arity: usize,
+    remainder_bits: Vec<Goldilocks>,
+    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+}
+
+fn scale_vec_shift_terms(shift: usize, gamma: Goldilocks)
+    -> Vec<(Goldilocks, Vec<usize>)>
+{
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let two_shift = Goldilocks::from_u64(1u64 << shift);
+    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+    let mut terms = vec![
+        (Goldilocks::ONE, vec![0usize, 1, 2]),
+        (-two_shift, vec![0usize, 3]),
+        (half, vec![0usize]),
+    ];
+    for j in 0..shift {
+        terms.push((-Goldilocks::from_u64(1u64 << j), vec![0usize, 4 + j]));
+    }
+    let mut gp = gamma;
+    for j in 0..shift {
+        terms.push((gp, vec![0usize, 4 + j]));
+        terms.push((-gp, vec![0usize, 4 + j, 4 + j]));
+        gp *= gamma;
+    }
+    terms
+}
+
 fn broadcast_scale_dims(op: &Op) -> Option<(T, T, T, usize)> {
     match op { Op::BroadcastScale { x, scale, out, h } => Some((*x, *scale, *out, *h)), _ => None }
 }
@@ -2054,6 +2093,113 @@ fn verify_reverse_scale_vec(op: &Op, point: &[Goldilocks], value: Goldilocks,
     let sk = TensorKey::Field(scale).encoded()?;
     Some(vec![
         EvalClaim { tensor_id: xk, point: z.clone(), value: fe[1] },
+        EvalClaim { tensor_id: sk, point: z[..proof.scale_arity].to_vec(), value: fe[2] },
+    ])
+}
+
+/// Project ② step 2b: ScaleVec with shift > 0. Requires L >= 32 (no padding
+/// ambiguity for the periodic scale endpoint), the scale period a power of two
+/// dividing L, and the precommitted ScaleVecRemainder bit aux. The rounding is
+/// ties-up, matching Op::Scale: out*2^s = x*scale_b - rho with
+/// rho = rem - 2^(s-1) and rem in [0, 2^s).
+fn prove_reverse_scale_vec_shifted(store: &Store, op: &Op, point: &[Goldilocks],
+    value: Goldilocks, aux: PreparedAux, transcript: &mut Transcript)
+    -> Option<(ReverseScaleVecShiftedProof, Vec<EvalClaim>)>
+{
+    let (x, scale, out, shift) = scale_vec_dims(op)?;
+    if shift == 0 || shift > 31 { return None; }
+    let lgl = point.len();
+    if lgl < 5 || lgl > 30 { return None; }
+    let l = 1usize << lgl;
+    let xv = store.get(x);
+    let sv = store.get(scale);
+    let ov = store.get(out);
+    if xv.len() != l || ov.len() != l || sv.is_empty() || !sv.len().is_power_of_two()
+        || l % sv.len() != 0 { return None; }
+    if aux.descriptor.role != AuxRole::ScaleVecRemainder || aux.descriptor.len != l
+        || aux.descriptor.arity != lgl || aux.descriptor.columns != shift as usize
+        || aux.columns.len() != shift as usize
+        || aux.columns.iter().any(|c| c.len() != l) { return None; }
+    let two_shift = 1i64.checked_shl(shift)?;
+    let half = two_shift / 2;
+    for i in 0..l {
+        let rem = to_i64(xv[i]).checked_mul(to_i64(sv[i % sv.len()]))?
+            .checked_sub(to_i64(ov[i]).checked_mul(two_shift)?)?
+            .checked_add(half)?;
+        if rem < 0 || rem as u64 >= two_shift as u64 { return None; }
+        for j in 0..shift as usize {
+            if aux.columns[j][i] != Goldilocks::from_u64(((rem as u64) >> j) & 1) { return None; }
+        }
+    }
+    let scale_b: Vec<Goldilocks> = (0..l).map(|i| sv[i % sv.len()]).collect();
+    transcript.absorb(b"zkie-scalevec-shift-v1");
+    let q = transcript.field_vec(lgl);
+    let gamma = transcript.field();
+    let eq = mle::eq_evals(&q);
+    let mut mles: Vec<&[Goldilocks]> = vec![&eq, xv, &scale_b, ov];
+    mles.extend(aux.columns.iter().map(Vec::as_slice));
+    let terms = scale_vec_shift_terms(shift as usize, gamma);
+    let (prod, z) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    if z.len() != lgl || prod.final_evals.len() != 4 + shift as usize { return None; }
+    let (bind, _) = prove_same_poly(ov, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
+    let bits = prod.final_evals[4..4 + shift as usize].to_vec();
+    let idxs: Vec<usize> = (0..shift as usize).collect();
+    let points = vec![z.clone(); shift as usize];
+    let tensors = aux.columns.clone();
+    let ctx = zkie_core::pcs::committed::BatchCtx {
+        commitment: aux.descriptor.commitment.clone(), prover_data: aux.prover_data,
+        protocol: aux.protocol, whir: aux.whir, num_tables: shift as usize,
+    };
+    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
+        ctx, &idxs, &tensors, &points, &bits).ok()?;
+    let (x_point, x_eval) = unpad_relu_claim(&z, prod.final_evals[1], lgl)?;
+    let scale_eval = prod.final_evals[2];
+    let lgs = sv.len().trailing_zeros() as usize;
+    let xk = TensorKey::Field(x).encoded()?;
+    let sk = TensorKey::Field(scale).encoded()?;
+    Some((ReverseScaleVecShiftedProof { prod, bind, scale_arity: lgs, remainder_bits: bits, opening },
+        vec![
+            EvalClaim { tensor_id: xk, point: x_point, value: x_eval },
+            EvalClaim { tensor_id: sk, point: z[..lgs].to_vec(), value: scale_eval },
+        ]))
+}
+
+fn verify_reverse_scale_vec_shifted(op: &Op, point: &[Goldilocks], value: Goldilocks,
+    aux: Option<&AuxDescriptor>, proof: &ReverseScaleVecShiftedProof, transcript: &mut Transcript)
+    -> Option<Vec<EvalClaim>>
+{
+    let (x, scale, _out, shift) = scale_vec_dims(op)?;
+    if shift == 0 || shift > 31 { return None; }
+    let lgl = point.len();
+    if lgl < 5 || lgl > 30 { return None; }
+    let l = 1usize << lgl;
+    let descriptor = aux?;
+    if descriptor.role != AuxRole::ScaleVecRemainder || descriptor.len != l
+        || descriptor.arity != lgl || descriptor.columns != shift as usize { return None; }
+    if proof.remainder_bits.len() != shift as usize
+        || proof.scale_arity > lgl
+        || proof.prod.final_evals.len() != 4 + shift as usize { return None; }
+    transcript.absorb(b"zkie-scalevec-shift-v1");
+    let q = transcript.field_vec(lgl);
+    let gamma = transcript.field();
+    let terms = scale_vec_shift_terms(shift as usize, gamma);
+    let (ok, z, fc) = verify_virtual(&proof.prod, &terms, Goldilocks::ZERO, lgl, transcript);
+    if !ok || z.len() != lgl { return None; }
+    let fe = &proof.prod.final_evals;
+    if fe[0] != mle::eq_poly(&q, &z) || fc != virtual_eval(&terms, fe) { return None; }
+    if !verify_aux_open(descriptor, &(0..shift as usize).collect::<Vec<_>>(),
+        &vec![z.clone(); shift as usize], &proof.remainder_bits, &proof.opening) { return None; }
+    for j in 0..shift as usize {
+        if fe[4 + j] != proof.remainder_bits[j] { return None; }
+    }
+    if verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
+        return None;
+    }
+    let (x_point, x_eval) = unpad_relu_claim(&z, fe[1], lgl)?;
+    let xk = TensorKey::Field(x).encoded()?;
+    let sk = TensorKey::Field(scale).encoded()?;
+    Some(vec![
+        EvalClaim { tensor_id: xk, point: x_point, value: x_eval },
         EvalClaim { tensor_id: sk, point: z[..proof.scale_arity].to_vec(), value: fe[2] },
     ])
 }
@@ -2690,6 +2836,8 @@ enum ReverseReduction {
     /// lookup group exists, so no-static-group proofs keep their exact
     /// pre-(b) wire bytes.
     LookupGroups { groups: Vec<LookupGroupProof> },
+    /// Project ② step 2b: ScaleVec with rounding (shift > 0).
+    ScaleVecShifted { proof: ReverseScaleVecShiftedProof },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3704,7 +3852,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecRemainder }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -3900,6 +4048,82 @@ fn prepare_scale_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest) ->
         let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor { op_index, role: AuxRole::ScaleRemainder, len, arity, columns: count, commitment };
+        prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+    }
+    Some(prepared)
+}
+
+/// ScaleVec shift>0 (project ② step 2b): one precommitted unsigned remainder
+/// bit witness per op. `rem = x*scale_b - out*2^shift + 2^(shift-1)` must lie
+/// in [0, 2^shift); the bits are the scale-remainder mechanism generalized to
+/// a tensor (periodic) scale. The bound reduction proves
+///     out*2^shift = x*scale_b - rho,  rho = rem - 2^(shift-1)
+/// with rem in [0,2^shift), i.e. ties-up rounding, matching Op::Scale.
+fn scale_vec_remainder_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, usize, usize, usize)>>
+{
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::ScaleVec { x, scale, shift, .. } = op {
+            if *shift == 0 { continue; }
+            if *shift > 31 { return None; }
+            let key = TensorKey::Field(*x).encoded()?;
+            let len = *model.tensor_lengths.get(&key)?;
+            let skey = TensorKey::Field(*scale).encoded()?;
+            let slen = *model.tensor_lengths.get(&skey)?;
+            // Domain contract: the scale period is a power of two and divides
+            // the position length L.
+            if len == 0 || len < 32 || !len.is_power_of_two() || slen == 0 || !slen.is_power_of_two()
+                || len % slen != 0 { return None; }
+            specs.push((i, len, len.trailing_zeros().max(5) as usize, *shift as usize));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_scale_vec_remainder_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<PreparedAux>>
+{
+    let mut prepared = Vec::new();
+    for (op_index, len, arity, count) in scale_vec_remainder_aux_specs(ops, model)? {
+        let (x, scale, out, shift) = match &ops[op_index] {
+            Op::ScaleVec { x, scale, out, shift } => (*x, *scale, *out, *shift),
+            _ => return None,
+        };
+        if shift as usize != count { return None; }
+        let xv = store.get(x);
+        let sv = store.get(scale);
+        let ov = store.get(out);
+        if xv.len() != len || ov.len() != len || sv.is_empty() || !sv.len().is_power_of_two()
+            || len % sv.len() != 0 { return None; }
+        let two_shift = 1i64.checked_shl(shift)?;
+        let half = two_shift / 2;
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
+        for i in 0..len {
+            let xv_i = to_i64(xv[i]);
+            let sv_i = to_i64(sv[i % sv.len()]);
+            // Step 2b domain contract (real FFN u/silu inputs): both operands
+            // must be in the 25-bit signed domain, so the integer product and
+            // the ties-up rounding are well-defined.
+            if !(-GELU_BOUND..GELU_BOUND).contains(&xv_i)
+                || !(-GELU_BOUND..GELU_BOUND).contains(&sv_i) { return None; }
+            let rem = xv_i.checked_mul(sv_i)?
+                .checked_sub(to_i64(ov[i]).checked_mul(two_shift)?)?
+                .checked_add(half)?;
+            if rem < 0 || rem as u64 >= two_shift as u64 { return None; }
+            for j in 0..count {
+                columns[j][i] = Goldilocks::from_u64(((rem as u64) >> j) & 1);
+            }
+        }
+        let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        let descriptor = AuxDescriptor {
+            op_index, role: AuxRole::ScaleVecRemainder, len, arity, columns: count, commitment,
+        };
         prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
     }
     Some(prepared)
@@ -4285,6 +4509,10 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::GeluIndexXRange, len, arity, cols))),
         None => return false,
     };
+    match scale_vec_remainder_aux_specs(ops, model) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleVecRemainder, len, arity, cols))),
+        None => return false,
+    };
     match argmax_aux_specs(ops) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ArgmaxWitness, len, arity, cols))),
         None => return false,
@@ -4302,7 +4530,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecRemainder => 16 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -5295,12 +5523,24 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 ReverseReduction::BroadcastScale { proof }
             }
             Op::ScaleVec { .. } => {
-                let (proof, incoming) = prove_reverse_scale_vec(store, op, &point, value, transcript)?;
-                for c in incoming {
-                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
-                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                let (_, _, _, shift) = scale_vec_dims(op)?;
+                if shift == 0 {
+                    let (proof, incoming) = prove_reverse_scale_vec(store, op, &point, value, transcript)?;
+                    for c in incoming {
+                        absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                        claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                    }
+                    ReverseReduction::ScaleVec { proof }
+                } else {
+                    let auxp = aux.remove(&(op_index, AuxRole::ScaleVecRemainder))?;
+                    let (proof, incoming) = prove_reverse_scale_vec_shifted(
+                        store, op, &point, value, auxp, transcript)?;
+                    for c in incoming {
+                        absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                        claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                    }
+                    ReverseReduction::ScaleVecShifted { proof }
                 }
-                ReverseReduction::ScaleVec { proof }
             }
             Op::CombineIdx { a, b, scale, out: out_t, .. } => {
                 // S5 (reverse): out = scale*a + b at the claim point. When the
@@ -5617,7 +5857,17 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 }
             }
             (Op::ScaleVec { .. }, ReverseReduction::ScaleVec { proof }) => {
+                let (_, _, _, shift) = scale_vec_dims(op)?;
+                if shift != 0 { return None; }
                 for c in verify_reverse_scale_vec(op, &point, value, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+            }
+            (Op::ScaleVec { .. }, ReverseReduction::ScaleVecShifted { proof }) => {
+                let descriptor = aux.iter().find(|a| a.op_index == op_index
+                    && a.role == AuxRole::ScaleVecRemainder);
+                for c in verify_reverse_scale_vec_shifted(op, &point, value, descriptor, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -11875,11 +12125,14 @@ fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<
                 if lx != lo || !lx.is_power_of_two() || ls.checked_mul(*h)? != lx { return None; }
             }
             Op::ScaleVec { x, scale, out, shift } => {
-                if *shift != 0 { return None; }
+                if *shift > 31 { return None; }
                 let lx = *model.tensor_lengths.get(&TensorKey::Field(*x).encoded()?)?;
                 let lo = *model.tensor_lengths.get(&TensorKey::Field(*out).encoded()?)?;
                 let ls = *model.tensor_lengths.get(&TensorKey::Field(*scale).encoded()?)?;
                 if lx != lo || !lx.is_power_of_two() || !ls.is_power_of_two() || lx % ls != 0 { return None; }
+                // Shift>0 rounding-tail contract: the bound reduction requires
+                // an unpadded position domain (L >= 32).
+                if *shift > 0 && lx < 32 { return None; }
             }
             Op::Scatter { sel, token_id, expert_of, m, n } => {
                 let kt = TensorKey::Index(*token_id).encoded()?;
@@ -12160,6 +12413,7 @@ pub fn prove_committed_shard_dag_bound(
     }
     let mut prepared = prepare_projection_aux(store, ops)?;
     prepared.extend(prepare_scale_aux(store, ops, model)?);
+    prepared.extend(prepare_scale_vec_remainder_aux(store, ops, model)?);
     prepared.extend(prepare_argmax_aux(store, ops)?);
     prepared.extend(prepare_expert_routing_aux(store, ops)?);
     prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
@@ -15044,24 +15298,23 @@ mod tests {
             "wrong silu table root must be rejected");
     }
 
-    /// Project ② step 2 scope blocker: the bound reverse ScaleVec supports
-    /// shift 0 only. The real FFN tail uses ScaleVec(shift=16), so the full
-    /// FFN segment cannot be proven until a rounding-tail reduction is
-    /// approved and implemented. This test pins the current fail-closed
-    /// behavior (no silent acceptance).
+    /// Project ② step 2b: ScaleVec shift=16 roundtrip (including a tie), byte
+    /// determinism, tampered scale/out/remainder rejections, and the
+    /// ties-down / out-of-range remainder fail-closed at the precommitted aux.
     #[test]
-    fn scale_vec_shift16_bound_fail_closed() {
+    fn scale_vec_shift16_roundtrip_and_negatives() {
         use zkie_core::pcs::whir::Whir;
         let mut store = Store::new();
-        let xv: Vec<Goldilocks> = (0..32).map(|i| from_i64(i as i64 - 16)).collect();
-        let sv: Vec<Goldilocks> = vec![from_i64(3), from_i64(-2), from_i64(5), from_i64(7)];
+        let mut xv: Vec<i64> = (0..32).map(|i| i as i64 - 16).collect();
+        xv[1] = 1; // exact tie with scale[1] = 2^15: 1*2^15 = 2^15
+        let xv: Vec<Goldilocks> = xv.into_iter().map(from_i64).collect();
+        let sv: Vec<Goldilocks> = vec![from_i64(65536), from_i64(32768), from_i64(1), from_i64(3)];
         let x = store.push(xv.clone());
         let s = store.push(sv.clone());
         let out = store.push(vec![]);
-        // from_offline_commitment resolves the identity tables a ScaleVec
-        // push arm references; the proof itself must still fail closed.
+        // from_offline_commitment resolves the identity table of length
+        // 2^shift referenced by the ScaleVec push arm.
         store.push((0..(1usize << 16)).map(|i| Goldilocks::from_u64(i as u64)).collect());
-        store.push((0..(1usize << 22)).map(|i| Goldilocks::from_u64(i as u64)).collect());
         let ops = vec![Op::ScaleVec { x, scale: s, out, shift: 16 }];
         forward_ops(&mut store, &ops);
         let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
@@ -15070,9 +15323,83 @@ mod tests {
             outputs: [(out, store.get(out).to_vec())].into(),
         };
         let whir = Whir::with_params(5, 90, 17);
-        assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
-            &PublicStatement::Generic, &model, &execution).is_none(),
-            "bound ScaleVec shift=16 must stay fail-closed");
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("ScaleVec shift16 proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+        let bytes1 = bincode::serialize(&proof).unwrap();
+        let proof2 = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("repeat ScaleVec shift16 proof");
+        assert_eq!(bytes1, bincode::serialize(&proof2).unwrap(),
+            "shifted ScaleVec proof bytes must be deterministic");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof2,
+            &PublicStatement::Generic, &model, &execution));
+
+        let mut bad_scale = execution.clone();
+        bad_scale.inputs.get_mut(&s).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &bad_scale), "tampered scale must be rejected");
+        let mut bad_out = execution.clone();
+        bad_out.outputs.get_mut(&out).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &bad_out), "tampered out must be rejected");
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes1).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::ScaleVecShifted { proof } = &mut step.reduction {
+                proof.remainder_bits[0] += Goldilocks::ONE;
+                hit = true;
+            }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged,
+            &PublicStatement::Generic, &model, &execution), "tampered remainder bit must be rejected");
+
+        // Ties-down and rho-out-of-range outputs are rejected by the
+        // precommitted remainder witness (honest requires rem in [0,2^16)).
+        for bad in [from_i64(0), from_i64(2)] {
+            let mut sb = Store::new();
+            let mut xb = vec![Goldilocks::ZERO; 32]; xb[0] = from_i64(1);
+            let xb = sb.push(xb);
+            let sb_scale = sb.push(vec![from_i64(32768), Goldilocks::ZERO,
+                Goldilocks::ZERO, Goldilocks::ZERO]);
+            let mut ob = vec![Goldilocks::ZERO; 32]; ob[0] = bad;
+            let ob = sb.push(ob);
+            sb.push((0..(1usize << 16)).map(|i| Goldilocks::from_u64(i as u64)).collect());
+            let opsb = vec![Op::ScaleVec { x: xb, scale: sb_scale, out: ob, shift: 16 }];
+            let modelb = TrustedModelManifest::from_offline_commitment(&[], &sb.owned_slices(), &opsb);
+            assert!(prepare_scale_vec_remainder_aux(&sb, &opsb, &modelb).is_none(),
+                "ties-down / out-of-range remainder must fail closed");
+        }
+    }
+
+    /// ScaleVec shift>0 domain contract: L >= 32, a power-of-two scale period
+    /// dividing L, and both operands inside the 25-bit signed domain.
+    #[test]
+    fn scale_vec_shift_domain_rejected() {
+        fn build(x_len: usize, s_len: usize, x0: i64) -> (Store, Vec<Op>, TrustedModelManifest) {
+            let mut store = Store::new();
+            let mut xv = vec![Goldilocks::ZERO; x_len]; xv[0] = from_i64(x0);
+            let x = store.push(xv);
+            let s = store.push((0..s_len).map(|i| from_i64(1 + i as i64)).collect());
+            let out = store.push(vec![Goldilocks::ZERO; x_len]);
+            store.push((0..(1usize << 16)).map(|i| Goldilocks::from_u64(i as u64)).collect());
+            let ops = vec![Op::ScaleVec { x, scale: s, out, shift: 16 }];
+            let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
+            (store, ops, model)
+        }
+        // L < 32.
+        let (s1, o1, m1) = build(16, 4, 0);
+        assert!(scale_vec_remainder_aux_specs(&o1, &m1).is_none());
+        assert!(prepare_scale_vec_remainder_aux(&s1, &o1, &m1).is_none());
+        // Non-power-of-two scale period.
+        let (s2, o2, m2) = build(32, 3, 0);
+        assert!(scale_vec_remainder_aux_specs(&o2, &m2).is_none());
+        assert!(prepare_scale_vec_remainder_aux(&s2, &o2, &m2).is_none());
+        // Out-of-domain operand.
+        let (s3, o3, m3) = build(32, 4, 1 << 24);
+        assert!(scale_vec_remainder_aux_specs(&o3, &m3).is_some());
+        assert!(prepare_scale_vec_remainder_aux(&s3, &o3, &m3).is_none());
     }
 
     #[test]
@@ -19972,7 +20299,7 @@ mod tests {
     /// S7c multiplicative tail: ScaleVec (shift 0 only) out[i] = x[i]*scale[i%s].
     /// Non-zero shifts (rounding tail) stay fail-closed.
     #[test]
-    fn s7c_scale_vec_bound_roundtrip_and_shift_closed() {
+    fn s7c_scale_vec_bound_roundtrip() {
         use zkie_core::pcs::whir::Whir;
         let mut store = Store::new();
         let xv: Vec<Goldilocks> = (0..16).map(|i| from_i64(i as i64 - 8)).collect();
@@ -19993,27 +20320,6 @@ mod tests {
             &PublicStatement::Generic, &model, &execution).expect("scale vec proof");
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution),
             "honest ScaleVec(shift 0) must verify");
-
-        // shift != 0 requires the rounding remainder tail: fail closed.
-        let mut store2 = Store::new();
-        let x2 = store2.push((0..16).map(|i| from_i64(i as i64 - 8)).collect());
-        let s2 = store2.push(vec![from_i64(3), from_i64(-2), from_i64(7), from_i64(1)]);
-        let o2 = store2.push(vec![]);
-        // The shift>0 rounding contract references an identity table of
-        // length 2^shift; provide it so the manifest can be built, then the
-        // bound entry must still fail closed for the unsupported shift.
-        let _id2 = store2.push(vec![Goldilocks::ZERO, Goldilocks::ONE]);
-        let ops2 = vec![Op::ScaleVec { x: x2, scale: s2, out: o2, shift: 1 }];
-        let cached2 = commit_model_weights(&store2, &ops2, "/tmp/zkie-s7c-svec-shift");
-        forward_ops(&mut store2, &ops2);
-        let model2 = TrustedModelManifest::from_offline_commitment(&cached2, &store2.owned_slices(), &ops2);
-        let execution2 = TrustedExecution {
-            inputs: [(x2, store2.get(x2).to_vec()), (s2, store2.get(s2).to_vec())].into(),
-            outputs: [(o2, store2.get(o2).to_vec())].into(),
-        };
-        assert!(prove_committed_shard_dag_bound(&mut store2, &ops2, 1, &whir, &cached2, 0, 0,
-            &PublicStatement::Generic, &model2, &execution2).is_none(),
-            "ScaleVec shift != 0 (rounding tail) must stay fail-closed");
     }
 
     #[test]

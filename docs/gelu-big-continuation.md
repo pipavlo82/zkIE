@@ -105,81 +105,94 @@ value; the test tampers the range x eval and verifier rejects.
   forward-evaluated in step 1), and the 23-bit Relu path is byte-identical.
 - Deterministic PoW and 90-bit security unchanged.
 
-## Step 2 — real silu 2^24 table in the real-data D segment (partial)
+## Step 2a — real silu 2^24 prefix (accepted, `4c4218a`)
 
-### What was integrated
+A D phase proved `GeluIndex(offset=2^23, table_len=2^24) ->
+Lookup(real L10 silu 2^24 static table)` with `g = B.g` as a caller-trusted
+input, the precommitted GeluIndexXRange witness and the deep-O7 shared table
+commit. Real domain: `g ∈ [-232482,171093]`, `w ∈ [8156126,8559701]`,
+`high ∈ [-8621089,-8217514]`, all inside `[-2^24,2^24)`. Prefix proof:
+908,637 bytes, hash `b2e058f3b527f805` (deterministic). The full FFN tail was
+blocked at ScaleVec shift 16 and escalated; the boss approved the extension.
 
-A new `FFN` (D) phase in `models/deepseek-v2-lite/examples/prove_core_chain.rs`:
+## Step 2b — ScaleVec shift>0 reduction + full FFN D segment
 
-- real L10 data: `silu_table_i32.bin` (2^24 entries) and the real gate
-  projection `g` (the same value B proves; the example asserts `D.g == B.g`
-  item by item and supplies `g` as the caller-trusted public input, matching
-  the C/d trust convention);
-- ops: `GeluIndex(offset = 2^23, table_len = 2^24)` followed by
-  `Lookup(idx, real silu 2^24 static table)`;
-- the GeluIndexXRange witness is precommitted, and the static silu table uses
-  the deep-O7 shared commit/tree/opening path.
+### Reduction
 
-### Real-data domain measurement
+- Domain contract: position length `L >= 32` and a power of two; the scale
+  period is a power of two dividing `L`; `1 <= shift <= 31`; real ScaleVec
+  operands (silu and u) must be in the 25-bit signed domain `[-2^24,2^24)`
+  (checked when the precommitted witness is built; the verifier relies on the
+  authenticated input claims exactly as the existing Scale reduction does).
+- Precommitted `ScaleVecRemainder` aux (ScaleRemainder generalized to a
+  tensor/periodic scale): `shift` bit columns of
+  `rem = x*scale_b - out*2^shift + 2^(shift-1)`, requiring
+  `0 <= rem < 2^shift`. This is ties-up rounding, identical to `Op::Scale`.
+- The bound reduction proves one eq-weighted virtual over the position domain:
+  `eq*(x*scale_b - out*2^shift + 2^(shift-1) - sum_j 2^j bits_j) = 0`
+  plus gamma-weighted booleanity of every remainder bit (claim 0). The
+  precommitted bits are opened at the virtual point; the output endpoint is
+  bound by S4 same_poly; the x claim is returned in full and the scale claim
+  at `z[..lgs]` (shift-0 convention). The shift-0 path keeps its existing
+  proof variant and bytes (the new variant is separate).
+- Range-check realization: the bound reverse DAG has no legacy
+  `lookup_by_table` channel, so the `[0,2^shift)` identity-table range check
+  is realized by the precommitted bit witness + booleanity (the same range
+  predicate); the trusted identity table of size `2^shift` remains present in
+  the manifest via the existing ScaleVec push arm.
 
-L10 gate projection range: `g ∈ [-232482, 171093]`, `w = g + 2^23 ∈
-[8156126, 8559701]`, `high = w - (2^24-1) ∈ [-8621089, -8217514]`. All three
-are inside `[-2^24, 2^24)`, so the 25-bit contract holds for the real
-activations; the example asserts these ranges on every run.
+### Reduction tests
 
-### Result
+`zkie-ops --lib`: 169/0. New `scale_vec_shift16_roundtrip_and_negatives`:
+honest shift-16 roundtrip including an exact tie (`1*2^15`), byte-identical
+double proof, tampered scale/out/remainder-bit rejection, and ties-down /
+rho-out-of-range inputs fail closed at the precommitted witness. The shift-0
+test (`s7c_scale_vec_bound_roundtrip`) is unchanged and green.
+
+### Full FFN D segment (real data)
+
+Ops, using the real L10 up/down expert weights and real silu table:
+
+```
+GatherMatMul(up, w_u) -> Scale16(u) -> GeluIndex(offset 2^23, len 2^24)
+  -> Lookup(real silu 2^24) -> ScaleVec(silu, u, shift 16)
+  -> GatherMatMul(down, w_d) -> Scale16(out)
+```
+
+Trust boundary: `g` is B's proven gate output (asserted equal); `segz` (the
+real activation segment) and `exp` (real public routing slice) are
+caller-trusted inputs. The output `d` is asserted equal to the caller d used
+by C.
+
+Real ScaleVec operand range: `|silu|max = 159,381`, `|u|max = 231,507`, both
+inside `2^24`; the example asserts this.
 
 | quantity | value |
 |---|---|
-| FFN forward | ~0.22 ms |
-| FFN commit + prove | ~7.53 s |
-| FFN verify | ~49.5 ms |
-| FFN proof bytes | 908,637 |
-| FFN proof hash (two runs) | `b2e058f3b527f805` both |
-| FFN proof dump SHA-256 (two runs) | `bc9763e6e08cb0cdc86de87f5d1cea09a35c033404a7ca55a8575cccfbd39472` both (`cmp` clean) |
-| sidx / silu length | 16,384 |
+| FFN commit + prove | 15.95–16.28 s |
+| FFN verify | 92.9–96.5 ms |
+| FFN proof bytes | 1,359,818 |
+| FFN proof hash (two runs) | `cbd9f41ab8a3469d` both |
+| FFN proof dump SHA-256 | `c15b13220910062a5fe6324ea31f89587159f63ac3391fb7e19a6f7f0e3fdd52` both (`cmp` clean) |
+| d length | 16,384 |
 
-Negatives: the example rejects a tampered silu output, a tampered trusted `g`
-input, and a wrong real silu-table root (the manifest is rebuilt from a
-mutated 2^24 table; the original proof cannot authenticate against the new
-root). New unit tests reject a wrong static silu-table root and a tampered
-GeluIndex index/range derivation (the latter mutates the GeluIndex step's
-derived output and the verifier rejects). Out-of-domain inputs remain
-fail-closed from step 1.
-
-### Blocking finding — ScaleVec(shift = 16)
-
-The approved project ② scope is the GeluIndex index reduction; the FFN tail
-uses `ScaleVec(shift = 16)`, and the **bound reverse ScaleVec supports shift
-0 only** (`prove_reverse_scale_vec` returns None for shift != 0). The real
-FFN chain `ScaleVec(shift 16) -> GatherMatMul(down)` therefore cannot be
-proven under the current reduction. This is pinned by
-`scale_vec_shift16_bound_fail_closed` (no silent acceptance).
-
-The legacy committed path contains the needed algebra
-(`rem = x*scale_b - out*2^shift + 2^(shift-1)`, identity-table lookup of the
-remainder), but it is not wired into the bound reverse path. A minimal
-extension would add a precommitted ScaleVec remainder aux (or the same
-identity-table lookup with a range/booleanity proof), bound in
-`execution_seeds` before challenges, and return x/scale/out claims. This is a
-reduction/transcript change outside the approved GeluIndex-only scope, so it
-is reported for TL approval rather than implemented here. Step 3 (full
-64-expert S7 retry) also depends on this tail.
+Negatives: tampered `segz`/`g` (u/silu sources), tampered routing slice, and
+tampered output `d` are rejected; a wrong real silu-table root (manifest
+rebuilt over a mutated 2^24 table) is rejected. Unit tests additionally cover
+tampered ScaleVec scale/out/remainder and GeluIndex index/range derivation.
 
 ### Baselines
 
-- `zkie-ops --lib`: 169/0.
-- Real A/B/C and full64: unchanged from step 1 (A 241,874 / B 491,978 /
-  C 355,183; full64 B 540,239, `CORE-CHAIN-OK`).
-- The D/FFN proof is a new baseline: 908,637 bytes, deterministic across two
-  runs.
-- Logs: `/data/zkie-soundness-fix/logs/gelu2-ops.log`,
-  `gelu2-real-ffn-final{1,2}.log`, `gelu2-full64.log`.
+- Real A/B/C unchanged: 241,874 / 491,978 / 355,183.
+- Full64 unchanged: B 540,239, `CORE-CHAIN-OK`.
+- The full FFN D proof is the new baseline: 1,359,818 bytes, deterministic
+  across two runs.
+- Logs: `/data/zkie-soundness-fix/logs/scalevec-ops.log`,
+  `gelu2b-fullffn-run{1,2}.log`, `gelu2b-full64.log`.
 
 ## Remaining
 
-Step 2b (if approved): ScaleVec shift-16 rounding-tail reduction in the
-bound path, then the full FFN tail and step 3 (full 64-expert S7 retry +
-negatives + docs). S7 is not accepted; S8/S9 stay postponed. Deep O7
-(a)–(d) is accepted; project ② steps 1 and 2-prefix are submitted for TL
-review.
+Step 3 (S7 full 64-expert retry: full FFN + routing chain + gate consistency,
+gist S7 negatives, memory regression) is next after TL review of step 2b. S7
+is not accepted until TL final review; S8/S9 stay postponed. Deep O7 (a)–(d)
+is accepted.

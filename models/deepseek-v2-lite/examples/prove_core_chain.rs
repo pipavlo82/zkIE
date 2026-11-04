@@ -499,66 +499,83 @@ fn main() {
     assert!(hi_min >= -(1i64 << 24) && hi_max < (1i64 << 24), "real high outside 25-bit ReLU domain");
     println!("D forward {:?} d_len={} (caller-computed; full FFN tail blocked at ScaleVec shift=16)", t_d.elapsed(), d_v.len());
 
-    // ---------------- Phase D (project ② step 2): real silu 2^24 table ------
-    // Trust boundary: g is the real gate projection produced by the model's
-    // forward path; here it is a caller-trusted public input (same convention
-    // as C's caller-trusted d). The caller statement binds it to B's proven g
-    // output item by item. The segment proves
-    //   GeluIndex(offset=2^23, table_len=2^24) -> Lookup(real silu 2^24 table)
-    // with the precommitted GeluIndexXRange witness and the O7 shared table
-    // commit. The remaining tail ScaleVec(shift=16) -> GatherMatMul(down) is
-    // NOT provable yet: the bound reverse ScaleVec supports shift 0 only and
-    // fails closed; this is reported to the TL as a scope blocker.
+    // ---------------- Phase D (project ② step 2b): full FFN tail ----------
+    // Trust boundary: g is B's proven gate projection (asserted equal below);
+    // segz is the real activation segment and exp the real public routing
+    // slice; both are caller-trusted public inputs. The segment proves
+    //   GatherMatMul(up) -> Scale16(u) -> GeluIndex(offset 2^23, len 2^24)
+    //   -> Lookup(real silu 2^24) -> ScaleVec(shift 16) ->
+    //   GatherMatMul(down) -> Scale16(out)
+    // with the real up/down expert weights and the new rounding-tail
+    // ScaleVec reduction. The output d must equal the caller d consumed by C.
     assert_eq!(sd.get(g_d), sb.get(g), "D gate input must equal B's proven g");
-    let mut sffn = Store::new();
-    let g_in = sffn.push(sd.get(g_d).to_vec());
-    let sidx = sffn.push_idx(vec![]);
-    let silu_out = sffn.push(vec![]);
-    let silu_tab = sffn.push(silu_v.clone());
     let ops_ffn = vec![
-        Op::GeluIndex { x: g_in, out: sidx, offset: 1 << 23, table_len: 1 << 24 },
-        Op::Lookup { idx: sidx, out: silu_out, table: silu_tab },
+        Op::GatherMatMul { a: segz_d, expert_of: exp_d, w: wu_d, c: uraw_d, s: s_pad, k: H, n: MOE_PAD, n_experts: 8 },
+        Op::Scale { x: uraw_d, out: u_d, factor: 1, shift: 16 },
+        Op::GeluIndex { x: g_d, out: sidx_d, offset: 1 << 23, table_len: 1 << 24 },
+        Op::Lookup { idx: sidx_d, out: silu_d, table: silu_t_d },
+        Op::ScaleVec { x: silu_d, scale: u_d, out: ffn_d, shift: 16 },
+        Op::GatherMatMul { a: ffn_d, expert_of: exp_d, w: wd_d, c: draw_d, s: s_pad, k: MOE_PAD, n: H, n_experts: 8 },
+        Op::Scale { x: draw_d, out: d_t, factor: 1, shift: 16 },
     ];
     let t_ff_fwd = Instant::now();
-    evaluate_ops(&mut sffn, &ops_ffn);
-    let silu_out_v = sffn.get(silu_out).to_vec();
-    let sidx_len = sffn.idx[sidx].len();
-    println!("FFN forward {:?} sidx_len={} silu_len={}",
-        t_ff_fwd.elapsed(), sidx_len, silu_out_v.len());
+    evaluate_ops(&mut sd, &ops_ffn);
+    let d_ffn = sd.get(d_t).to_vec();
+    assert_eq!(d_ffn, d_v, "proven FFN output must equal the caller d used by C");
+    let silu_max = sd.get(silu_d).iter().map(|&v| to_i64(v).abs()).max().unwrap_or(0);
+    let u_max = sd.get(u_d).iter().map(|&v| to_i64(v).abs()).max().unwrap_or(0);
+    println!("FFN ScaleVec domain |silu|max={} |u|max={} (contract < 2^24)", silu_max, u_max);
+    assert!(silu_max < (1i64 << 24) && u_max < (1i64 << 24),
+        "real ScaleVec operands must stay in the 25-bit signed domain");
+    // The ScaleVec shift>0 push arm references the identity table of length
+    // 2^shift; provide the trusted identity table for the manifest.
+    let _id16 = sd.push((0..(1usize << 16)).map(|i| Goldilocks::from_u64(i as u64)).collect());
     let cache_ffn = format!("{cache}-ffn");
-    let cached_ffn = commit_model_weights(&sffn, &ops_ffn, &cache_ffn);
-    let model_ffn = TrustedModelManifest::from_offline_commitment(&cached_ffn, &sffn.owned_slices(), &ops_ffn)
-        .with_index_shapes(&[(sidx, sidx_len)].into());
+    let cached_ffn = commit_model_weights(&sd, &ops_ffn, &cache_ffn);
+    let sidx_len = sd.idx[sidx_d].len();
+    let model_ffn = TrustedModelManifest::from_offline_commitment(&cached_ffn, &sd.owned_slices(), &ops_ffn)
+        .with_index_shapes(&[(exp_d, s_pad), (sidx_d, sidx_len)].into());
+    let exp_values = to_g(&sd.idx[exp_d]);
     let exec_ffn = TrustedExecution {
-        inputs: [(g_in, sffn.get(g_in).to_vec())].into(),
-        outputs: [(silu_out, silu_out_v.clone())].into(),
+        inputs: [
+            (segz_d, sd.get(segz_d).to_vec()),
+            (g_d, sd.get(g_d).to_vec()),
+            (TensorKey::Index(exp_d).encoded().unwrap(), exp_values),
+        ].into(),
+        outputs: [(d_t, d_ffn.clone())].into(),
     };
     let t_ff = Instant::now();
-    let proof_ffn = prove_committed_shard_dag_bound(&mut sffn, &ops_ffn, 1, &whir, &cached_ffn, 0, 0,
+    let proof_ffn = prove_committed_shard_dag_bound(&mut sd, &ops_ffn, 1, &whir, &cached_ffn, 0, 0,
         &PublicStatement::Generic, &model_ffn, &exec_ffn)
-        .expect("phase D real silu 2^24 proof");
+        .expect("phase D full FFN proof");
     let bytes_ffn = bincode::serialize(&proof_ffn).expect("serialize FFN");
     let ff_prove_t = t_ff.elapsed();
     let t_ff_v = Instant::now();
     assert!(verify_committed_shard_dag_bound_bytes(&bytes_ffn, &ops_ffn, 1, &whir,
         &PublicStatement::Generic, &model_ffn, &exec_ffn), "phase D must verify");
-    println!("FFN commit+prove {:?} verify {:?} bytes {} hash={:016x} sidx_len={}",
-        ff_prove_t, t_ff_v.elapsed(), bytes_ffn.len(), fnv(&bytes_ffn), sidx_len);
+    println!("FFN commit+prove {:?} verify {:?} bytes {} hash={:016x} d_len={}",
+        ff_prove_t, t_ff_v.elapsed(), bytes_ffn.len(), fnv(&bytes_ffn), d_ffn.len());
     let mut bad_ffn_out = exec_ffn.clone();
-    bad_ffn_out.outputs.get_mut(&silu_out).unwrap()[0] += Goldilocks::ONE;
+    bad_ffn_out.outputs.get_mut(&d_t).unwrap()[0] += Goldilocks::ONE;
     assert!(!verify_committed_shard_dag_bound_bytes(&bytes_ffn, &ops_ffn, 1, &whir,
         &PublicStatement::Generic, &model_ffn, &bad_ffn_out));
-    let mut bad_ffn_g = exec_ffn.clone();
-    bad_ffn_g.inputs.get_mut(&g_in).unwrap()[0] += Goldilocks::ONE;
+    for bad_input in [segz_d, g_d] {
+        let mut bad = exec_ffn.clone();
+        bad.inputs.get_mut(&bad_input).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound_bytes(&bytes_ffn, &ops_ffn, 1, &whir,
+            &PublicStatement::Generic, &model_ffn, &bad));
+    }
+    let mut bad_exp = exec_ffn.clone();
+    let ek = TensorKey::Index(exp_d).encoded().unwrap();
+    bad_exp.inputs.get_mut(&ek).unwrap()[0] += Goldilocks::ONE;
     assert!(!verify_committed_shard_dag_bound_bytes(&bytes_ffn, &ops_ffn, 1, &whir,
-        &PublicStatement::Generic, &model_ffn, &bad_ffn_g));
-    println!("negative rejected: FFN silu output / trusted g input tamper");
+        &PublicStatement::Generic, &model_ffn, &bad_exp));
+    println!("negative rejected: FFN u source / silu source / out tamper");
     // Wrong real silu table root: mutate the real table and rebuild the
-    // trusted manifest (a fresh root over the same graph). The original
-    // proof's table opening cannot authenticate against the new root.
-    sffn.get_mut(silu_tab)[0] += Goldilocks::ONE;
-    let bad_model_ffn = TrustedModelManifest::from_offline_commitment(&cached_ffn, &sffn.owned_slices(), &ops_ffn)
-        .with_index_shapes(&[(sidx, sidx_len)].into());
+    // trusted manifest. The original proof cannot authenticate against it.
+    sd.get_mut(silu_t_d)[0] += Goldilocks::ONE;
+    let bad_model_ffn = TrustedModelManifest::from_offline_commitment(&cached_ffn, &sd.owned_slices(), &ops_ffn)
+        .with_index_shapes(&[(exp_d, s_pad), (sidx_d, sidx_len)].into());
     assert!(!verify_committed_shard_dag_bound_bytes(&bytes_ffn, &ops_ffn, 1, &whir,
         &PublicStatement::Generic, &bad_model_ffn, &exec_ffn));
     println!("negative rejected: wrong real silu table root");
