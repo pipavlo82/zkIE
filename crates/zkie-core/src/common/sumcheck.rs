@@ -670,24 +670,32 @@ pub fn prove_virtual(
     let mut challenges = Vec::with_capacity(t);
     for _ in 0..t {
         let half = bufs[0].len() / 2;
+        let min_len = (half / (rayon::current_num_threads().max(1) * 4)).max(1);
         let pvals: Vec<Goldilocks> = (0..half)
             .into_par_iter()
-            .map(|s| {
-                let mut p = vec![Goldilocks::ZERO; max_deg + 1];
-                for (coeff, idxs) in terms {
-                    for k in 0..=max_deg {
-                        let mut prod = *coeff;
-                        for &j in idxs {
-                            let f0 = bufs[j][2 * s];
-                            let f1 = bufs[j][2 * s + 1];
-                            let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
-                            prod = prod * fk;
+            .with_min_len(min_len)
+            // O3: one reused accumulator per Rayon worker/chunk, not one Vec
+            // allocation per element pair. Field addition is exact and
+            // associative, so the round coefficients and the transcript
+            // messages are unchanged.
+            .fold(
+                || vec![Goldilocks::ZERO; max_deg + 1],
+                |mut p, s| {
+                    for (coeff, idxs) in terms {
+                        for k in 0..=max_deg {
+                            let mut prod = *coeff;
+                            for &j in idxs {
+                                let f0 = bufs[j][2 * s];
+                                let f1 = bufs[j][2 * s + 1];
+                                let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
+                                prod = prod * fk;
+                            }
+                            p[k] = p[k] + prod;
                         }
-                        p[k] = p[k] + prod;
                     }
-                }
-                p
-            })
+                    p
+                },
+            )
             .reduce(
                 || vec![Goldilocks::ZERO; max_deg + 1],
                 |mut a, b| {
@@ -801,24 +809,32 @@ pub fn prove_virtual_with_challenges(
     let mut rounds = Vec::with_capacity(t);
     for &r in challenges {
         let half = bufs[0].len() / 2;
+        let min_len = (half / (rayon::current_num_threads().max(1) * 4)).max(1);
         let pvals: Vec<Goldilocks> = (0..half)
             .into_par_iter()
-            .map(|s| {
-                let mut p = vec![Goldilocks::ZERO; max_deg + 1];
-                for (coeff, idxs) in terms {
-                    for k in 0..=max_deg {
-                        let mut prod = *coeff;
-                        for &j in idxs {
-                            let f0 = bufs[j][2 * s];
-                            let f1 = bufs[j][2 * s + 1];
-                            let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
-                            prod = prod * fk;
+            .with_min_len(min_len)
+            // O3: one reused accumulator per Rayon worker/chunk, not one Vec
+            // allocation per element pair. Field addition is exact and
+            // associative, so the round coefficients and the transcript
+            // messages are unchanged.
+            .fold(
+                || vec![Goldilocks::ZERO; max_deg + 1],
+                |mut p, s| {
+                    for (coeff, idxs) in terms {
+                        for k in 0..=max_deg {
+                            let mut prod = *coeff;
+                            for &j in idxs {
+                                let f0 = bufs[j][2 * s];
+                                let f1 = bufs[j][2 * s + 1];
+                                let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
+                                prod = prod * fk;
+                            }
+                            p[k] = p[k] + prod;
                         }
-                        p[k] = p[k] + prod;
                     }
-                }
-                p
-            })
+                    p
+                },
+            )
             .reduce(
                 || vec![Goldilocks::ZERO; max_deg + 1],
                 |mut a, b| {
@@ -875,6 +891,161 @@ mod virtual_tests {
     use super::*;
     use crate::common::field::XorShift64;
     use crate::common::mle;
+
+    /// Reference implementation matching the pre-O3 code: one Vec allocation
+    /// per element pair inside a parallel map. Kept only for coefficient
+    /// equality tests.
+    fn reference_virtual(
+        mles: &[&[Goldilocks]],
+        terms: &[(Goldilocks, Vec<usize>)],
+        claimed: Goldilocks,
+        transcript: &mut Transcript,
+    ) -> (VirtualProof, Vec<Goldilocks>) {
+        let n = mles[0].len();
+        let t = n.trailing_zeros() as usize;
+        for m in mles {
+            assert_eq!(m.len(), n);
+        }
+        let max_deg = terms.iter().map(|(_, idxs)| idxs.len()).max().unwrap_or(0);
+        transcript.absorb_field(claimed);
+        let mut bufs: Vec<Vec<Goldilocks>> = mles.iter().map(|m| m.to_vec()).collect();
+        let mut rounds = Vec::with_capacity(t);
+        let mut challenges = Vec::with_capacity(t);
+        for _ in 0..t {
+            let half = bufs[0].len() / 2;
+            let pvals: Vec<Goldilocks> = (0..half)
+                .into_par_iter()
+                .map(|s| {
+                    let mut p = vec![Goldilocks::ZERO; max_deg + 1];
+                    for (coeff, idxs) in terms {
+                        for k in 0..=max_deg {
+                            let mut prod = *coeff;
+                            for &j in idxs {
+                                let f0 = bufs[j][2 * s];
+                                let f1 = bufs[j][2 * s + 1];
+                                let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
+                                prod = prod * fk;
+                            }
+                            p[k] = p[k] + prod;
+                        }
+                    }
+                    p
+                })
+                .reduce(
+                    || vec![Goldilocks::ZERO; max_deg + 1],
+                    |mut a, b| {
+                        for i in 0..=max_deg {
+                            a[i] = a[i] + b[i];
+                        }
+                        a
+                    },
+                );
+            for &p in &pvals {
+                transcript.absorb_field(p);
+            }
+            rounds.push(pvals);
+            let r = transcript.field();
+            challenges.push(r);
+            bufs.par_iter_mut().for_each(|buf| {
+                for s in 0..half {
+                    let f0 = buf[2 * s];
+                    let f1 = buf[2 * s + 1];
+                    buf[s] = (Goldilocks::ONE - r) * f0 + r * f1;
+                }
+                buf.truncate(half);
+            });
+        }
+        let final_evals = bufs.iter().map(|b| b[0]).collect();
+        (VirtualProof { rounds, final_evals }, challenges)
+    }
+
+    fn reference_virtual_with_challenges(
+        mles: &[&[Goldilocks]],
+        terms: &[(Goldilocks, Vec<usize>)],
+        claimed: Goldilocks,
+        challenges: &[Goldilocks],
+    ) -> VirtualProof {
+        let n = mles[0].len();
+        let max_deg = terms.iter().map(|(_, idxs)| idxs.len()).max().unwrap_or(0);
+        let mut bufs: Vec<Vec<Goldilocks>> = mles.iter().map(|m| m.to_vec()).collect();
+        let mut rounds = Vec::with_capacity(challenges.len());
+        for &r in challenges {
+            let half = bufs[0].len() / 2;
+            let pvals: Vec<Goldilocks> = (0..half)
+                .into_par_iter()
+                .map(|s| {
+                    let mut p = vec![Goldilocks::ZERO; max_deg + 1];
+                    for (coeff, idxs) in terms {
+                        for k in 0..=max_deg {
+                            let mut prod = *coeff;
+                            for &j in idxs {
+                                let f0 = bufs[j][2 * s];
+                                let f1 = bufs[j][2 * s + 1];
+                                let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
+                                prod = prod * fk;
+                            }
+                            p[k] = p[k] + prod;
+                        }
+                    }
+                    p
+                })
+                .reduce(
+                    || vec![Goldilocks::ZERO; max_deg + 1],
+                    |mut a, b| {
+                        for i in 0..=max_deg {
+                            a[i] = a[i] + b[i];
+                        }
+                        a
+                    },
+                );
+            rounds.push(pvals);
+            bufs.par_iter_mut().for_each(|buf| {
+                for s in 0..half {
+                    let f0 = buf[2 * s];
+                    let f1 = buf[2 * s + 1];
+                    buf[s] = (Goldilocks::ONE - r) * f0 + r * f1;
+                }
+                buf.truncate(half);
+            });
+        }
+        let final_evals = bufs.iter().map(|b| b[0]).collect();
+        VirtualProof { rounds, final_evals }
+    }
+
+    #[test]
+    fn virtual_fold_matches_map_reduce_reference() {
+        let mut rng = XorShift64::new(0x0F3D);
+        let n = 1usize << 7;
+        let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let g: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let h: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let terms: Vec<(Goldilocks, Vec<usize>)> = vec![
+            (Goldilocks::from_u64(3), vec![0, 1]),
+            (from_i64(-2), vec![1, 2]),
+            (Goldilocks::ONE, vec![0, 1, 2]),
+        ];
+        let claimed: Goldilocks = (0..n)
+            .map(|i| {
+                Goldilocks::from_u64(3) * f[i] * g[i]
+                    + from_i64(-2) * g[i] * h[i]
+                    + f[i] * g[i] * h[i]
+            })
+            .sum();
+        let mles: Vec<&[Goldilocks]> = vec![&f, &g, &h];
+        let mut t_opt = Transcript::new(b"o3-fold-reference");
+        let (opt, opt_ch) = prove_virtual(&mles, &terms, claimed, &mut t_opt);
+        let mut t_ref = Transcript::new(b"o3-fold-reference");
+        let (rf, rf_ch) = reference_virtual(&mles, &terms, claimed, &mut t_ref);
+        assert_eq!(opt_ch, rf_ch, "challenges must match");
+        assert_eq!(bincode::serialize(&opt).unwrap(), bincode::serialize(&rf).unwrap(),
+            "fold and map/reduce must produce identical round polys and final evals");
+
+        let challenges: Vec<Goldilocks> = (0..7).map(|_| rng.field()).collect();
+        let opt2 = prove_virtual_with_challenges(&mles, &terms, claimed, &challenges);
+        let rf2 = reference_virtual_with_challenges(&mles, &terms, claimed, &challenges);
+        assert_eq!(bincode::serialize(&opt2).unwrap(), bincode::serialize(&rf2).unwrap(),
+            "fixed-challenge fold proof must match the reference");
+    }
 
     #[test]
     fn virtual_sumcheck_roundtrip() {
