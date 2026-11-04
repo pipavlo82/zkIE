@@ -127,6 +127,60 @@ fn pad_lookup_table(table: &[Goldilocks]) -> Vec<Goldilocks> {
     out
 }
 
+/// Deep O7 (a): static lookup groups. Only static, non-identity tables are
+/// grouped; the trusted tensor id is the key (different ids are never merged),
+/// and the manifest must carry the table's root and length. Members are op
+/// indices in ascending order, giving a deterministic group order and group
+/// membership for the prover/verifier α/β derivation.
+fn static_lookup_groups(
+    ops: &[Op],
+    model: &TrustedModelManifest,
+) -> Option<std::collections::BTreeMap<T, Vec<usize>>> {
+    let written = op_field_writes(ops);
+    let mut groups: std::collections::BTreeMap<T, Vec<usize>> = std::collections::BTreeMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::Lookup { table, .. } = op {
+            if written.contains(table) || model.identity_tables.contains_key(table) {
+                continue; // dynamic / identity: unchanged per-op path
+            }
+            model.lookup_roots.get(table)?;
+            model.lookup_lengths.get(table)?;
+            groups.entry(*table).or_default().push(i);
+        }
+    }
+    Some(groups)
+}
+
+/// Deep O7 (a): derive the common (α, β) of each static lookup group on the
+/// bound transcript, AFTER model+execution+aux descriptors and BEFORE the
+/// reverse DAG. Absorption per group in ascending trusted-id order:
+///   tag, table id, padded-table arity, member count, member op indices,
+/// then α = field(), β = field(). The prover and verifier run this identical
+/// sequence; every later op transcript is shifted accordingly.
+fn derive_lookup_group_ab(
+    transcript: &mut Transcript,
+    ops: &[Op],
+    model: &TrustedModelManifest,
+) -> Option<std::collections::BTreeMap<T, (Goldilocks, Goldilocks)>> {
+    let groups = static_lookup_groups(ops, model)?;
+    let mut out = std::collections::BTreeMap::new();
+    for (tid, members) in groups {
+        transcript.absorb(b"zkie-lookup-group-ab-v1");
+        transcript.absorb_u64(tid as u64);
+        let len = *model.lookup_lengths.get(&tid)?;
+        let arity = len.next_power_of_two().max(32).trailing_zeros() as u64;
+        transcript.absorb_u64(arity);
+        transcript.absorb_u64(members.len() as u64);
+        for &oi in &members {
+            transcript.absorb_u64(oi as u64);
+        }
+        let alpha = transcript.field();
+        let beta = transcript.field();
+        out.insert(tid, (alpha, beta));
+    }
+    Some(out)
+}
+
 /// O7 (per-proof table-side sharing): commit each STATIC lookup table once,
 /// keyed by its trusted tensor id. Same-id lookups reuse the Merkle tree and
 /// commitment; different ids are never merged even if their contents match.
@@ -4030,7 +4084,7 @@ fn lookup_prefix_eval(len: usize, point: &[Goldilocks]) -> Goldilocks {
 
 fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
     pairs: PreparedAux, multiplicity: PreparedAux, model: &TrustedModelManifest, dynamic_table: bool,
-    transcript: &mut Transcript)
+    group_ab: Option<(Goldilocks, Goldilocks)>, transcript: &mut Transcript)
     -> Option<(ReverseLookupProof, Vec<EvalClaim>)>
 {
     let (idx, out, table_id) = match op { Op::Lookup { idx, out, table } => (*idx, *out, *table), _ => return None };
@@ -4041,8 +4095,13 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
     let output_index = mle::eval(&pairs.columns[0], &output_point);
     if mle::eval(&pairs.columns[1], &output_point) != value { return None; }
     transcript.absorb_field(output_index);
-    let alpha = transcript.field();
-    let beta = transcript.field();
+    // Deep O7 (a): grouped static-lookup ops share the group (α, β) derived
+    // before the reverse DAG; dynamic/identity/plain paths keep the per-op
+    // squeeze (two field() calls at this position).
+    let (alpha, beta) = match group_ab {
+        Some(ab) => ab,
+        None => (transcript.field(), transcript.field()),
+    };
     let (witness, _, _, _, _) = prove_lookup_witness_batch_columns(&[xs.as_slice()], &[ys], alpha, beta, transcript);
     // O7: reuse the once-per-proof static table commit (same trusted id);
     // otherwise fall back to the per-lookup padded table.
@@ -4119,13 +4178,18 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
 
 fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs: &AuxDescriptor,
     multiplicity: &AuxDescriptor, model: &TrustedModelManifest, dynamic_table: bool,
+    group_ab: Option<(Goldilocks, Goldilocks)>,
     proof: &ReverseLookupProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
 {
     let (idx, table_id) = match op { Op::Lookup { idx, table, .. } => (*idx, *table), _ => return None };
     if point.len() != pairs.len.trailing_zeros() as usize { return None; }
     transcript.absorb_field(proof.output_index);
-    let alpha = transcript.field();
-    let beta = transcript.field();
+    // Must match the prover: grouped static lookups use the pre-derived
+    // group (α, β); other paths keep the per-op squeeze.
+    let (alpha, beta) = match group_ab {
+        Some(ab) => ab,
+        None => (transcript.field(), transcript.field()),
+    };
     let witness = verify_fractional_chain_core(&proof.witness, pairs.arity, transcript)?;
     let table = verify_fractional_chain_core(&proof.table, multiplicity.arity, transcript)?;
     if witness.final_den == Goldilocks::ZERO || table.final_den == Goldilocks::ZERO
@@ -4391,12 +4455,12 @@ fn reverse_setup(ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript)
 }
 
 pub fn prove_reverse_dag(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript) -> Option<ReverseDagProof> {
-    prove_reverse_dag_inner(store, ops, seeds, transcript, &mut std::collections::BTreeMap::new(), None, None, None)
+    prove_reverse_dag_inner(store, ops, seeds, transcript, &mut std::collections::BTreeMap::new(), None, None, None, &std::collections::BTreeMap::new())
         .map(|(proof, _leaves)| proof)
 }
 
 
-fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>) -> Option<(ReverseDagProof, Vec<EvalClaim>)> {
+fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>, lookup_groups: &std::collections::BTreeMap<T, (Goldilocks, Goldilocks)>) -> Option<(ReverseDagProof, Vec<EvalClaim>)> {
     let replayed = execution.and_then(|e| replay_index_columns(ops, e));
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
@@ -4441,7 +4505,8 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 let dynamic_table = op_field_writes(ops).contains(&table_id);
                 let r = prove_reverse_lookup(store, op, &point, value,
                     aux.remove(&(op_index, AuxRole::LookupPairs))?,
-                    aux.remove(&(op_index, AuxRole::LookupMultiplicity))?, model?, dynamic_table, transcript);
+                    aux.remove(&(op_index, AuxRole::LookupMultiplicity))?, model?, dynamic_table,
+                    lookup_groups.get(&table_id).copied(), transcript);
                 let (proof, incoming) = r?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
@@ -4676,10 +4741,10 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
 }
 
 pub fn verify_reverse_dag(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>> {
-    verify_reverse_dag_inner(ops, seeds, proof, transcript, &[], None, None, None)
+    verify_reverse_dag_inner(ops, seeds, proof, transcript, &[], None, None, None, &std::collections::BTreeMap::new())
 }
 
-fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript, aux: &[AuxDescriptor], model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>) -> Option<Vec<EvalClaim>> {
+fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript, aux: &[AuxDescriptor], model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>, lookup_groups: &std::collections::BTreeMap<T, (Goldilocks, Goldilocks)>) -> Option<Vec<EvalClaim>> {
     let replayed = execution.and_then(|e| replay_index_columns(ops, e));
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
@@ -4729,7 +4794,8 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 let multiplicity = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::LookupMultiplicity)?;
                 let table_id = match op { Op::Lookup { table, .. } => *table, _ => return None };
                 let dynamic_table = op_field_writes(ops).contains(&table_id);
-                for c in verify_reverse_lookup(op, &point, value, pairs, multiplicity, model?, dynamic_table, proof, transcript)? {
+                for c in verify_reverse_lookup(op, &point, value, pairs, multiplicity, model?, dynamic_table,
+                    lookup_groups.get(&table_id).copied(), proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -11331,14 +11397,18 @@ pub fn prove_committed_shard_dag_bound(
     if std::env::var("ZKIE_O7_TABLE_CACHE").ok().as_deref() != Some("0") {
         prepare_static_lookup_commits(store, ops, model)?;
     }
-    let (reverse, prover_leaves) = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution))?;
+    // Deep O7 (a): derive each static lookup group's common (α, β) after the
+    // model/execution/aux absorption and before the reverse DAG.
+    let lookup_groups = derive_lookup_group_ab(&mut transcript, ops, model)?;
+    let (reverse, prover_leaves) = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution), &lookup_groups)?;
     // O2 (TL Q3): the prover uses its own residual claims; the verifier-side
     // replay is optional, for separately-accounted self-verify measurements
     // and a leaf consistency check. Default off: no prover self-verification.
     let leaves = if std::env::var("ZKIE_O2_SELFVERIFY").ok().as_deref() == Some("1") {
         let (mut replay, replay_seeds) = execution_seeds(ops, model, execution, &aux)?;
+        let replay_groups = derive_lookup_group_ab(&mut replay, ops, model)?;
         let t_sv = std::time::Instant::now();
-        let verified = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model), Some(&certified), Some(execution))?;
+        let verified = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model), Some(&certified), Some(execution), &replay_groups)?;
         eprintln!("O2-selfverify ms={:.1} leaves={}", t_sv.elapsed().as_secs_f64() * 1e3, verified.len());
         let mut a: Vec<String> = prover_leaves.iter().map(|c| format!("{:?}", c)).collect();
         let mut b: Vec<String> = verified.iter().map(|c| format!("{:?}", c)).collect();
@@ -11428,7 +11498,10 @@ pub fn verify_committed_shard_dag_bound(
     }
     let (mut transcript, seeds) = match execution_seeds(ops, model, execution, &proof.aux) { Some(v) => v, None => return false };
     let certified = certified_index_tensors(ops, execution);
-    let leaves = match verify_reverse_dag_inner(ops, &seeds, &proof.reverse, &mut transcript, &proof.aux, Some(model), Some(&certified), Some(execution)) {
+    let lookup_groups = match derive_lookup_group_ab(&mut transcript, ops, model) {
+        Some(v) => v, None => return false,
+    };
+    let leaves = match verify_reverse_dag_inner(ops, &seeds, &proof.reverse, &mut transcript, &proof.aux, Some(model), Some(&certified), Some(execution), &lookup_groups) {
         Some(v) => v, None => return false,
     };
     let weights: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
@@ -14019,9 +14092,9 @@ mod tests {
         let pair_desc = pairs.descriptor.clone();
         let mult_desc = mult.descriptor.clone();
         let mut prover = Transcript::new(b"padded-identity-forgery");
-        let (proof, _) = prove_reverse_lookup(&store, &ops[0], &[], from_i64(3), pairs, mult, &model, false, &mut prover).unwrap();
+        let (proof, _) = prove_reverse_lookup(&store, &ops[0], &[], from_i64(3), pairs, mult, &model, false, None, &mut prover).unwrap();
         let mut verifier = Transcript::new(b"padded-identity-forgery");
-        assert!(verify_reverse_lookup(&ops[0], &[], from_i64(3), &pair_desc, &mult_desc, &model, false, &proof, &mut verifier).is_none());
+        assert!(verify_reverse_lookup(&ops[0], &[], from_i64(3), &pair_desc, &mult_desc, &model, false, None, &proof, &mut verifier).is_none());
     }
 
     #[test]
@@ -18209,7 +18282,7 @@ mod tests {
         let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux).unwrap();
         let certified = certified_index_tensors(&ops, &execution);
         let (reverse, _leaves) = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
-            Some(&model), Some(&certified), Some(&execution)).expect("forged bound proof is producible");
+            Some(&model), Some(&certified), Some(&execution), &std::collections::BTreeMap::new()).expect("forged bound proof is producible");
         let proof = BoundExecutionProof {
             aux, reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None,
         };
@@ -18517,7 +18590,7 @@ mod tests {
         let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux).unwrap();
         let certified = certified_index_tensors(&ops, &execution);
         let (reverse, _leaves) = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
-            Some(&model), Some(&certified), Some(&execution)).expect("forged proof producible");
+            Some(&model), Some(&certified), Some(&execution), &std::collections::BTreeMap::new()).expect("forged proof producible");
         let proof = BoundExecutionProof { aux, reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None };
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
             &PublicStatement::Generic, &model, &execution),
