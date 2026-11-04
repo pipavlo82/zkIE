@@ -127,6 +127,47 @@ fn pad_lookup_table(table: &[Goldilocks]) -> Vec<Goldilocks> {
     out
 }
 
+/// O7 (per-proof table-side sharing): commit each STATIC lookup table once,
+/// keyed by its trusted tensor id. Same-id lookups reuse the Merkle tree and
+/// commitment; different ids are never merged even if their contents match.
+/// The root is checked against the trusted model manifest before use. The
+/// multiplicity columns and α/β stay per lookup in this step (their deeper
+/// aggregation requires a transcript/reduction change).
+fn prepare_static_lookup_commits(
+    store: &mut Store,
+    ops: &[Op],
+    model: &TrustedModelManifest,
+) -> Option<()> {
+    use std::sync::atomic::Ordering;
+    let written = op_field_writes(ops);
+    let mut seen = std::collections::BTreeSet::new();
+    for op in ops {
+        let tid = match op {
+            Op::Lookup { table, .. } => *table,
+            _ => continue,
+        };
+        if written.contains(&tid) || model.identity_tables.contains_key(&tid) {
+            continue; // dynamic table or identity table: no static opening
+        }
+        if !seen.insert(tid) {
+            continue;
+        }
+        let values = pad_lookup_table(store.get(tid));
+        let arity = values.len().trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let committed = zkie_core::pcs::committed::commit(&whir, &values);
+        if bincode::serialize(&committed.commitment).ok()?
+            != bincode::serialize(model.lookup_roots.get(&tid)?).ok()?
+        {
+            return None;
+        }
+        store.o7_table_commits.fetch_add(1, Ordering::Relaxed);
+        store.static_table_commits.insert(tid, (values, committed));
+    }
+    Some(())
+}
+
 /// One claim in the verifier's self-built authentication chain: tensor
 /// `tensor_id`'s MLE evaluated at `point` equals `value`. Every claim the
 /// verifier uses is derived from its own reduction (op sumcheck final evals,
@@ -4003,7 +4044,19 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
     let alpha = transcript.field();
     let beta = transcript.field();
     let (witness, _, _, _, _) = prove_lookup_witness_batch_columns(&[xs.as_slice()], &[ys], alpha, beta, transcript);
-    let table_values = pad_lookup_table(store.get(table_id));
+    // O7: reuse the once-per-proof static table commit (same trusted id);
+    // otherwise fall back to the per-lookup padded table.
+    let cached_values = store
+        .static_table_commits
+        .get(&table_id)
+        .map(|(v, _)| v.as_slice());
+    let table_values_owned = if cached_values.is_none() {
+        Some(pad_lookup_table(store.get(table_id)))
+    } else {
+        None
+    };
+    let table_values: &[Goldilocks] = cached_values
+        .unwrap_or_else(|| table_values_owned.as_deref().unwrap());
     let m: Vec<u64> = multiplicity.columns[0].iter().map(|&v| to_i64(v) as u64).collect();
     let table = prove_lookup_table(&m, &table_values, alpha, beta, transcript);
     let (w_num_point, w_num, w_den_point, w_den) = fractional_leaf(&witness);
@@ -4036,7 +4089,18 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
     } else if model.identity_tables.contains_key(&table_id) {
         if table_eval != lookup_index_eval(&t_den_point) { return None; }
         None
+    } else if let Some((values, committed)) = store.static_table_commits.get(&table_id) {
+        let arity = values.len().trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let (opening, opened) =
+            whir.open(committed.prover_data.clone(), &committed.protocol, &t_den_point);
+        if opened != table_eval { return None; }
+        Some(opening)
     } else {
+        // Fallback (ZKIE_O7_TABLE_CACHE=0 or uncached table): commit once for
+        // this lookup and count it for the before/after measurement.
+        store.o7_table_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let arity = table_values.len().trailing_zeros() as usize;
         let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
         let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
@@ -5381,6 +5445,12 @@ pub struct Store {
     pub(crate) o6_fwd_mm: std::sync::atomic::AtomicU64,
     pub(crate) o6_proof_mm: std::sync::atomic::AtomicU64,
     pub(crate) o6_hits: std::sync::atomic::AtomicU64,
+    /// O7: per-proof committed static lookup tables, keyed by the TRUSTED
+    /// table tensor id. Same-id lookups share one Merkle tree/commitment;
+    /// different ids are never merged even if their contents coincide.
+    pub(crate) static_table_commits:
+        std::collections::BTreeMap<T, (Vec<Goldilocks>, zkie_core::pcs::committed::Committed)>,
+    pub(crate) o7_table_commits: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -5413,6 +5483,15 @@ impl Store {
         self.o6_fwd_mm.store(0, Ordering::Relaxed);
         self.o6_proof_mm.store(0, Ordering::Relaxed);
         self.o6_hits.store(0, Ordering::Relaxed);
+    }
+    /// O7 metrics: number of static lookup-table Merkle trees committed.
+    pub fn o7_table_commits(&self) -> u64 {
+        self.o7_table_commits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Reset this store's O7 counter (measurement tooling).
+    pub fn o7_metrics_reset(&self) {
+        self.o7_table_commits
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn push(&mut self, t: Vec<Goldilocks>) -> T {
         let id = self.v.len();
@@ -11246,6 +11325,12 @@ pub fn prove_committed_shard_dag_bound(
     let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux)?;
     let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
     let certified = certified_index_tensors(ops, execution);
+    // O7: commit each static lookup table once per proof (per trusted id).
+    // ZKIE_O7_TABLE_CACHE=0 falls back to the per-lookup commit for the
+    // before/after measurement.
+    if std::env::var("ZKIE_O7_TABLE_CACHE").ok().as_deref() != Some("0") {
+        prepare_static_lookup_commits(store, ops, model)?;
+    }
     let (reverse, prover_leaves) = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution))?;
     // O2 (TL Q3): the prover uses its own residual claims; the verifier-side
     // replay is optional, for separately-accounted self-verify measurements
@@ -14098,6 +14183,49 @@ mod tests {
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// O7: two Lookups into the SAME static table share one per-proof table
+    /// commitment/Merkle tree (o7_table_commits == 1), while the per-lookup
+    /// table-side fractional proofs remain (two Lookup reverse steps).
+    #[test]
+    fn o7_same_table_lookups_share_table_commit() {
+        let mut store = Store::new();
+        let table: Vec<Goldilocks> = (0..32).map(|i| from_i64(100 + i)).collect();
+        let t = store.push(table);
+        let idx1 = store.push_idx((0..32u32).map(|i| (i * 7) % 32).collect());
+        let idx2 = store.push_idx((0..32u32).map(|i| (i * 11 + 3) % 32).collect());
+        let out1 = store.push(vec![]);
+        let out2 = store.push(vec![]);
+        let ops = vec![
+            Op::Lookup { idx: idx1, out: out1, table: t },
+            Op::Lookup { idx: idx2, out: out2, table: t },
+        ];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let path = std::env::temp_dir().join("zkie-o7-same-table");
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx1, 32usize), (idx2, 32usize)].into());
+        forward_ops(&mut store, &ops);
+        store.o7_metrics_reset();
+        let k1 = TensorKey::Index(idx1).encoded().unwrap();
+        let k2 = TensorKey::Index(idx2).encoded().unwrap();
+        let g1: Vec<Goldilocks> = store.idx[idx1].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let g2: Vec<Goldilocks> = store.idx[idx2].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(k1, g1), (k2, g2)].into(),
+            outputs: [(out1, store.get(out1).to_vec()), (out2, store.get(out2).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0,
+            &PublicStatement::Generic, &model, &execution)
+            .expect("O7 same-table bound proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+        assert_eq!(store.o7_table_commits(), 1,
+            "one table Merkle tree for two same-id lookups");
+        let lookups = proof.reverse.steps.iter()
+            .filter(|s| matches!(&s.reduction, ReverseReduction::Lookup { .. })).count();
+        assert_eq!(lookups, 2, "per-lookup table-side fractions still run");
     }
 
     /// O6: the bound prover forwards once (one Projection matmul) and the
