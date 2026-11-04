@@ -339,6 +339,28 @@ roundtrip/tamper, lookup split identity + zero-den rejection). Existing ops
 Composer wiring, EF PCS boundary/batch-opening wrapper, budget caps,
 dead-field canonicalization, and A/B/D/C measurements remain for 2b-2/2b-3.
 
+## 9d. Step 2b-2a status — EF PCS boundary and batch opening
+
+Sub-step 2b-2a adds the EF end of the committed-data boundary; tensors and
+Merkle roots stay base-field:
+
+- `Whir::open_ef` / `verify_ef`: open/verify a base-field committed MLE at an
+  EF challenge point (LSB→MSB coordinate reversal, no extra randomness). The
+  returned evaluation is EF and equals `mle_eval_at_ef` of the F table.
+- `Whir::open_batch_multi_ef` / `verify_batch_multi_ef`: the same for a batch
+  of tables opened at one EF point.
+- `pcs/ef_batch_open.rs`: `EfBatchOpeningProof` plus
+  `prove/verify_batch_open_committed_ef`. Fiat–Shamir absorbs the commitment
+  and EF points/claims as two-lane values, γ is an EF squeeze, the
+  sum-of-products `W_t` sumcheck is EF (`ef_batch`), the WHIR opening runs at
+  the EF challenges, and the verifier reconstructs `Σ W_g(r)·eval_g` in EF.
+- Test: honest roundtrip, duplicate-table grouping, EF open matches EF MLE
+  evaluation, tampered sumcheck/evals rejected.
+
+Existing base-field paths remain untouched; no proof bytes changed. Composer
+claim/reverse migration, budget caps, dead-field canonicalization and A/B/D/C
+measurements remain for 2b-2b/2b-2c.
+
 ## 10. Acceptance status
 
 Step 1 delivers only this inventory and budget. The S9 acceptance items

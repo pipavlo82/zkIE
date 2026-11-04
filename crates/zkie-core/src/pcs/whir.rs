@@ -34,6 +34,8 @@ use p3_whir::pcs::prover::WhirProver;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
+use crate::common::field::Ef;
+
 type F = Goldilocks;
 type EF = BinomialExtensionField<F, 2>;
 type Perm = Poseidon2Goldilocks<16>;
@@ -750,6 +752,49 @@ impl Whir {
             .as_base()
             .expect("base-field MLE opens to a base element"))
     }
+
+    /// S9: open a base-field committed MLE at an EF challenge point. The
+    /// opened evaluation is an EF element (the MLE is lifted by the PCS
+    /// evaluation); this is the PCS boundary used by the EF outer reductions.
+    pub fn open_ef(
+        &self,
+        prover_data: ProverData,
+        protocol: &OpeningProtocol,
+        point: &[Ef],
+    ) -> (Proof, Ef) {
+        let t0 = std::time::Instant::now();
+        let target = to_ef_point_ef(point);
+        let proof = self.pcs.open_at(
+            prover_data,
+            protocol,
+            std::slice::from_ref(&target),
+            &mut self.fresh_challenger(),
+        );
+        let opened = proof.evals[0].current()[0];
+        let (n, secs) = self.open_stats.get();
+        self.open_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
+        GLOBAL_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (proof, opened)
+    }
+
+    /// S9: verify a base-field committed MLE opened at an EF point.
+    pub fn verify_ef(
+        &self,
+        commitment: &Commitment,
+        proof: &Proof,
+        protocol: &OpeningProtocol,
+        point: &[Ef],
+    ) -> Result<Ef, <MyPcs as MultilinearPcs<EF, MyChallenger>>::Error> {
+        let target = to_ef_point_ef(point);
+        let evals = self.pcs.verify_at(
+            commitment,
+            proof,
+            protocol,
+            std::slice::from_ref(&target),
+            &mut self.fresh_challenger(),
+        )?;
+        Ok(evals[0].current()[0])
+    }
     /// Open the `table_index`-th MLE in a batch at `point`.
     pub fn open_batch(
         &self,
@@ -882,6 +927,48 @@ impl Whir {
             })
             .collect())
     }
+
+    /// S9: open every MLE in a batch at an EF challenge point.
+    pub fn open_batch_multi_ef(
+        &self,
+        prover_data: ProverData,
+        protocol: &OpeningProtocol,
+        num_tables: usize,
+        point: &[Ef],
+    ) -> (Proof, Vec<Ef>) {
+        let target = to_ef_point_ef(point);
+        let points: Vec<Point<EF>> = (0..num_tables).map(|_| target.clone()).collect();
+        let proof = self.pcs.open_at(
+            prover_data,
+            protocol,
+            &points,
+            &mut self.fresh_challenger(),
+        );
+        let opened: Vec<Ef> = proof.evals.iter().map(|e| e.current()[0]).collect();
+        GLOBAL_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (proof, opened)
+    }
+
+    /// S9: verify a batch opening at an EF challenge point.
+    pub fn verify_batch_multi_ef(
+        &self,
+        commitment: &Commitment,
+        proof: &Proof,
+        protocol: &OpeningProtocol,
+        num_tables: usize,
+        point: &[Ef],
+    ) -> Result<Vec<Ef>, <MyPcs as MultilinearPcs<EF, MyChallenger>>::Error> {
+        let target = to_ef_point_ef(point);
+        let points: Vec<Point<EF>> = (0..num_tables).map(|_| target.clone()).collect();
+        let evals = self.pcs.verify_at(
+            commitment,
+            proof,
+            protocol,
+            &points,
+            &mut self.fresh_challenger(),
+        )?;
+        Ok(evals.iter().map(|e| e.current()[0]).collect())
+    }
 }
 
 /// Embed base-field coordinates into the degree-2 extension field.
@@ -891,6 +978,13 @@ impl Whir {
 /// Reversing here reconciles the two orderings at the commitment boundary.
 fn to_ef_point(point: &[Goldilocks]) -> Point<EF> {
     Point::new(point.iter().rev().map(|&c| EF::from(c)).collect())
+}
+
+/// S9: an EF challenge point is already in the extension field; only the
+/// coordinate order is reconciled (LSB-first -> Plonky3 MSB-first). No
+/// additional randomness is introduced by the conversion.
+fn to_ef_point_ef(point: &[Ef]) -> Point<EF> {
+    Point::new(point.iter().rev().copied().collect())
 }
 
 #[cfg(test)]
