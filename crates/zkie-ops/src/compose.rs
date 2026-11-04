@@ -12,6 +12,8 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use bincode::config::Options as _;
+
 use crate::layer_norm_centered::{
     layer_norm_forward as layer_norm_centered_forward, prove_layer_norm_centered,
     verify_layer_norm_centered, LayerNormCenteredProof,
@@ -48,6 +50,78 @@ use zkie_core::common::same_poly::{prove_same_poly, verify_same_poly, SamePolyPr
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
 use zkie_core::common::transcript::Transcript;
 use zkie_core::common::weights_io::WeightMmap;
+
+/// S8: hard cap on the serialized proof size accepted by the byte entries.
+/// The largest proof recorded in this workspace's benchmarks is ~225 MB
+/// (DeepSeek-V2-Lite, 512 tokens, legacy committed pipeline); 512 MiB keeps
+/// more than 2x headroom while making decode memory bounded and explicit.
+pub const MAX_PROOF_BYTES: usize = 512 * 1024 * 1024;
+/// Aux descriptors are fully pinned to the trusted graph; this cap bounds the
+/// work done before that comparison.
+const MAX_AUX_DESCRIPTORS: usize = 1 << 20;
+/// A reverse step never carries more claims than an op has output tensors
+/// (at most five today); this cap allows headroom without permitting
+/// proof-controlled scans.
+const MAX_REVERSE_STEP_OUTPUTS: usize = 64;
+/// Verifier policy: every WHIR instance reconstructed while checking a proof
+/// uses at least this security level, independent of any proof-supplied value.
+const VERIFIER_SECURITY: usize = 90;
+
+/// Bounded bincode decode with the legacy (fixint, trailing-bytes-allowed)
+/// format. The byte cap is checked before deserialization and enforced by
+/// bincode's limit; it bounds vector lengths and total allocation.
+fn decode_proof_limited<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+    if bytes.len() > MAX_PROOF_BYTES {
+        return None;
+    }
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_PROOF_BYTES as u64)
+        .deserialize(bytes)
+        .ok()
+}
+
+/// Verifier-side WHIR construction for a proof-derived dimension: security is
+/// fixed by the verifier policy, PoW is the exact requirement for that size,
+/// and every parameter is range-checked before any FFT/DFT allocation.
+fn verifier_whir(num_vars: usize) -> Option<zkie_core::pcs::whir::Whir> {
+    if num_vars > zkie_core::pcs::whir::MAX_WHIR_NUM_VARIABLES {
+        return None;
+    }
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
+    zkie_core::pcs::whir::Whir::try_with_params(num_vars, VERIFIER_SECURITY, pow)
+}
+
+/// Verifier-side WHIR construction for a trusted manifest batch. The manifest
+/// is caller-owned, but its parameters are still policy-checked here so a
+/// malformed manifest fails closed rather than constructing out-of-range PCS
+/// parameters (the security policy itself is never taken from a proof).
+fn trusted_batch_whir(
+    num_vars: usize,
+    security_level: usize,
+    pow_bits: usize,
+) -> Option<zkie_core::pcs::whir::Whir> {
+    if security_level < VERIFIER_SECURITY {
+        return None;
+    }
+    let required = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
+    if pow_bits < required {
+        return None;
+    }
+    zkie_core::pcs::whir::Whir::try_with_params(num_vars, security_level, pow_bits)
+}
+
+/// Last-resort panic barrier for the public byte entries. Structural
+/// validation and bounded decode are the primary defenses (and the S8 fuzz
+/// corpus checks that the underlying verifier does not panic); this guard
+/// ensures a service still sees `false` if an unforeseen panic escapes.
+fn guard_verify(f: impl FnOnce() -> bool) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => false,
+    }
+}
 
 fn is_identity_table(table: &[Goldilocks]) -> bool {
     table
@@ -3125,8 +3199,7 @@ fn verify_reverse_scale(op: &Op, point: &[Goldilocks], value: Goldilocks, aux: O
     if final_value != virtual_eval(&terms, &evals) { return None; }
     let padded = 1usize.checked_shl(descriptor.arity as u32)?;
     let vars = descriptor.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-    let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+    let whir = verifier_whir(vars)?;
     let protocol = whir.batch_opening_protocol(descriptor.columns, descriptor.arity);
     let mut padded_point = point.to_vec(); padded_point.resize(descriptor.arity, Goldilocks::ZERO);
     let mut idxs: Vec<usize> = (0..descriptor.columns).collect();
@@ -3517,8 +3590,7 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
     push!(0, argmax_pad_point(&zd2, arity));
     let padded = 1usize.checked_shl(arity as u32)?;
     let vars = descriptor.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-    let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+    let whir = verifier_whir(vars)?;
     let protocol = whir.batch_opening_protocol(descriptor.columns, arity);
     if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &descriptor.commitment, &protocol, descriptor.columns, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
     let av = &proof.aux_values;
@@ -4604,8 +4676,7 @@ fn open_aux(aux: PreparedAux, idxs: &[usize], points: &[Vec<Goldilocks>], values
 fn verify_aux_open(aux: &AuxDescriptor, idxs: &[usize], points: &[Vec<Goldilocks>], values: &[Goldilocks], proof: &zkie_core::pcs::batch_open::BatchOpeningProof) -> bool {
     let padded = match 1usize.checked_shl(aux.arity as u32) { Some(v) => v, None => return false };
     let vars = match aux.columns.checked_mul(padded).and_then(usize::checked_next_power_of_two) { Some(v) => v.trailing_zeros() as usize, None => return false };
-    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-    let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+    let whir = match verifier_whir(vars) { Some(w) => w, None => return false };
     let protocol = whir.batch_opening_protocol(aux.columns, aux.arity);
     zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &aux.commitment, &protocol, aux.columns, idxs, points, values, proof)
 }
@@ -4817,8 +4888,7 @@ fn verify_lookup_groups(
         // leaf. The opened value is bound by the group leaf relation; the
         // table root comes from the trusted model, never from the proof.
         let root = model.lookup_roots.get(&tid)?;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let whir = verifier_whir(arity)?;
         let protocol = whir.opening_protocol(arity, 1);
         let table_eval = whir.verify(root, &gp.table_opening, &protocol, &tc.q_den).ok()?;
         if tc.den_leaf != alpha + lookup_index_eval(&tc.q_den) + beta * table_eval { return None; }
@@ -5093,8 +5163,7 @@ fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs
     } else {
         let root = model.lookup_roots.get(&table_id)?;
         let opening = proof.table_opening.as_ref()?;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(multiplicity.arity, 90);
-        let whir = zkie_core::pcs::whir::Whir::with_params(multiplicity.arity, 90, pow);
+        let whir = verifier_whir(multiplicity.arity)?;
         let protocol = whir.opening_protocol(multiplicity.arity, 1);
         if whir.verify(root, opening, &protocol, &table.q_den).ok() != Some(proof.table_value) { return None; }
     }
@@ -5197,8 +5266,7 @@ fn verify_reverse_projection(op: &Op, point: &[Goldilocks], value: Goldilocks, a
     if final_value != virtual_eval(&terms, &evals) { return None; }
     let padded = 1usize.checked_shl(aux.arity as u32)?;
     let vars = aux.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-    let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+    let whir = verifier_whir(vars)?;
     let protocol = whir.batch_opening_protocol(aux.columns, aux.arity);
     let mut padded_point = point.to_vec(); padded_point.resize(aux.arity, Goldilocks::ZERO);
     let mut idxs: Vec<usize> = (0..aux.columns).collect(); idxs.extend(0..aux.columns);
@@ -5289,8 +5357,7 @@ fn verify_reverse_relu(proof: &ReverseReluProof, point: &[Goldilocks], value: Go
     evals[0] = mle::eq_poly(&q, &range_point);
     if final_range != virtual_eval(&terms_range, &evals) { return None; }
     let num_vars = bits.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
-    let whir = zkie_core::pcs::whir::Whir::with_params(num_vars, 90, pow);
+    let whir = verifier_whir(num_vars)?;
     let protocol = whir.batch_opening_protocol(bits, proof.arity);
     let mut idxs = vec![bits - 1]; idxs.extend(0..bits);
     let mut points = vec![out_point.clone()]; points.extend((0..bits).map(|_| range_point.clone()));
@@ -9684,11 +9751,11 @@ pub fn verify_shard_dag_bytes(
     ops: &[Op],
     ops_per_shard: usize,
 ) -> bool {
-    let proof: ShardDagProof = match bincode::deserialize(proof_bytes) {
-        Ok(p) => p,
-        Err(_) => return false,
+    let proof: ShardDagProof = match decode_proof_limited(proof_bytes) {
+        Some(p) => p,
+        None => return false,
     };
-    verify_shard_dag(tables, ops, ops_per_shard, &proof)
+    guard_verify(|| verify_shard_dag(tables, ops, ops_per_shard, &proof))
 }
 
 pub fn verify_shard_dag(
@@ -9796,7 +9863,7 @@ pub struct WeightBatchCommit {
     pub commitment: zkie_core::pcs::whir::Commitment,
     pub arity: usize,
     pub num_tables: usize,
-    pub whir: zkie_core::pcs::whir::Whir,
+    pub whir: zkie_core::pcs::whir::WhirParams,
 }
 
 pub fn committed_cross_bind(
@@ -9851,7 +9918,9 @@ pub fn verify_committed_cross_bind(
     if proof.openings.len() != claims.len() {
         return false;
     }
-    let whir = zkie_core::pcs::whir::Whir::with_params(committed.arity, 90, 17);
+    let whir = match zkie_core::pcs::whir::Whir::try_with_params(committed.arity, 90, 17) {
+        Some(w) => w, None => return false,
+    };
     let protocol = whir.opening_protocol(committed.arity, 1);
     for ((pt, expected), (open, opened)) in claims.iter().zip(proof.openings.iter()) {
         if whir
@@ -10144,9 +10213,9 @@ impl TrustedModelManifest {
             if trusted.security < 90 || trusted.table_ids.len() != trusted.num_tables
                 || trusted.tensor_lengths.len() != trusted.num_tables
                 || trusted.arity != supplied.arity || trusted.num_tables != supplied.num_tables
-                || trusted.num_vars != supplied.whir.num_variables()
-                || trusted.security != supplied.whir.security_level()
-                || trusted.pow_bits != supplied.whir.pow_bits()
+                || trusted.num_vars != supplied.whir.num_variables
+                || trusted.security != supplied.whir.security_level
+                || trusted.pow_bits != supplied.whir.pow_bits
                 || bincode::serialize(&trusted.commitment).ok() != bincode::serialize(&supplied.commitment).ok()
             { return false; }
             for (ti, (&id, &len)) in trusted.table_ids.iter().zip(&trusted.tensor_lengths).enumerate() {
@@ -10286,7 +10355,7 @@ pub struct WitnessBatchCommit {
     pub commitment: zkie_core::pcs::whir::Commitment,
     pub arity: usize,
     pub num_tables: usize,
-    pub whir: zkie_core::pcs::whir::Whir,
+    pub whir: zkie_core::pcs::whir::WhirParams,
 }
 
 /// One vertical batch opening for a group of same-arity witness columns of one
@@ -10319,7 +10388,7 @@ pub struct ColumnBatchCommit {
     pub commitment: zkie_core::pcs::whir::Commitment,
     pub arity: usize,
     pub num_tables: usize,
-    pub whir: zkie_core::pcs::whir::Whir,
+    pub whir: zkie_core::pcs::whir::WhirParams,
 }
 
 /// One vertical batch opening for a group of same-arity columns of one type.
@@ -10563,7 +10632,7 @@ fn prove_committed_shard_dag_inner(
             commitment: cw.commitment.clone(),
             arity: cw.arity,
             num_tables: cw.num_tables,
-            whir: zkie_core::pcs::whir::Whir::with_params(cw.num_vars, cw.security, cw.pow_bits),
+            whir: zkie_core::pcs::whir::WhirParams::new(cw.num_vars, cw.security, cw.pow_bits),
         });
 
         if claims.is_empty() {
@@ -10819,19 +10888,19 @@ fn prove_committed_shard_dag_inner(
             commitment: g.x_ctx.commitment.clone(),
             arity: g.arity,
             num_tables: g.cols.len(),
-            whir: zkie_core::pcs::whir::Whir::with_params(num_vars, 90, pow_bits),
+            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, 90, pow_bits),
         });
         witness_batches.push(WitnessBatchCommit {
             commitment: g.y_ctx.commitment.clone(),
             arity: g.arity,
             num_tables: g.cols.len(),
-            whir: zkie_core::pcs::whir::Whir::with_params(num_vars, 90, pow_bits),
+            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, 90, pow_bits),
         });
         witness_batches.push(WitnessBatchCommit {
             commitment: g.num_ctx.commitment.clone(),
             arity: g.arity,
             num_tables: g.cols.len(),
-            whir: zkie_core::pcs::whir::Whir::with_params(num_vars, 90, pow_bits),
+            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, 90, pow_bits),
         });
     }
 
@@ -11220,7 +11289,7 @@ fn prove_committed_shard_dag_inner(
                 commitment: ctx.commitment.clone(),
                 arity: g.arity,
                 num_tables: g.ops.len(),
-                whir: zkie_core::pcs::whir::Whir::with_params(num_vars, 90, pow_bits),
+                whir: zkie_core::pcs::whir::WhirParams::new(num_vars, 90, pow_bits),
             });
         }
     }
@@ -11496,7 +11565,7 @@ fn prove_committed_shard_dag_inner(
             commitment: g.ctx.commitment.clone(),
             arity: g.arity,
             num_tables: g.ops.len(),
-            whir: zkie_core::pcs::whir::Whir::with_params(num_vars, 90, pow_bits),
+            whir: zkie_core::pcs::whir::WhirParams::new(num_vars, 90, pow_bits),
         });
     }
 
@@ -12243,8 +12312,7 @@ fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &Trusted
 fn aux_batch_whir(descriptor: &AuxDescriptor) -> Option<(zkie_core::pcs::whir::Whir, zkie_core::pcs::whir::OpeningProtocol)> {
     let padded = 1usize.checked_shl(descriptor.arity as u32)?;
     let vars = descriptor.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
-    let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+    let whir = verifier_whir(vars)?;
     let protocol = whir.batch_opening_protocol(descriptor.columns, descriptor.arity);
     Some((whir, protocol))
 }
@@ -12525,6 +12593,16 @@ pub fn verify_committed_shard_dag_bound(
     statement: &PublicStatement, model: &TrustedModelManifest, execution: &TrustedExecution,
 ) -> bool {
     let _ = (ops_per_shard, whir);
+    // S8 wire/resource prechecks before any proof indexing. The aux layout is
+    // pinned to the trusted graph by validate_aux_descriptors (inside
+    // execution_seeds); the remaining caps bound proof-controlled scans.
+    if proof.aux.len() > MAX_AUX_DESCRIPTORS
+        || proof.reverse.steps.len() > ops.len().saturating_add(1)
+        || proof.reverse.steps.iter().any(|s| s.outputs.len() > MAX_REVERSE_STEP_OUTPUTS)
+        || proof.weight_openings.len() != model.batches.len()
+    {
+        return false;
+    }
     if trusted_weight_locations(model, ops).is_none() { return false; }
     // S7b index-domain contract: every caller-authenticated index tensor holds
     // u32 values. The reverse relations for CombineIdx/IdxBroadcast are exact
@@ -12589,7 +12667,9 @@ pub fn verify_committed_shard_dag_bound(
             (None, true) => {},
             (Some(p), false) => {
                 let batch = &model.batches[bi];
-                let whir = zkie_core::pcs::whir::Whir::with_params(batch.num_vars, batch.security, batch.pow_bits);
+                let whir = match trusted_batch_whir(batch.num_vars, batch.security, batch.pow_bits) {
+                    Some(w) => w, None => return false,
+                };
                 let protocol = whir.batch_opening_protocol(batch.num_tables, batch.arity);
                 if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &batch.commitment, &protocol, batch.num_tables, &idxs, &points, &values, p) { return false; }
             }
@@ -12695,9 +12775,11 @@ pub fn verify_committed_shard_dag_bound_bytes(
     whir: &zkie_core::pcs::whir::Whir, statement: &PublicStatement,
     model: &TrustedModelManifest, execution: &TrustedExecution,
 ) -> bool {
-    match bincode::deserialize::<BoundExecutionProof>(bytes) {
-        Ok(proof) => verify_committed_shard_dag_bound(ops, ops_per_shard, whir, &proof, statement, model, execution),
-        Err(_) => false,
+    match decode_proof_limited::<BoundExecutionProof>(bytes) {
+        Some(proof) => guard_verify(|| {
+            verify_committed_shard_dag_bound(ops, ops_per_shard, whir, &proof, statement, model, execution)
+        }),
+        None => false,
     }
 }
 
@@ -12873,9 +12955,10 @@ fn verify_committed_shard_dag_inner(
                     return false;
                 }
                 let batch = &proof.weight_batches[bi];
-                let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
+                let whir = match batch.whir.try_whir(90) { Some(w) => w, None => return false };
+                let protocol = whir.opening_protocol(batch.arity, batch.num_tables);
                 if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-                    &batch.whir,
+                    &whir,
                     &batch.commitment,
                     &protocol,
                     batch.num_tables,
@@ -13001,9 +13084,10 @@ fn verify_committed_shard_dag_inner(
             return false;
         }
         let batch = &proof.witness_batches[bi];
-        let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
+        let whir = match batch.whir.try_whir(90) { Some(w) => w, None => return false };
+        let protocol = whir.opening_protocol(batch.arity, batch.num_tables);
         if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &batch.whir,
+            &whir,
             &batch.commitment,
             &protocol,
             batch.num_tables,
@@ -13069,8 +13153,7 @@ fn verify_committed_shard_dag_inner(
                 let (q_num_t, a_t, q_den_t, b_t) =
                     (&tl.q_num, &tl.num_leaf, &tl.q_den, &tl.den_leaf);
                 let to = &proof.table_openings[ti];
-                let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(to.arity, 90);
-                let bw = zkie_core::pcs::whir::Whir::with_params(to.arity, 90, pow_bits);
+                let bw = match verifier_whir(to.arity) { Some(w) => w, None => return false };
                 let protocol = bw.opening_protocol(to.arity, 1);
                 if to.point != *q_num_t || to.claimed != *a_t {
                     return false;
@@ -13198,9 +13281,10 @@ fn verify_committed_shard_dag_inner(
             return false;
         }
         let batch = &proof.perm_batches[bi];
-        let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
+        let whir = match batch.whir.try_whir(90) { Some(w) => w, None => return false };
+        let protocol = whir.opening_protocol(batch.arity, batch.num_tables);
         if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &batch.whir,
+            &whir,
             &batch.commitment,
             &protocol,
             batch.num_tables,
@@ -13348,9 +13432,10 @@ fn verify_committed_shard_dag_inner(
             return false;
         }
         let batch = &proof.gather_batches[bi];
-        let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
+        let whir = match batch.whir.try_whir(90) { Some(w) => w, None => return false };
+        let protocol = whir.opening_protocol(batch.arity, batch.num_tables);
         if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &batch.whir,
+            &whir,
             &batch.commitment,
             &protocol,
             batch.num_tables,
@@ -13601,9 +13686,10 @@ fn verify_committed_shard_dag_inner(
         if tb.claimed != x_hat {
             return false; // proof-carried claimed value must match the recomputed one
         }
-        let protocol = wb.whir.opening_protocol(wb.arity, wb.num_tables);
+        let whir = match wb.whir.try_whir(90) { Some(w) => w, None => return false };
+        let protocol = whir.opening_protocol(wb.arity, wb.num_tables);
         if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &wb.whir,
+            &whir,
             &wb.commitment,
             &protocol,
             wb.num_tables,
@@ -13629,8 +13715,7 @@ fn verify_committed_shard_dag_inner(
                 if so.points.is_empty() || so.openings.len() != so.points.len() || so.openings.len() != *m {
                     return false;
                 }
-                let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(so.arity, 90);
-                let bw = zkie_core::pcs::whir::Whir::with_params(so.arity, 90, pow_bits);
+                let bw = match verifier_whir(so.arity) { Some(w) => w, None => return false };
                 let protocol = bw.opening_protocol(so.arity, 1);
                 // S6: same-column binding at the relation claim point r.
                 let mut r_pt = ap.topk.r.clone();
@@ -13785,11 +13870,13 @@ pub fn verify_committed_shard_dag_bytes(
     statement: &PublicStatement,
     trusted_model: &TrustedModelManifest,
 ) -> bool {
-    let proof: CommittedShardDagProof = match bincode::deserialize(proof_bytes) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    verify_committed_shard_dag(tables, ops, ops_per_shard, whir, &proof, statement, trusted_model)
+    // S8: this entry is permanently closed (the verifier always returned
+    // false) and its legacy wire format carries `WhirParams`/deeply nested
+    // structures. Rejecting before decoding removes the decoder as an
+    // untrusted-input attack surface entirely; callers only observe `false`,
+    // exactly as before.
+    let _ = (proof_bytes, tables, ops, ops_per_shard, whir, statement, trusted_model);
+    false
 }
 
 /// Build a full pre-norm GPT-2 transformer layer as an op list:
@@ -22516,5 +22603,183 @@ mod tests {
         // Above the boundary: step 2^8.
         let var_large = ((1 << 20) + 256) << 18;
         assert_eq!(rsqrt_index(var_large), (1 << 20) + 1);
+    }
+
+    // ---- S8: untrusted wire/resource hardening ----
+
+    /// Run a verifier call and turn any panic into a test failure, so a
+    /// malformed-proof corpus proves the raw verifier is panic-free rather
+    /// than merely relying on the public entry's panic barrier.
+    fn s8_catch_verify<F: FnOnce() -> bool>(what: &str, f: F) -> bool {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(v) => v,
+            Err(_) => panic!("S8: verifier panicked on {what}"),
+        }
+    }
+
+    fn s8_bound_fixture(seed: u64)
+        -> (Vec<Op>, zkie_core::pcs::whir::Whir, TrustedModelManifest, TrustedExecution, Vec<u8>)
+    {
+        let (mut store, ops, whir, cached, model, execution, ..) = s7_gather_matmul_fixture(seed);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("S8 fixture proof");
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        (ops, whir, model, execution, bytes)
+    }
+
+    #[test]
+    fn s8_bound_bytes_truncation_and_oversized_headers_reject_without_panic() {
+        let (ops, whir, model, execution, bytes) = s8_bound_fixture(0x5801);
+        let mut cuts = vec![0usize, 1, 8, bytes.len() / 2, bytes.len() - 1];
+        cuts.sort_unstable();
+        cuts.dedup();
+        for cut in cuts {
+            let ok = s8_catch_verify("truncated bound proof", || {
+                verify_committed_shard_dag_bound_bytes(
+                    &bytes[..cut], &ops, 1, &whir, &PublicStatement::Generic, &model, &execution)
+            });
+            assert!(!ok, "truncated proof at {cut} must be rejected");
+        }
+        // A decodable length prefix claiming a huge aux vector must fail the
+        // bounded decoder without allocating.
+        let mut huge = bincode::serialize(&u64::MAX).unwrap();
+        huge.extend_from_slice(&[0u8; 64]);
+        assert!(decode_proof_limited::<BoundExecutionProof>(&huge).is_none());
+        let ok = s8_catch_verify("huge declared vector", || {
+            verify_committed_shard_dag_bound_bytes(
+                &huge, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution)
+        });
+        assert!(!ok);
+        // The legacy entry is closed before decoding.
+        let ok = s8_catch_verify("legacy committed entry", || {
+            verify_committed_shard_dag_bytes(
+                &huge, &[], &ops, 1, &whir, &PublicStatement::Generic, &model)
+        });
+        assert!(!ok);
+        // Plain shard entry: garbage and truncation are rejected, no panic.
+        let ok = s8_catch_verify("plain shard garbage", || {
+            verify_shard_dag_bytes(&huge, &[], &ops, 1)
+        });
+        assert!(!ok);
+    }
+
+    #[test]
+    fn s8_bound_wire_structure_mutations_reject_without_panic() {
+        let (ops, whir, model, execution, bytes) = s8_bound_fixture(0x5802);
+        let decode = || bincode::deserialize::<BoundExecutionProof>(&bytes).unwrap();
+        let check = |what: &str, proof: &BoundExecutionProof| {
+            let b = bincode::serialize(proof).unwrap();
+            let ok = s8_catch_verify(what, || {
+                verify_committed_shard_dag_bound_bytes(
+                    &b, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution)
+            });
+            assert!(!ok, "{what} must be rejected");
+        };
+
+        let mut p = decode();
+        let dup = p.aux[0].clone();
+        p.aux.push(dup);
+        check("duplicate aux descriptor", &p);
+        let mut p = decode();
+        p.aux.clear();
+        check("empty aux descriptors", &p);
+        let mut p = decode();
+        p.reverse.steps.clear();
+        check("empty reverse steps", &p);
+        let mut p = decode();
+        for s in &mut p.reverse.steps { s.outputs.clear(); }
+        check("empty reverse-step outputs", &p);
+        let mut p = decode();
+        p.weight_openings.clear();
+        check("empty weight openings", &p);
+        let mut p = decode();
+        if let Some(w) = p.weight_openings.first_mut() {
+            w.table_idxs.push(usize::MAX);
+            w.points.push(Vec::new());
+            w.claimed.push(Goldilocks::ZERO);
+        }
+        check("out-of-range weight table index", &p);
+        let mut p = decode();
+        for a in &mut p.aux {
+            a.arity = usize::MAX;
+        }
+        check("aux arity overflow", &p);
+        let mut p = decode();
+        for a in &mut p.aux {
+            a.columns = usize::MAX;
+        }
+        check("aux columns overflow", &p);
+        let mut p = decode();
+        for s in &mut p.reverse.steps {
+            for o in &mut s.outputs {
+                o.point.push(Goldilocks::ONE);
+                o.merge = None;
+            }
+        }
+        check("extended reverse claim point", &p);
+    }
+
+    #[test]
+    fn s8_lookup_group_wire_mutations_reject_without_panic() {
+        let mut f = o7b_two_lookup_fixture("s8-wire");
+        let proof = o7b_bound_proof(&mut f);
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(
+            &bytes, &f.ops, 1, &f.whir, &PublicStatement::Generic, &f.model, &f.execution));
+        let decode = || bincode::deserialize::<BoundExecutionProof>(&bytes).unwrap();
+        let check = |what: &str, p: &BoundExecutionProof| {
+            let b = bincode::serialize(p).unwrap();
+            let ok = s8_catch_verify(what, || {
+                verify_committed_shard_dag_bound_bytes(
+                    &b, &f.ops, 1, &f.whir, &PublicStatement::Generic, &f.model, &f.execution)
+            });
+            assert!(!ok, "{what} must be rejected");
+        };
+        let mut p = decode();
+        if let Some(ReverseStep { reduction: ReverseReduction::LookupGroups { groups }, .. }) =
+            p.reverse.steps.last_mut()
+        {
+            groups[0].identity.final_evals.pop();
+        }
+        check("truncated group identity evals", &p);
+        let mut p = decode();
+        if let Some(ReverseStep { reduction: ReverseReduction::LookupGroups { groups }, .. }) =
+            p.reverse.steps.last_mut()
+        {
+            groups[0].members.clear();
+        }
+        check("empty group member list", &p);
+        let mut p = decode();
+        if let Some(ReverseStep { reduction: ReverseReduction::LookupGroups { groups }, .. }) =
+            p.reverse.steps.last_mut()
+        {
+            groups[0].members.push(usize::MAX);
+        }
+        check("out-of-range group member", &p);
+        let mut p = decode();
+        if let Some(ReverseStep { reduction: ReverseReduction::LookupGroups { groups }, .. }) =
+            p.reverse.steps.last_mut()
+        {
+            groups[0].table.layers.clear();
+        }
+        check("empty group table fraction tree", &p);
+        let mut p = decode();
+        if let Some(ReverseStep { reduction: ReverseReduction::LookupGroups { groups }, .. }) =
+            p.reverse.steps.last_mut()
+        {
+            groups[0].table_id = groups[0].table_id.wrapping_add(1);
+        }
+        check("wrong group table id", &p);
+        let mut p = decode();
+        if let Some(ReverseStep { reduction: ReverseReduction::LookupGroups { groups }, .. }) =
+            p.reverse.steps.last_mut()
+        {
+            let dup: LookupGroupProof =
+                bincode::deserialize(&bincode::serialize(&groups[0]).unwrap()).unwrap();
+            groups.push(dup);
+        }
+        check("duplicate group proof", &p);
     }
 }

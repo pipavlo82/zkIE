@@ -259,6 +259,68 @@ pub type ProverData = <MyPcs as MultilinearPcs<EF, MyChallenger>>::ProverData;
 pub type Proof = <MyPcs as MultilinearPcs<EF, MyChallenger>>::Proof;
 pub use p3_sumcheck::OpeningProtocol;
 
+/// Maximum multilinear-variable count accepted by [`Whir::try_with_params`].
+/// The honest bound proofs in this workspace top out at 29 variables (a
+/// 25-column 2^24 range-aux batch); 30 leaves one bit of headroom while
+/// bounding the FFT/DFT buffers a caller can request.
+pub const MAX_WHIR_NUM_VARIABLES: usize = 30;
+pub const MAX_WHIR_SECURITY: usize = 256;
+pub const MAX_WHIR_POW_BITS: usize = 128;
+
+/// Strict bounds for a directly deserialized [`Whir`] object. Proof formats
+/// that carry verifier parameters use [`WhirParams`] (plain integers) and
+/// construct the PCS only after the verifier has checked them; a serialized
+/// `Whir` is therefore never a proof-carried security policy.
+pub const MAX_WIRE_WHIR_NUM_VARIABLES: usize = 24;
+pub const MIN_WIRE_WHIR_SECURITY: usize = 90;
+
+/// Proof/wire-side WHIR parameters. This is the type stored in proof
+/// structures: deserializing it performs no cryptographic work (no FFT/DFT
+/// allocation, no parameter-derived tables). The verifier must call
+/// [`WhirParams::try_whir`] with its own minimum security level before using
+/// the parameters. Serialized bytes are identical to the old `Whir` tuple
+/// encoding (three fixed-int `usize` fields), so legacy byte formats are
+/// preserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WhirParams {
+    pub num_variables: usize,
+    pub security_level: usize,
+    pub pow_bits: usize,
+}
+
+impl WhirParams {
+    pub fn new(num_variables: usize, security_level: usize, pow_bits: usize) -> Self {
+        WhirParams { num_variables, security_level, pow_bits }
+    }
+
+    pub fn from_whir(whir: &Whir) -> Self {
+        WhirParams {
+            num_variables: whir.num_variables,
+            security_level: whir.security_level,
+            pow_bits: whir.pow_bits,
+        }
+    }
+
+    /// Verifier-side policy gate: the security level must meet the caller's
+    /// minimum, the variable count and PoW bits must be bounded, and the PoW
+    /// budget must be at least the value the PCS requires for this size at
+    /// the caller's minimum security. Only then is a `Whir` constructed.
+    pub fn try_whir(&self, min_security: usize) -> Option<Whir> {
+        if self.num_variables > MAX_WHIR_NUM_VARIABLES
+            || self.security_level < min_security
+            || self.security_level > MAX_WHIR_SECURITY
+            || self.pow_bits > MAX_WHIR_POW_BITS
+        {
+            return None;
+        }
+        let required = Whir::required_pow_bits(self.num_variables, min_security);
+        if self.pow_bits < required {
+            return None;
+        }
+        Whir::try_with_params(self.num_variables, self.security_level, self.pow_bits)
+    }
+}
+
 /// A WHIR PCS over Goldilocks configured for a single `2^num_variables` MLE.
 pub struct Whir {
     pcs: MyPcs,
@@ -294,10 +356,26 @@ impl Whir {
     }
 
     pub fn with_params(num_variables: usize, security_level: usize, pow_bits: usize) -> Self {
+        Self::try_with_params(num_variables, security_level, pow_bits)
+            .expect("valid Whir parameters")
+    }
+
+    /// Fallible constructor: rejects out-of-range parameters before doing any
+    /// FFT/DFT allocation or parameter-table construction. Verifier paths that
+    /// handle untrusted dimensions must use this (or [`WhirParams::try_whir`])
+    /// rather than [`Whir::with_params`].
+    pub fn try_with_params(num_variables: usize, security_level: usize, pow_bits: usize) -> Option<Self> {
+        if num_variables > MAX_WHIR_NUM_VARIABLES
+            || security_level == 0
+            || security_level > MAX_WHIR_SECURITY
+            || pow_bits > MAX_WHIR_POW_BITS
+        {
+            return None;
+        }
         let folding_factor = FoldingFactor::Constant(5);
         let (num_rounds, _) = folding_factor
             .compute_number_of_rounds(num_variables)
-            .expect("valid folding schedule");
+            .ok()?;
         let mut round_log_inv_rates = Vec::with_capacity(num_rounds);
         let mut rate = 1;
         for round in 0..num_rounds {
@@ -332,20 +410,22 @@ impl Whir {
                 MyMmcs::Cpu(CpuMmcs::new(hash, compress, 0))
             }
         };
-        let config = WhirConfig::<EF, F, MyChallenger>::new(num_variables, params).unwrap();
+        let config = WhirConfig::<EF, F, MyChallenger>::new(num_variables, params).ok()?;
+        let fft_bits = config.max_fft_size();
+        if fft_bits >= usize::BITS as usize { return None; }
         #[cfg(not(feature = "cuda"))]
-        let dft = MyDft::new(1 << config.max_fft_size());
+        let dft = MyDft::new(1usize << fft_bits);
         #[cfg(feature = "cuda")]
         let dft = {
             if backend::use_cuda_dft() {
                 MyDft::Cuda(crate::pcs::dft_cuda::CudaDft::new())
             } else {
-                MyDft::Cpu(CpuDft::new(1 << config.max_fft_size()))
+                MyDft::Cpu(CpuDft::new(1usize << fft_bits))
             }
         };
         let pcs = MyPcs::new(config, dft, mmcs);
 
-        Whir {
+        Some(Whir {
             pcs,
             perm,
             folding_factor,
@@ -355,7 +435,7 @@ impl Whir {
             commit_stats: std::cell::Cell::new((0, 0.0)),
             open_stats: std::cell::Cell::new((0, 0.0)),
             verify_stats: std::cell::Cell::new((0, 0.0)),
-        }
+        })
     }
 
     /// Number of `commit` calls and total wall-clock seconds spent inside them.
@@ -410,10 +490,21 @@ impl Whir {
     /// the group's `pow_bits`, so a large tensor (e.g. a 2^28 lm_head) gets a
     /// higher PoW budget while small groups stay cheap.
     pub fn required_pow_bits(num_variables: usize, security_level: usize) -> usize {
+        // Out-of-policy requests are reported as "more PoW than any accepted
+        // parameter set", so callers fail closed instead of panicking on
+        // untrusted dimensions.
+        let out_of_policy = MAX_WHIR_POW_BITS.saturating_add(1);
+        if num_variables > MAX_WHIR_NUM_VARIABLES
+            || security_level == 0
+            || security_level > MAX_WHIR_SECURITY
+        {
+            return out_of_policy;
+        }
         let folding_factor = FoldingFactor::Constant(5);
-        let (num_rounds, _) = folding_factor
-            .compute_number_of_rounds(num_variables)
-            .expect("valid folding schedule");
+        let (num_rounds, _) = match folding_factor.compute_number_of_rounds(num_variables) {
+            Ok(v) => v,
+            Err(_) => return out_of_policy,
+        };
         let mut round_log_inv_rates = Vec::with_capacity(num_rounds);
         let mut rate = 1;
         for round in 0..num_rounds {
@@ -431,7 +522,7 @@ impl Whir {
         match WhirConfig::<EF, F, MyChallenger>::new(num_variables, params) {
             Ok(config) => config.max_pow_bits(),
             Err(WhirConfigError::PowBitsExceedBudget { required, .. }) => required,
-            Err(e) => panic!("unexpected WhirConfig error: {e:?}"),
+            Err(_) => out_of_policy,
         }
     }
 
@@ -930,6 +1021,62 @@ mod tests {
         assert_eq!(opened, verified);
         assert_eq!(verified.len(), num_tables);
     }
+
+    /// S8: the wire-parameter type uses exactly the old `Whir` tuple encoding,
+    /// so moving proof-carried parameters to `WhirParams` preserves bytes for
+    /// every existing proof format.
+    #[test]
+    fn whir_params_wire_encoding_matches_whir() {
+        for (nv, sec, pow) in [(5usize, 90usize, 17usize), (8, 90, 32)] {
+            let whir = Whir::with_params(nv, sec, pow);
+            let params = WhirParams::from_whir(&whir);
+            assert_eq!(
+                bincode::serialize(&whir).unwrap(),
+                bincode::serialize(&params).unwrap(),
+                "Whir and WhirParams must share the wire encoding"
+            );
+            let bytes = bincode::serialize(&params).unwrap();
+            let restored = Whir::try_with_params(
+                params.num_variables, params.security_level, params.pow_bits
+            ).unwrap();
+            assert_eq!(restored.security_level(), sec);
+            assert_eq!(restored.pow_bits(), pow);
+            assert_eq!(restored.num_variables(), nv);
+            assert_eq!(bytes, bincode::serialize(&WhirParams::from_whir(&restored)).unwrap());
+        }
+    }
+
+    /// S8: deserializing an attacker-chosen WHIR configuration is fallible and
+    /// rejects out-of-policy parameters without panicking or allocating.
+    #[test]
+    fn whir_deserialize_rejects_out_of_policy_params() {
+        let bad = [
+            (usize::MAX, 90usize, 17usize),
+            (5, 32, 10),       // below the 90-bit wire policy
+            (5, 90, 100_000),  // PoW outside the allowed range
+            (5, 0, 0),         // zero security
+            (25, 90, 17),      // above the wire variable cap
+            (30, 90, 17),      // above the wire variable cap
+        ];
+        for (nv, sec, pow) in bad {
+            let bytes = bincode::serialize(&(nv, sec, pow)).unwrap();
+            assert!(bincode::deserialize::<Whir>(&bytes).is_err(),
+                "params ({nv},{sec},{pow}) must be rejected");
+        }
+        let good = bincode::serialize(&(8usize, 90usize, 32usize)).unwrap();
+        assert!(bincode::deserialize::<Whir>(&good).is_ok());
+    }
+
+    /// S8: policy bounds apply before any parameter-derived allocation.
+    #[test]
+    fn whir_try_with_params_rejects_oversized_dimensions() {
+        assert!(Whir::try_with_params(MAX_WHIR_NUM_VARIABLES + 1, 90, 17).is_none());
+        assert_eq!(
+            Whir::required_pow_bits(MAX_WHIR_NUM_VARIABLES + 1, 90),
+            MAX_WHIR_POW_BITS + 1
+        );
+        assert!(Whir::required_pow_bits(5, 90) <= MAX_WHIR_POW_BITS);
+    }
 }
 
 
@@ -945,10 +1092,26 @@ impl serde::Serialize for Whir {
 }
 
 impl<'de> serde::Deserialize<'de> for Whir {
+    /// S8: a serialized `Whir` is treated as untrusted input. It must satisfy
+    /// the strict wire policy (bounded variable count, at least 90-bit
+    /// security, bounded PoW) and is constructed fallibly — no panic and no
+    /// parameter-derived allocation on invalid data. Active proof formats use
+    /// [`WhirParams`] and run their own verifier policy gate before
+    /// construction, so this restriction does not affect honest proofs.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let (num_variables, security_level, pow_bits) =
             <(usize, usize, usize)>::deserialize(deserializer)?;
-        Ok(Whir::with_params(num_variables, security_level, pow_bits))
+        if num_variables > MAX_WIRE_WHIR_NUM_VARIABLES
+            || security_level < MIN_WIRE_WHIR_SECURITY
+            || security_level > MAX_WHIR_SECURITY
+            || pow_bits > MAX_WHIR_POW_BITS
+        {
+            return Err(serde::de::Error::custom(
+                "Whir parameters outside the verifier wire policy",
+            ));
+        }
+        Whir::try_with_params(num_variables, security_level, pow_bits)
+            .ok_or_else(|| serde::de::Error::custom("invalid Whir parameters"))
     }
 }
 
