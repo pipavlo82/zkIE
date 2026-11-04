@@ -446,6 +446,59 @@ zkie-core --release` 88 passed / 1 ignored, plus the `same_poly` suite
 90→96, all proof bytes change; the new baseline and EF cost measurements
 are step 2d.
 
+## 9g. Step 2d status — real A/B/D/C measurement (partial; blocked on the
+96-bit large-opening PoW cost)
+
+Harness fix: the obsolete O2 route-A measurement hook in
+`models/deepseek-v2-lite/examples/prove_core_chain.rs` consumed weight-opening
+points/claimed values as base-field Goldilocks. Those fields are EF after
+2b-2b; the one-time measurement was removed (converting would have
+materialized an EF copy of the real table). All deepseek examples compile.
+
+Measured on the S7 full64 real harness (DeepSeek-V2-Lite layer 10, seq=1,
+64 experts; same 495 GB / 64-core machine). "Before" is the recorded S7
+baseline (`docs/s7-full-continuation.md`: base-field outer challenges,
+WHIR 90). "After" is this branch (EF outer challenges, WHIR 96).
+
+| phase | before bytes | after bytes | before prove | after prove | before verify | after verify |
+|---|---|---|---|---|---|---|
+| A | 241,874 | **290,618** (+20.1%) | 0.15–0.18 s | 0.133 s | not separately timed | not separately timed |
+| B | 540,239 | **527,948** (−2.3%) | 241.4 s | **7,195.5 s** (open 7,180.3 s) | 159 ms | 160.3 ms |
+| D | 1,779,403 | **not completed** | 487.7 s | would be ~4 h (two 2^28 openings) | 339 ms | not measured |
+| C | 355,183 | **not reached** | 204 ms | not measured | 15.5 ms | not measured |
+
+B peak RSS grew 16.0 GB → 26.5 GB (EF copies of the folded weights).
+
+**Cost finding (corrects the earlier commit-only PoW expectation).** B's
+weight cache commit wrote 6.4 GB in under 3 s; restore took 3.26 s; the
+7,180 s is the WHIR **opening** grind (`O5-phases ... open_ms=7180274.6`).
+Caching prover data does not amortize this PoW: every proof that opens a
+2^28-slot committed table at 96-bit pays ~2 h wall on this machine. D opens
+two such batches (up/down), so a full D proof is ~4 h, and a double-run of
+A/B/D/C is ~12 h plus aux work. Aux openings at small arity are cheap; A's
+prove time is unchanged. The 96-bit increment therefore lands almost
+entirely on large-weight openings (`required_pow_bits` at 2^28 grows from
+26 to 32, and the grind dominates wall time).
+
+**Abort record.** Cumulative process CPU time reached 627,304 s =
+174.25 CPU-hours (> the 168 CPU-hour = 2× expected threshold set by the TL)
+while D's first 2^28 opening was still grinding; the process was terminated
+per instruction. A and B completed and verified; B's A/B negatives were all
+rejected before the abort. Determinism (two-run byte comparison) and D/C
+prove/verify/bytes could not be completed.
+
+**End-to-end budget is unaffected by this performance result.** For accepted
+proofs: outer error ≤ W/2^128 ≤ 2^26/2^128 = 2^-102 (EF challenges, degree-3
+conservative charging, verifier-enforced W cap); PCS error ≤ K·2^-96 ≤ 2^-90
+for the provisioned K ≤ 64 (verifier rejects larger K); Fiat–Shamir/hash
+terms remain assumed as before. The blocker is proving cost, not soundness.
+
+Decision needed before S9 final acceptance: accept ~6 h per full64 prove and
+~12 h per determinism pair, or split large weight batches into smaller arity
+groups to reduce per-opening PoW (more openings K, lower pow each), or
+re-provision with an explicitly re-derived lower per-opening target. S9 is
+not accepted; 2d is incomplete.
+
 ## 10. Acceptance status
 
 Step 1 delivers only this inventory and budget. The S9 acceptance items

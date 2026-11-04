@@ -746,23 +746,11 @@ fn main() {
     println!("B commit+prove {:?} verify {:?} bytes {} peak_rss={}kB",
         b_prove_t, b_verify_t, bytes_b.len(), peak_rss_kb());
 
-    // O2 route A measurement (isolated, env-gated; main path unaffected):
-    // merge the real weight-opening claims with S4 same_poly and time it.
-    // Full64 has 64 claims on 2^28; prove_same_poly materializes one full eq
-    // vector per claim (64 x 2^28 x 8 B = 128 GiB), so this is measured on the
-    // 8-expert real table only; the full64 scaling is recorded in docs.
-    if std::env::var("ZKIE_O2_ROUTE_A_MEASURE").ok().as_deref() == Some("1") {
-        let wo = &proof_b.weight_openings()[0];
-        let claims: Vec<(Vec<Goldilocks>, Goldilocks)> =
-            wo.points.iter().cloned().zip(wo.claimed.iter().copied()).collect();
-        let table = sb.get(w);
-        let mut ts = zkie_core::common::transcript::Transcript::new(b"zkie-o2-route-a-measure");
-        let t_a = Instant::now();
-        let (merge, merged) = zkie_core::common::same_poly::prove_same_poly(table, &claims, &mut ts);
-        println!("O2-routeA-merge claims={} table_len={} merged_point_len={} ms={} rss_kb={} merged={}",
-            claims.len(), table.len(), merge.merged_point.len(),
-            t_a.elapsed().as_millis(), peak_rss_kb(), to_i64(merged));
-    }
+    // S9 2d: the former O2 route-A measurement hook consumed the weight
+    // opening's points/claimed values as base-field Goldilocks. Those fields
+    // are EF after the 2b-2b migration, and the one-time measurement is
+    // obsolete; the O2 results are recorded in docs. Removed instead of
+    // converting, which would have materialized an EF copy of the real table.
 
     // ---------------- real-data malicious regressions (bytes entry) ----------------
     let mut bad_a = execution_a.clone();
