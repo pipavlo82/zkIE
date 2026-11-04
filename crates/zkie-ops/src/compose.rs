@@ -4105,8 +4105,10 @@ fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs
 fn prove_reverse_projection(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
     aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseProjectionProof, Vec<EvalClaim>)>
 {
-    let (x, w, bias, m, k, n, shift) = match op {
-        Op::Projection { x, w, bias, m, k, n, shift, .. } => (*x, *w, *bias, *m, *k, *n, *shift),
+    let (x, w, bias, out, m, k, n, shift) = match op {
+        Op::Projection { x, w, bias, out, m, k, n, shift, .. } => {
+            (*x, *w, *bias, *out, *m, *k, *n, *shift)
+        }
         _ => return None,
     };
     if !m.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two() { return None; }
@@ -4119,9 +4121,25 @@ fn prove_reverse_projection(store: &Store, op: &Op, point: &[Goldilocks], value:
     let bias_eval = mle::eval(store.get(bias), point);
     transcript.absorb_field(bias_eval);
     transcript.absorb_fields(&bit_evals);
-    let h = crate::par::mm_par_fixed(store.get(x), store.materialize(w).as_ref(), m, k, n);
+    // O6: reuse the forward `x @ w` product when the bound prover cached it
+    // (bounded by the store's byte budget); otherwise recompute (controlled
+    // fallback). The weight is materialized once and shared by both uses.
+    let wv = store.materialize(w);
+    let h_owned = if store.projection_h.contains_key(&out) {
+        None
+    } else {
+        store.o6_proof_mm.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(crate::par::mm_par_fixed(store.get(x), wv.as_ref(), m, k, n))
+    };
+    let h: &[Goldilocks] = match h_owned.as_deref() {
+        Some(v) => v,
+        None => {
+            store.o6_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            store.projection_h.get(&out)?.as_slice()
+        }
+    };
     let at = transpose(store.get(x), m, k);
-    let (matmul, ch) = matmul_prove(&at, store.materialize(w).as_ref(), &h, m, k, n, u, v, transcript);
+    let (matmul, ch) = matmul_prove(&at, wv.as_ref(), h, m, k, n, u, v, transcript);
     let half = Goldilocks::from_u64(1u64 << (shift - 1));
     let scale = Goldilocks::from_u64(1u64 << shift);
     if matmul.claimed - remainder + half != scale * (value - bias_eval) { return None; }
@@ -5350,11 +5368,51 @@ pub enum TensorData {
 pub struct Store {
     pub v: Vec<TensorData>,
     pub idx: Vec<Vec<u32>>,
+    /// O6: bounded cache of the forward Projection product `h = x @ w`,
+    /// keyed by the Projection output tensor id. The reverse proof reuses it
+    /// instead of recomputing the matmul; the byte budget bounds retention.
+    pub(crate) projection_h: std::collections::BTreeMap<T, Vec<Goldilocks>>,
+    pub(crate) projection_h_bytes: usize,
+    pub(crate) projection_cache_enabled: bool,
+    pub(crate) projection_cache_budget: usize,
+    // O6 per-store measurement counters: forward matmul calls, reverse-proof
+    // recomputes, cache hits. Interior mutability so the &Store proof path can
+    // increment them; no proof/transcript effect.
+    pub(crate) o6_fwd_mm: std::sync::atomic::AtomicU64,
+    pub(crate) o6_proof_mm: std::sync::atomic::AtomicU64,
+    pub(crate) o6_hits: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
     pub fn new() -> Self {
         Store::default()
+    }
+    /// O6: enable the bounded Projection `h = x @ w` cache for a bound
+    /// prover. A zero budget disables it (baseline / memory-constrained).
+    pub fn enable_projection_cache(&mut self, budget_bytes: usize) {
+        self.projection_cache_enabled = budget_bytes > 0;
+        self.projection_cache_budget = budget_bytes;
+    }
+    /// O6 cache stats: `(cached tensors, cached bytes)`.
+    pub fn projection_cache_stats(&self) -> (usize, usize) {
+        (self.projection_h.len(), self.projection_h_bytes)
+    }
+    /// O6 metrics: `(forward Projection matmul calls, reverse-proof recomputes,
+    /// cache hits)` for this store.
+    pub fn o6_metrics(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.o6_fwd_mm.load(Ordering::Relaxed),
+            self.o6_proof_mm.load(Ordering::Relaxed),
+            self.o6_hits.load(Ordering::Relaxed),
+        )
+    }
+    /// Reset this store's O6 counters (measurement tooling).
+    pub fn o6_metrics_reset(&self) {
+        use std::sync::atomic::Ordering;
+        self.o6_fwd_mm.store(0, Ordering::Relaxed);
+        self.o6_proof_mm.store(0, Ordering::Relaxed);
+        self.o6_hits.store(0, Ordering::Relaxed);
     }
     pub fn push(&mut self, t: Vec<Goldilocks>) -> T {
         let id = self.v.len();
@@ -6273,6 +6331,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
             } => {
                 let wv = store.materialize(w);
                 let h = crate::par::mm_par_fixed(store.get(x), wv.as_ref(), m, k, n);
+                store.o6_fwd_mm.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let o: Vec<Goldilocks> = (0..m * n)
                     .map(|ij| {
                         from_i64(
@@ -6291,6 +6350,15 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .collect();
                 store.v[out] = TensorData::Owned(o);
                 store.v[rem] = TensorData::Owned(r);
+                // O6: retain the forward matmul product (bounded) so the
+                // reverse Projection proof does not recompute x@w.
+                if store.projection_cache_enabled && !store.projection_h.contains_key(&out) {
+                    let bytes = h.len() * std::mem::size_of::<Goldilocks>();
+                    if bytes <= store.projection_cache_budget.saturating_sub(store.projection_h_bytes) {
+                        store.projection_h_bytes += bytes;
+                        store.projection_h.insert(out, h);
+                    }
+                }
             }
             Op::Add { a, b, c } => {
                 let s: Vec<Goldilocks> = store
@@ -11140,6 +11208,14 @@ pub fn prove_committed_shard_dag_bound(
             if idx.len() != expected.len() || idx.iter().zip(expected).any(|(&a, &b)| Goldilocks::from_u64(a as u64) != b) { return None; }
         }
     }
+    // O6: enable the bounded Projection forward-product cache for this
+    // proof. ZKIE_O6_CACHE_MB=0 disables it (baseline measurement or memory
+    // pressure); the byte budget bounds retention for Projection-heavy graphs.
+    let cache_mb = std::env::var("ZKIE_O6_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256);
+    store.enable_projection_cache(cache_mb.saturating_mul(1024 * 1024));
     forward_ops(store, ops);
     for (&id, expected) in &execution.outputs {
         if usize::BITS != 64 { return None; }
@@ -13056,6 +13132,7 @@ mod tests {
         let mut bad = Store {
             v: store.v.clone(),
             idx: store.idx.clone(),
+            ..Store::default()
         };
         bad.get_mut(fc_w)[0] = bad.get_mut(fc_w)[0] + Goldilocks::ONE;
         // tamper test removed: plain path is store-free; soundness is in the committed path
@@ -13095,6 +13172,7 @@ mod tests {
         let mut bad = Store {
             v: store.v.clone(),
             idx: store.idx.clone(),
+            ..Store::default()
         };
         bad.idx[idx][0] ^= 1;
         // tamper test removed: plain path is store-free; soundness is in the committed path
@@ -13143,6 +13221,7 @@ mod tests {
         let mut bad = Store {
             v: store.v.clone(),
             idx: store.idx.clone(),
+            ..Store::default()
         };
         bad.get_mut(x)[0] = bad.get_mut(x)[0] + Goldilocks::ONE;
         // tamper test removed: plain path is store-free; soundness is in the committed path
@@ -13241,6 +13320,7 @@ mod tests {
         let mut bad = Store {
             v: store.v.clone(),
             idx: store.idx.clone(),
+            ..Store::default()
         };
         bad.get_mut(weights[1])[0] = bad.get_mut(weights[1])[0] + Goldilocks::ONE;
         // tamper test removed: plain path is store-free
@@ -14018,6 +14098,40 @@ mod tests {
         let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// O6: the bound prover forwards once (one Projection matmul) and the
+    /// reverse Projection proof reuses the cached product instead of
+    /// recomputing x@w (one hit, zero proof-side recomputes).
+    #[test]
+    fn o6_projection_h_cache_reuses_forward_product() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)]);
+        let w = store.push(vec![from_i64(1), from_i64(0), from_i64(0), from_i64(1)]);
+        let bias = store.push(vec![Goldilocks::ZERO; 4]);
+        let out = store.push(vec![]);
+        let rem = store.push(vec![]);
+        let ops = vec![Op::Projection { x, w, bias, out, rem, m: 2, k: 2, n: 2, shift: 3 }];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let path = std::env::temp_dir().join("zkie-o6-projection-cache");
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
+        forward_ops(&mut store, &ops);
+        let expected = store.get(out).to_vec();
+        store.o6_metrics_reset();
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec())].into(),
+            outputs: [(out, expected)].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0,
+            &PublicStatement::Generic, &model, &execution)
+            .expect("O6 projection proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+        let (fwd, recompute, hits) = store.o6_metrics();
+        assert_eq!((fwd, recompute, hits), (1, 0, 1),
+            "forward must compute h once and the proof must reuse it");
+        assert_eq!(store.projection_cache_stats().0, 1, "one cached h");
     }
 
     #[test]
@@ -19028,6 +19142,7 @@ mod tests {
         let mut bad = Store {
             v: store.v.clone(),
             idx: store.idx.clone(),
+            ..Store::default()
         };
         bad.get_mut(a)[0] = bad.get_mut(a)[0] + Goldilocks::ONE;
         // tamper test removed: plain path is store-free; soundness is in the committed path
@@ -19585,6 +19700,7 @@ mod tests {
         let mut bad = Store {
             v: store.v.clone(),
             idx: store.idx.clone(),
+            ..Store::default()
         };
         bad.get_mut(q_t)[0] = bad.get_mut(q_t)[0] + Goldilocks::ONE;
         // tamper test removed: plain path is store-free; soundness is in the committed path
@@ -19720,6 +19836,7 @@ mod tests {
         let mut bad = Store {
             v: store.v.clone(),
             idx: store.idx.clone(),
+            ..Store::default()
         };
         bad.get_mut(ws[0])[0] = bad.get_mut(ws[0])[0] + Goldilocks::ONE;
         // tamper test removed: plain path is store-free; soundness is in the committed path
@@ -19905,6 +20022,7 @@ mod tests {
         let mut bad = Store {
             v: store.v.clone(),
             idx: store.idx.clone(),
+            ..Store::default()
         };
         bad.get_mut(x)[0] = bad.get_mut(x)[0] + Goldilocks::ONE;
         // tamper test removed: plain path is store-free; soundness is in the committed path
@@ -20030,6 +20148,7 @@ mod tests {
         let mut bad = Store {
             v: store.v.clone(),
             idx: store.idx.clone(),
+            ..Store::default()
         };
         bad.get_mut(ln_w)[0] = bad.get_mut(ln_w)[0] + Goldilocks::ONE;
         // tamper test removed: plain path is store-free; soundness is in the committed path
@@ -20084,6 +20203,7 @@ mod tests {
         let mut bad = Store {
             v: store.v.clone(),
             idx: store.idx.clone(),
+            ..Store::default()
         };
         bad.get_mut(x)[0] = bad.get_mut(x)[0] + Goldilocks::ONE;
         // tamper test removed: plain path is store-free; soundness is in the committed path
@@ -20146,6 +20266,7 @@ mod tests {
             let mut c = Store {
                 v: Vec::with_capacity(s.v.len()),
                 idx: s.idx.clone(),
+                ..Store::default()
             };
             for t in 0..s.v.len() {
                 c.v.push(TensorData::Owned(s.get(t).to_vec()));
@@ -20183,6 +20304,7 @@ mod tests {
         let mut part = Store {
             v: Vec::new(),
             idx: base.idx.clone(),
+            ..Store::default()
         };
         for t in 0..base.v.len() {
             part.v.push(TensorData::Owned(base.get(t).to_vec()));
@@ -20235,6 +20357,7 @@ mod tests {
             let mut c = Store {
                 v: Vec::with_capacity(s.v.len()),
                 idx: s.idx.clone(),
+                ..Store::default()
             };
             for t in 0..s.v.len() {
                 c.v.push(TensorData::Owned(s.get(t).to_vec()));
@@ -20267,6 +20390,7 @@ mod tests {
             let mut c = Store {
                 v: Vec::with_capacity(s.v.len()),
                 idx: s.idx.clone(),
+                ..Store::default()
             };
             for t in 0..s.v.len() {
                 c.v.push(TensorData::Owned(s.get(t).to_vec()));
@@ -20419,6 +20543,7 @@ mod tests {
             let mut c = Store {
                 v: Vec::with_capacity(s.v.len()),
                 idx: s.idx.clone(),
+                ..Store::default()
             };
             for t in 0..s.v.len() {
                 c.v.push(TensorData::Owned(s.get(t).to_vec()));
