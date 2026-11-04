@@ -217,6 +217,7 @@ fn prepare_static_lookup_commits(
             return None;
         }
         store.o7_table_commits.fetch_add(1, Ordering::Relaxed);
+        store.o7_table_scan_bytes.fetch_add((values.len() * std::mem::size_of::<Goldilocks>()) as u64, Ordering::Relaxed);
         store.static_table_commits.insert(tid, (values, committed));
     }
     Some(())
@@ -4297,12 +4298,17 @@ fn prove_lookup_groups(
         }
         transcript.absorb(b"zkie-lookup-group-table-v1");
         let m_agg: Vec<u64> = m_aux.columns[0].iter().map(|&v| to_i64(v) as u64).collect();
+        let table_bytes = (table_values.len() * std::mem::size_of::<Goldilocks>()) as u64;
+        store.o7_table_side_trees.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
         let table_proof = prove_lookup_table(&m_agg, table_values, alpha, beta, transcript);
         let (t_num_point, t_num, t_den_point, t_den) = fractional_leaf(&table_proof);
         if t_num != mle::eval(&m_aux.columns[0], &t_num_point) { return None; }
         let table_eval = mle::eval(table_values, &t_den_point);
+        store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
         if t_den != alpha + lookup_index_eval(&t_den_point) + beta * table_eval { return None; }
         let (table_num_tree, table_den_tree) = build_lookup_table_num_den(&m_agg, table_values, alpha, beta);
+        store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
         let (table_final_num, table_final_den) = fraction_root(table_num_tree, table_den_tree)?;
         if table_final_den == Goldilocks::ZERO { return None; }
         let aggregate_opening = open_aux(m_aux, &[0, 0],
@@ -4321,10 +4327,12 @@ fn prove_lookup_groups(
                 if bincode::serialize(&committed.commitment).ok()?
                     != bincode::serialize(model.lookup_roots.get(&tid)?).ok()? { return None; }
                 store.o7_table_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
                 whir.open(committed.prover_data, &committed.protocol, &t_den_point)
             }
         };
         if opened != table_eval { return None; }
+        store.o7_table_openings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         proofs.push(LookupGroupProof {
             table_id: tid,
             members: members.clone(),
@@ -4536,10 +4544,14 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
     let table_values: &[Goldilocks] = cached_values
         .unwrap_or_else(|| table_values_owned.as_deref().unwrap());
     let m: Vec<u64> = multiplicity.columns[0].iter().map(|&v| to_i64(v) as u64).collect();
+    let table_bytes = (table_values.len() * std::mem::size_of::<Goldilocks>()) as u64;
+    store.o7_table_side_trees.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
     let table = prove_lookup_table(&m, &table_values, alpha, beta, transcript);
     let (t_num_point, t_num, t_den_point, t_den) = fractional_leaf(&table);
     let mult_eval = mle::eval(&multiplicity.columns[0], &t_num_point);
     let table_eval = mle::eval(&table_values, &t_den_point);
+    store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
     if t_num != mult_eval
         || t_den != alpha + lookup_index_eval(&t_den_point) + beta * table_eval { return None; }
     transcript.absorb_fields(&[witness_index, witness_value, mult_eval, table_eval]);
@@ -4575,6 +4587,7 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
         // Fallback (ZKIE_O7_TABLE_CACHE=0 or uncached table): commit once for
         // this lookup and count it for the before/after measurement.
         store.o7_table_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
         let arity = table_values.len().trailing_zeros() as usize;
         let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
         let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
@@ -4584,6 +4597,9 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Gol
         if opened != table_eval { return None; }
         Some(opening)
     };
+    if table_opening.is_some() {
+        store.o7_table_openings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut claims = vec![EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index }];
     if dynamic_table {
         claims.push(EvalClaim { tensor_id: TensorKey::Field(table_id).encoded()?, point: t_den_point, value: table_eval });
@@ -6063,6 +6079,12 @@ pub struct Store {
     pub(crate) static_table_commits:
         std::collections::BTreeMap<T, (Vec<Goldilocks>, zkie_core::pcs::committed::Committed)>,
     pub(crate) o7_table_commits: std::sync::atomic::AtomicU64,
+    // O7 deep measurement counters (step (d)): table-side fraction trees,
+    // table openings, and padded-table scan bytes traversed by table-side
+    // construction (commit scan, fraction-tree build, leaf/root evaluation).
+    pub(crate) o7_table_side_trees: std::sync::atomic::AtomicU64,
+    pub(crate) o7_table_openings: std::sync::atomic::AtomicU64,
+    pub(crate) o7_table_scan_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -6100,10 +6122,26 @@ impl Store {
     pub fn o7_table_commits(&self) -> u64 {
         self.o7_table_commits.load(std::sync::atomic::Ordering::Relaxed)
     }
-    /// Reset this store's O7 counter (measurement tooling).
+    /// O7 deep metrics: `(table-side fraction trees, table openings,
+    /// padded-table scan bytes)`. The scan-byte counter covers the padded
+    /// table bytes traversed by the per-proof table commit, the table-side
+    /// fraction-tree build and the leaf/root evaluations. Measurement only;
+    /// no proof/transcript effect.
+    pub fn o7_deep_metrics(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.o7_table_side_trees.load(Ordering::Relaxed),
+            self.o7_table_openings.load(Ordering::Relaxed),
+            self.o7_table_scan_bytes.load(Ordering::Relaxed),
+        )
+    }
+    /// Reset this store's O7 counters (measurement tooling).
     pub fn o7_metrics_reset(&self) {
-        self.o7_table_commits
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering;
+        self.o7_table_commits.store(0, Ordering::Relaxed);
+        self.o7_table_side_trees.store(0, Ordering::Relaxed);
+        self.o7_table_openings.store(0, Ordering::Relaxed);
+        self.o7_table_scan_bytes.store(0, Ordering::Relaxed);
     }
     pub fn push(&mut self, t: Vec<Goldilocks>) -> T {
         let id = self.v.len();

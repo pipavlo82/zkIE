@@ -219,6 +219,91 @@ singleton groups. Step (d) remains: synthetic ≥2 same-table example at real
 scale, full before/after table-tree/opening/proof-byte/scan-byte/time
 measurements, and the final record.
 
+## Step (d) — real-scale measurement and scaling
+
+State: `07591ba` + step (d) on `fix/soundness-repair`. This is the final
+measurement step; deep O7 acceptance remains with the TL.
+
+### Harness
+
+`crates/zkie-ops/examples/o7_deep.rs` builds N (2..=4) Lookups into one
+static synthetic silu-like table, `t[i] = round(2^16 * silu((i - len/2) /
+4096))`, at a real scale of 2^24 entries (128 MiB) with 2^18 witness rows
+per lookup. No real silu table file is checked into the workspace; the
+synthetic table is the equal-scale substitute. The same source and the same
+table/idx generation run against the 184bf82 baseline worktree (per-lookup
+table trees/openings) and the current deep (b)+(c) code.
+
+The baseline worktree carries instrumentation-only counters (table-side
+fraction trees, table openings, table scan bytes) in addition to its accepted
+code; the counters only touch atomics and cannot affect the transcript or
+proof. It lives at `/data/zkie-o7-baseline` (a `git worktree` at `184bf82`).
+The offline model root commit is outside the per-proof timing; the per-proof
+static-table Merkle tree rebuild is inside prove and is counted in `commits`
+and `scan_bytes`.
+
+Scan bytes are defined as the padded table bytes traversed by table-side
+construction: the per-proof commit scan, the table-side fraction-tree build,
+and the leaf/root evaluations. They are counted at the exact call sites on
+each version (baseline: per-op `prove_lookup_table` + `mle::eval`; deep:
+shared `prove_lookup_table` + `mle::eval` + the prover-side root build).
+
+### 2^24 table (primary)
+
+Table bytes = 134,217,728; idx rows per lookup = 2^18.
+
+| N | version | table trees | openings | scan bytes | proof bytes | prove ms | verify ms | HWM kB |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 184bf82 | 2 | 2 | 671,088,640 | 979,465 | 10,126.3 | 75.3 | 3,626,384 |
+| 2 | deep b+c | 1 | 1 | 536,870,912 | 935,169 | 9,465.9 | 73.8 | 4,432,404 |
+| 3 | 184bf82 | 3 | 3 | 939,524,096 | 1,420,473 | 14,968.2 | 111.3 | 4,329,584 |
+| 3 | deep b+c | 1 | 1 | 536,870,912 | 1,201,108 | 11,587.6 | 97.2 | 5,132,620 |
+| 4 | 184bf82 | 4 | 4 | 1,207,959,552 | 1,850,985 | 19,777.1 | 142.8 | 5,031,164 |
+| 4 | deep b+c | 1 | 1 | 536,870,912 | 1,462,119 | 13,678.5 | 121.8 | 5,834,960 |
+
+Deep vs baseline: proof bytes -4.5% / -15.4% / -21.0%; prove time
+-6.5% / -22.6% / -30.8%; verify time slightly lower; scan bytes -20% / -43%
+/ -56%; table trees and openings N -> 1. The marginal cost of one more
+lookup falls from ~4.8 s (baseline) to ~2.1 s (deep). Peak RSS is higher for
+deep by ~0.8 GB at this scale (the shared table/commit and prover-side root
+evaluation are retained), which is reported as a real trade-off, not hidden.
+
+### 2^20 table (scaling support)
+
+Table bytes = 8,388,608; idx rows per lookup = 2^16.
+
+| N | version | trees | openings | scan bytes | proof bytes | prove ms | verify ms | HWM kB |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 184bf82 | 2 | 2 | 41,943,040 | 810,685 | 809.4 | 33.5 | 238,216 |
+| 2 | deep b+c | 1 | 1 | 33,554,432 | 776,853 | 786.3 | 33.0 | 283,056 |
+| 3 | 184bf82 | 3 | 3 | 58,720,256 | 1,164,763 | 1,202.4 | 50.0 | 282,684 |
+| 3 | deep b+c | 1 | 1 | 33,554,432 | 999,803 | 970.0 | 44.1 | 335,060 |
+| 4 | 184bf82 | 4 | 4 | 75,497,472 | 1,526,585 | 1,532.3 | 66.4 | 336,620 |
+| 4 | deep b+c | 1 | 1 | 33,554,432 | 1,216,289 | 1,151.0 | 55.1 | 384,796 |
+
+The same trend holds at the smaller scale; deep's table-side counters are
+constant in N.
+
+### Byte determinism
+
+The deep N=4 2^24 harness was run twice with serialized proof dumps:
+1,462,119 bytes both times, `cmp` clean, SHA-256
+`4b0a0df079961b633a6db92a5f141bc9769055d1679ae288e1bfcdfc71fef69e` both,
+prove 13,656.5 / 13,745.6 ms, verify 122.2 / 122.9 ms. The deterministic PoW
+and 90-bit security are unchanged.
+
+### Regression
+
+- `zkie-ops --lib`: 164/0 (all four deep-O7 negatives and the existing
+  suites green).
+- Real A/B/C: A 241,874 / B 491,978 / C 355,183 — unchanged from (c).
+- Full64: B 540,239, `CORE-CHAIN-OK`, verify 157.9 ms.
+- Harness metrics and logs: `/data/zkie-soundness-fix/logs/o7d-ops.log`,
+  `o7d-real-seg.log`, `o7d-full64.log`; raw measurement lines are reproduced
+  in the tables above.
+
 ## Remaining
 
-Step (d) measurements + docs. S7 is not accepted; S8/S9 postponed.
+This closes the step (d) measurement deliverable. Deep O7 (a)/(b)/(c)/(d)
+is submitted for TL final acceptance; S7 remains unaccepted and S8/S9 are
+postponed. Project ② (GeluIndex big-table reduction) has not started.
