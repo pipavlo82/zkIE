@@ -17,7 +17,7 @@
 //! the existing base-field routines are untouched until the composers are
 //! migrated in the next sub-step.
 
-use crate::common::field::{BasedVectorSpace, Ef, Field, Goldilocks, PrimeCharacteristicRing};
+use crate::common::field::{Ef, Field, Goldilocks, PrimeCharacteristicRing};
 use crate::common::transcript::Transcript;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -108,10 +108,10 @@ fn fold(buf: &mut Vec<Ef>, p: Ef) {
     buf.truncate(half);
 }
 
-/// EF sum-check for `sum_x f(x)·h(x)`, with base-field tensors lifted to EF.
-pub fn prove_sumcheck(
-    f: &[Goldilocks],
-    h: &[Goldilocks],
+/// EF sum-check for `sum_x f(x)·h(x)` over EF-valued buffers.
+pub fn prove_sumcheck_ef(
+    f: &[Ef],
+    h: &[Ef],
     claimed_sum: Ef,
     transcript: &mut Transcript,
 ) -> (EfSumcheckProof, Vec<Ef>) {
@@ -119,8 +119,8 @@ pub fn prove_sumcheck(
     assert!(f.len().is_power_of_two(), "sumcheck length must be a power of two");
     let t = f.len().trailing_zeros() as usize;
     transcript.absorb_ef(claimed_sum);
-    let mut f_buf: Vec<Ef> = f.iter().map(|&x| efg(x)).collect();
-    let mut h_buf: Vec<Ef> = h.iter().map(|&x| efg(x)).collect();
+    let mut f_buf = f.to_vec();
+    let mut h_buf = h.to_vec();
     let mut rounds = Vec::with_capacity(t);
     let mut challenges = Vec::with_capacity(t);
     for _ in 0..t {
@@ -140,6 +140,18 @@ pub fn prove_sumcheck(
         },
         challenges,
     )
+}
+
+/// EF sum-check for base-field buffers (lifted to EF).
+pub fn prove_sumcheck(
+    f: &[Goldilocks],
+    h: &[Goldilocks],
+    claimed_sum: Ef,
+    transcript: &mut Transcript,
+) -> (EfSumcheckProof, Vec<Ef>) {
+    let f_ef: Vec<Ef> = f.iter().map(|&x| efg(x)).collect();
+    let h_ef: Vec<Ef> = h.iter().map(|&x| efg(x)).collect();
+    prove_sumcheck_ef(&f_ef, &h_ef, claimed_sum, transcript)
 }
 
 /// EF sum-check verification. Returns `(ok, challenges)`; `ok` includes the
@@ -210,7 +222,6 @@ pub fn prove_virtual(
     assert!(!mles.is_empty(), "virtual proof needs at least one MLE");
     let n = mles[0].len();
     assert!(n.is_power_of_two(), "virtual domain must be a power of two");
-    assert!(n >= 2, "virtual domain must have at least two entries");
     for m in mles {
         assert_eq!(m.len(), n, "virtual MLE lengths differ");
     }
@@ -338,6 +349,26 @@ pub fn eq_evals(r: &[Ef]) -> Vec<Ef> {
     eq
 }
 
+/// Partially evaluate a base-field MLE at an EF prefix, returning the
+/// EF-valued residual table used by the MatMul/batch-opening reductions.
+pub fn partial_eval_at_ef(values: &[Goldilocks], fix: &[Ef]) -> Option<Vec<Ef>> {
+    let t = values.len().trailing_zeros() as usize;
+    if !values.len().is_power_of_two() || fix.len() > t {
+        return None;
+    }
+    let mut buf: Vec<Ef> = values.iter().map(|&v| efg(v)).collect();
+    for &p in fix {
+        let half = buf.len() / 2;
+        for i in 0..half {
+            let a = buf[2 * i];
+            let b = buf[2 * i + 1];
+            buf[i] = a + p * (b - a);
+        }
+        buf.truncate(half);
+    }
+    Some(buf)
+}
+
 /// Evaluate a base-field MLE at an EF point: fold base values with EF
 /// weights. The result is an EF element; when every point coordinate lies in
 /// the base subfield (second lane zero) it equals the base-field evaluation.
@@ -360,10 +391,19 @@ pub fn mle_eval_at_ef(values: &[Goldilocks], point: &[Ef]) -> Option<Ef> {
     Some(buf[0])
 }
 
-/// EF same-poly merge: prove that all `(r_i, y_i)` are evaluations of the same
-/// base-field MLE `f`, and return the merged claim at the sum-check point.
+/// EF same-poly merge over a base-field MLE.
 pub fn prove_same_poly(
     f: &[Goldilocks],
+    claims: &[(Vec<Ef>, Ef)],
+    transcript: &mut Transcript,
+) -> (EfSamePolyProof, Ef) {
+    let f_ef: Vec<Ef> = f.iter().map(|&x| efg(x)).collect();
+    prove_same_poly_ef(&f_ef, claims, transcript)
+}
+
+/// EF same-poly merge over an EF-valued MLE (e.g. a LogUp fraction column).
+pub fn prove_same_poly_ef(
+    f: &[Ef],
     claims: &[(Vec<Ef>, Ef)],
     transcript: &mut Transcript,
 ) -> (EfSamePolyProof, Ef) {
@@ -381,9 +421,8 @@ pub fn prove_same_poly(
         acc = acc * gamma;
     }
     let eqs: Vec<Vec<Ef>> = claims.iter().map(|(r_i, _)| eq_evals(r_i)).collect();
-    let f_ef: Vec<Ef> = f.iter().map(|&x| efg(x)).collect();
     let mut mles: Vec<&[Ef]> = Vec::with_capacity(1 + eqs.len());
-    mles.push(f_ef.as_slice());
+    mles.push(f);
     for e in &eqs {
         mles.push(e.as_slice());
     }

@@ -316,6 +316,29 @@ bytes:
 - Not yet wired into composers: the base-field sum-check/virtual/same_poly
   remain the production path until step 2b/2c. No proof bytes changed.
 
+## 9c. Step 2b-1 status — EF MatMul / W_t / LogUp core
+
+Step 2b is split into sub-steps because the composer migration touches every
+outer reduction. Sub-step 2b-1 adds the remaining EF algebra cores, still
+without changing any production path or proof byte:
+
+- `common/ef_matmul.rs`: EF MatMul sum-check (`claimed`, round messages and
+  terminals in EF; A/B/C tensors stay F, restricted with
+  `partial_eval_at_ef`; C evaluated with `mle_eval_at_ef`).
+- `common/ef_batch.rs`: EF sum-of-products sum-check for the batch-opening
+  `W_t` arithmetic (weights/values EF; `b_eval` EF).
+- `common/ef_logup.rs`: EF fractional/LogUp chain with EF α/β/γ and leaf
+  claims; EF witness/table/permutation column builders; EF leaf helper;
+  split witness/table identity and zero-root-denominator rejection.
+- `ef_outer.rs`: `prove_sumcheck_ef`, `partial_eval_at_ef`, and
+  `prove_same_poly_ef` (same-poly over EF-valued fraction columns).
+
+Tests: 10/10 EF (`ef_` filter; adds MatMul, batch sum-of-products, EF LogUp
+roundtrip/tamper, lookup split identity + zero-den rejection). Existing ops
+175/0 and the base-field protocols are untouched; no proof bytes changed.
+Composer wiring, EF PCS boundary/batch-opening wrapper, budget caps,
+dead-field canonicalization, and A/B/D/C measurements remain for 2b-2/2b-3.
+
 ## 10. Acceptance status
 
 Step 1 delivers only this inventory and budget. The S9 acceptance items
