@@ -199,5 +199,50 @@ hook is isolated and env-gated. O2 is not complete pending TL acceptance; S7
 is not accepted. No transcript/authentication/security change was made by
 this comparison step.
 
+## Project-level finding: proof bytes were not byte-reproducible (fixed)
+
+Observed on the same real inputs across separate processes: C 354,735 /
+355,119 / 355,247 B; B 464,564 / 462,132 / 461,940 B; A constant 241,874 B
+(A has no WHIR openings). Every variant verified. Root cause:
+p3-challenger 0.7.0's `DuplexChallenger::grind` used Rayon
+`find_map_any`/`find_any`, returning ANY valid proof-of-work witness. The
+witness is absorbed into the transcript, so different thread scheduling
+selected different valid witnesses and changed the proof bytes. Red test
+(`pow_grind_returns_minimal_witness`, upstream crate): witness
+4,647,996,289,340,866,574 vs the minimal valid witness 1,109.
+
+Fix: p3-challenger 0.7.0 is vendored at
+`crates/zkie-core/vendor/p3-challenger` and patched in the workspace
+`[patch.crates-io]`. The PoW grind now uses an adaptive deterministic segment
+search: a segment starts at ~4x the expected number of batches
+(`2^bits / lanes`), the segment is scanned in parallel and its MINIMUM
+matching batch is taken; on a miss the next segment doubles. Segments are
+ordered, so the first segment containing a match yields the global smallest
+valid witness. Low-pow grinds stay on a tiny segment; 32-bit PoW uses a few
+large parallel segments. The set of valid witnesses, the verification
+predicate, the transcript order and the security parameters are unchanged;
+only the deterministic choice among valid witnesses changes. PoW witnesses
+are still checked by the verifier.
+
+Regressions:
+
+- `pow_grind_returns_minimal_witness` (zkie-core): red on the upstream
+  parallel `find_any`, green after the ordered search.
+- `s7c_bound_proof_bytes_deterministic` (zkie-ops): two proofs of the same
+  statement in one process serialize byte-identically.
+- Cross-process: the real A/B/C example run twice with
+  `ZKIE_O2_DUMP_PREFIX` produced `cmp`-identical A/B/C proof files
+  (241,874 / 462,836 / 355,183 B).
+- `zkie-ops` 158/0.
+
+Performance note: adaptive segments keep low-pow grinds cheap. On the real B
+proof, `commit+prove` moved from 5.20 s to 5.50 s (~6%); C stayed at ~0.28 s.
+The pow-32 core WHIR test (upstream ordered-any search: 35 s) is slower under
+the deterministic first-match rule and is measured separately; it exercises a
+test-only high PoW target, not the production proof parameters. The byte-level
+variance of the earlier O2/O5 metrics (±~0.1%) is explained by this PoW
+witness nondeterminism; post-fix proof bytes are deterministic. No timing/RSS
+number in O5 changes meaning because of the byte fix itself.
+
 S7 is not accepted; O2 is not complete. No security parameter or
 authentication relation is changed by this baseline step.

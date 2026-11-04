@@ -18710,6 +18710,64 @@ mod tests {
             &PublicStatement::Generic, &model, &execution).is_none(),
             "a static Lookup in the ScaleVec scale slot on the weighted path must fail closed");
     }
+
+    /// Byte-level determinism: two proofs of the same statement in one process
+    /// must serialize identically. The WHIR PoW witness search is an ordered
+    /// scan (vendored p3-challenger `find_first`), not a parallel `find_any`;
+    /// with the upstream parallel search, the witness (and proof bytes) varied
+    /// between runs while every variant still verified.
+    #[test]
+    fn s7c_bound_proof_bytes_deterministic() {
+        use zkie_core::pcs::whir::Whir;
+        let (m, n, k, h) = (4usize, 8usize, 2usize, 4usize);
+        let mut store = Store::new();
+        let xv: Vec<Goldilocks> = (0..m * n).map(|i| from_i64(((i * 7) % 13) as i64)).collect();
+        let dv: Vec<Goldilocks> = (0..m * k * h).map(|i| from_i64(((i * 5) % 11) as i64 - 5)).collect();
+        let (thr_v, _sel_v, gate_v, d1_v, d2_v) = topk_forward(&xv, m, n, k);
+        let x = store.push(xv.clone());
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let token_id = store.push_idx(vec![]);
+        let expert_of = store.push_idx(vec![]);
+        let idx = store.push_idx(vec![]);
+        let gate_pos = store.push(vec![]);
+        let d = store.push(dv.clone());
+        let weighted = store.push(vec![]);
+        let out = store.push(vec![]);
+        let ops = vec![
+            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k },
+            Op::Scatter { sel, token_id, expert_of, m, n },
+            Op::CombineIdx { a: token_id, b: expert_of, scale: n, out: idx },
+            Op::Lookup { idx, out: gate_pos, table: gate },
+            Op::BroadcastScale { x: d, scale: gate_pos, out: weighted, h },
+            Op::Gather { weighted, token_id, gate: gate_pos, out, m, h },
+        ];
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7c-deterministic");
+        forward_ops(&mut store, &ops);
+        let s = store.idx[token_id].len();
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(token_id, s), (expert_of, s), (idx, s)].into());
+        let execution = TrustedExecution {
+            inputs: [(x, xv.clone()), (d, dv.clone())].into(),
+            outputs: [
+                (thr, thr_v.clone()), (gate, gate_v.clone()),
+                (d1, d1_v.clone()), (d2, d2_v.clone()),
+                (out, store.get(out).to_vec()),
+            ].into(),
+        };
+        let p1 = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("first proof");
+        let p2 = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("second proof");
+        assert_eq!(bincode::serialize(&p1).unwrap(), bincode::serialize(&p2).unwrap(),
+            "bound proof bytes must be deterministic for identical inputs");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &p1,
+            &PublicStatement::Generic, &model, &execution), "first proof must verify");
+    }
     #[test]
     fn s2_matmul32_empty_commitments_rejected() {
         use zkie_core::pcs::whir::Whir;

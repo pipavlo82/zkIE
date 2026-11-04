@@ -120,3 +120,11 @@
   - 指标（同安全等级、同真实输入、同认证范围对比）：唯一张量数/claim 数/复制字节、RSS、page fault、读盘字节、prove 时间；重点验证 DeepSeek 内存压力；不把文件缓存命中当算法加速。
   - 验收：security 与认证关系不变；诚实与恶意回归全部保持；记录关闭优化的对照。
 - **状态**：S7 完整 64 专家**未验收**，不得宣称 S7 完成；本轮先同步决策，O5 自测后回测。
+
+## 2026-11-04 O2 字节确定性修复（项目级发现）
+
+- **发现**：同一输入跨进程证明字节不一致（含 WHIR opening 的 B/C/full64 变体 ±~0.1%，A 无 opening 恒定 241,874B），所有变体验证通过。
+- **根因**：p3-challenger 0.7.0 `DuplexChallenger::grind` 使用 Rayon `find_any`/`find_map_any`，PoW witness 随线程调度选择不同合法值；witness 被 transcript 吸收，故字节变化。红测示例：上游返回 witness 4,647,996,289,340,866,574，最小合法为 1,109。
+- **修复**：p3-challenger 0.7.0 vendor 到 `crates/zkie-core/vendor/p3-challenger` 并通过 `[patch.crates-io]` 使用；grind 改为有序 `find_first`/`find_map_first`（最小合法 witness）。合法 witness 集合、验证谓词、transcript 顺序与安全参数均不变，仅确定性地选择其中一个合法 witness。
+- **回归**：`pow_grind_returns_minimal_witness`（红→绿）；`s7c_bound_proof_bytes_deterministic`（同进程双跑字节一致）；真实 A/B/C 双进程 `ZKIE_O2_DUMP_PREFIX` 输出 `cmp` 一致；`zkie-ops` 158/0。
+- **性能/指标**：自适应分段有序搜索（段长初值 4×2^bits/lanes，未命中倍增；段内并行取最小匹配）在低 PoW 下开销很小；真实 B prove 5.20s→5.50s（约 +6%），C 约 0.28s 不变。pow-32 core 测试（上游 35s）在确定性首命中规则下较慢，属测试专用高 PoW，另行记录。O2/O5 旧字节指标补 ±~0.1% 方差说明，修复后字节确定；时间/RSS 指标含义不变。

@@ -808,6 +808,33 @@ mod tests {
     use crate::common::field::{Goldilocks, XorShift64};
     use crate::common::mle;
 
+    /// Determinism regression: the PoW witness must be the SMALLEST valid
+    /// witness (ordered scan). The upstream p3-challenger used Rayon
+    /// `find_any`/`find_map_any`, so the witness varied with thread
+    /// scheduling and proof bytes changed across processes. The vendored
+    /// crate uses `find_first`/`find_map_first`; this test fails on the
+    /// upstream parallel search whenever it returns a non-minimal witness.
+    #[test]
+    fn pow_grind_returns_minimal_witness() {
+        use crate::common::field::PrimeCharacteristicRing;
+        use p3_challenger::{CanObserve, GrindingChallenger};
+        let mut c = MyChallenger::new(Perm::new_from_rng_128(
+            &mut SmallRng::seed_from_u64(9),
+        ));
+        c.observe(Goldilocks::from_u64(12345));
+        let bits = 10usize;
+        let witness = c.clone().grind(bits);
+        let mut expected = Goldilocks::ZERO;
+        loop {
+            if c.clone().check_witness(bits, expected) {
+                break;
+            }
+            expected = expected + Goldilocks::ONE;
+        }
+        assert_eq!(witness, expected,
+            "PoW grind must return the smallest valid witness (deterministic)");
+    }
+
     #[test]
     fn whir_batch_open_matches_mle_eval() {
         let mut rng = XorShift64::new(0xbeef);

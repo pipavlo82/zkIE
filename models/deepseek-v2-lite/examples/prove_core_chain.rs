@@ -833,6 +833,11 @@ fn main() {
         &PublicStatement::Generic, &model_bad, &exec_bad).is_none(),
         "static gate table in the real-graph chain must fail closed");
     println!("negative rejected: C static gate table fails closed (router-gate consistency)");
+    if let Ok(prefix) = std::env::var("ZKIE_O2_DUMP_PREFIX") {
+        std::fs::write(format!("{prefix}-a.bin"), &bytes_a).expect("dump A bytes");
+        std::fs::write(format!("{prefix}-b.bin"), &bytes_b).expect("dump B bytes");
+        std::fs::write(format!("{prefix}-c.bin"), &bytes_c).expect("dump C bytes");
+    }
     println!("SEGMENT-OK layer={layer} (A routing + B gate projection + C router-gate/Gather over caller-trusted real d) A_bytes={} B_bytes={} C_bytes={}",
         bytes_a.len(), bytes_b.len(), bytes_c.len());
 }

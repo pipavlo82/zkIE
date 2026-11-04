@@ -82,6 +82,14 @@ accepted. No security/transcript change is introduced by O5.
 
 ## Measurements (real layer-10 segmented example, 8-expert slice, 90-bit)
 
+Byte-size note (O2 determinism follow-up): the proof byte counts reported
+below were taken before the p3-challenger ordered-grind fix. With the upstream
+nondeterministic PoW witness, sizes varied by ±~0.1% across runs on identical
+inputs (e.g. B 464,564/462,132/461,940 B; C 354,735/355,119/355,247 B; every
+variant verified). After the fix (`[patch.crates-io]` vendored p3-challenger
+with ordered `find_first`) proof bytes are deterministic; the time/RSS
+measurements below are unaffected by the byte nondeterminism itself.
+
 Cold-read metering fix: `scripts/o5_measure.py` records page-cache residency
 with `fincore --bytes` immediately before and after each run, samples
 `/proc/<pid>/{io,status,stat}`, and reports child rusage. A run is classified
