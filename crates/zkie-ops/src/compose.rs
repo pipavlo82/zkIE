@@ -517,7 +517,8 @@ fn gather_routing_terms(gamma: Ef, count: usize) -> Vec<(Ef, Vec<usize>)> {
 }
 
 fn prove_reverse_gather(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
-    aux: PreparedAux, transcript: &mut Transcript)
+    aux: PreparedAux, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseGatherProof, Vec<EfClaim>)>
 {
     let (weighted, token_id, gate, out, m, h) = gather_dims(op)?;
@@ -579,6 +580,9 @@ fn prove_reverse_gather(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let mut values: Vec<Ef> = Vec::with_capacity(2 * m);
     for t in 0..m { idxs.push(t); points.push(zp.clone()); values.push(ef_eval(&aux.columns[t], &zp)); }
     for t in 0..m { idxs.push(t); points.push(zpg.clone()); values.push(ef_eval(&aux.columns[t], &zpg)); }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&aux.descriptor, &idxs, &points, &values)?;
+    }
     let opening = open_aux(aux, &idxs, &points, &values)?;
 
     // Zero-extension to the tensors' own domains.
@@ -601,7 +605,8 @@ fn prove_reverse_gather(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 }
 
 fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
-    descriptor: &AuxDescriptor, proof: &ReverseGatherProof, transcript: &mut Transcript)
+    descriptor: &AuxDescriptor, proof: &ReverseGatherProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<Vec<EfClaim>>
 {
     let (weighted, token_id, gate, out, m, h) = gather_dims(op)?;
@@ -641,7 +646,9 @@ fn verify_reverse_gather(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let mut points: Vec<Vec<Ef>> = Vec::with_capacity(2 * m);
     for t in 0..m { idxs.push(t); points.push(zp.clone()); }
     for t in 0..m { idxs.push(t); points.push(zpg.clone()); }
-    if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(descriptor, &idxs, &points, &proof.aux_values)?;
+    } else if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
     let eq_t = efo::eq_evals(r_t);
     let mut rp_z = Ef::ZERO;
     for t in 0..m { rp_z = rp_z + eq_t[t] * proof.aux_values[m + t]; }
@@ -1400,7 +1407,8 @@ fn topk_tie_layout(z_zero: &[Ef], z_bits: &[Ef], z_rank: &[Ef],
 
 fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     witness: PreparedAux, thr_aux: PreparedAux, range_aux: PreparedAux,
-    thr_range_aux: PreparedAux, tie_aux: PreparedAux, transcript: &mut Transcript)
+    thr_range_aux: PreparedAux, tie_aux: PreparedAux, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseTopKSelectProof, Vec<EfClaim>)>
 {
     let (x, sel_t, thr_t, gate_t, d1_t, d2_t, m, n, k) = topk_dims(op)?;
@@ -1631,6 +1639,9 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let tie_points: Vec<Vec<Ef>> = tie_layout.iter().map(|e| e.1.clone()).collect();
     let tie_values: Vec<Ef> = tie_layout.iter()
         .map(|e| ef_eval(&tie_aux.columns[e.0], &e.1)).collect();
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&tie_aux.descriptor, &tie_idxs, &tie_points, &tie_values)?;
+    }
     let tie_opening = open_aux(tie_aux, &tie_idxs, &tie_points, &tie_values)?;
 
     let layout = topk_witness_layout(&z1, &z2, &z3, &z4, &z5, &z6, &z7, &z8, &z10,
@@ -1638,12 +1649,18 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let idxs: Vec<usize> = layout.iter().map(|e| e.0).collect();
     let points: Vec<Vec<Ef>> = layout.iter().map(|e| e.1.clone()).collect();
     let values: Vec<Ef> = layout.iter().map(|e| ef_eval(&witness.columns[e.0], &e.1)).collect();
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&witness.descriptor, &idxs, &points, &values)?;
+    }
     let opening = open_aux(witness, &idxs, &points, &values)?;
 
     let thr_layout = topk_thr_layout(&q_hi, &qt, thr_arity);
     let thr_idxs: Vec<usize> = thr_layout.iter().map(|e| e.0).collect();
     let thr_points: Vec<Vec<Ef>> = thr_layout.iter().map(|e| e.1.clone()).collect();
     let thr_values: Vec<Ef> = thr_points.iter().map(|p| ef_eval(thr_col, p)).collect();
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&thr_aux.descriptor, &thr_idxs, &thr_points, &thr_values)?;
+    }
     let thr_opening = open_aux(thr_aux, &thr_idxs, &thr_points, &thr_values)?;
 
     let range_layout = topk_range_layout(&z9, arity);
@@ -1651,6 +1668,9 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let range_points: Vec<Vec<Ef>> = range_layout.iter().map(|e| e.1.clone()).collect();
     let range_values: Vec<Ef> = range_layout.iter()
         .map(|e| ef_eval(&range_aux.columns[e.0], &e.1)).collect();
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&range_aux.descriptor, &range_idxs, &range_points, &range_values)?;
+    }
     let range_opening = open_aux(range_aux, &range_idxs, &range_points, &range_values)?;
 
     let tr_range_layout = topk_range_layout(&z10, arity);
@@ -1658,6 +1678,10 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let tr_range_points: Vec<Vec<Ef>> = tr_range_layout.iter().map(|e| e.1.clone()).collect();
     let tr_range_values: Vec<Ef> = tr_range_layout.iter()
         .map(|e| ef_eval(&thr_range_aux.columns[e.0], &e.1)).collect();
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&thr_range_aux.descriptor, &tr_range_idxs, &tr_range_points,
+            &tr_range_values)?;
+    }
     let thr_range_opening = open_aux(thr_range_aux, &tr_range_idxs, &tr_range_points, &tr_range_values)?;
 
     let xk = TensorKey::Field(x).encoded()?;
@@ -1688,7 +1712,8 @@ fn prove_reverse_topk(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     witness: &AuxDescriptor, thr_aux: &AuxDescriptor, range_aux: &AuxDescriptor,
     thr_range_aux: &AuxDescriptor, tie_aux: &AuxDescriptor,
-    proof: &ReverseTopKSelectProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
+    proof: &ReverseTopKSelectProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
 {
     let (x, sel_t, thr_t, gate_t, d1_t, d2_t, m, n, k) = topk_dims(op)?;
     let len = m.checked_mul(n)?;
@@ -1783,7 +1808,9 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let thr_idxs: Vec<usize> = thr_layout.iter().map(|e| e.0).collect();
     let thr_points: Vec<Vec<Ef>> = thr_layout.iter().map(|e| e.1.clone()).collect();
     if proof.thr_values.len() != thr_points.len() { return None; }
-    if !verify_aux_open(thr_aux, &thr_idxs, &thr_points, &proof.thr_values, &proof.thr_opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(thr_aux, &thr_idxs, &thr_points, &proof.thr_values)?;
+    } else if !verify_aux_open(thr_aux, &thr_idxs, &thr_points, &proof.thr_values, &proof.thr_opening) { return None; }
     if proof.thr_values[1] != vt { return None; }
     let terms = topk_broadcast_terms();
     let (ok, z8, f8) = efo::verify_virtual(&proof.broadcast, &terms, proof.thr_values[0], arity, transcript);
@@ -1799,7 +1826,9 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let range_layout = topk_range_layout(&z9, arity);
     let range_idxs: Vec<usize> = range_layout.iter().map(|e| e.0).collect();
     let range_points: Vec<Vec<Ef>> = range_layout.iter().map(|e| e.1.clone()).collect();
-    if !verify_aux_open(range_aux, &range_idxs, &range_points, &proof.range_aux_values, &proof.range_opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(range_aux, &range_idxs, &range_points, &proof.range_aux_values)?;
+    } else if !verify_aux_open(range_aux, &range_idxs, &range_points, &proof.range_aux_values, &proof.range_opening) { return None; }
     for b in 0..TK_SIGNED_BITS {
         if proof.x_range.final_evals[2 + b] != proof.range_aux_values[b] { return None; }
     }
@@ -1813,7 +1842,10 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let tr_range_layout = topk_range_layout(&z10, arity);
     let tr_range_idxs: Vec<usize> = tr_range_layout.iter().map(|e| e.0).collect();
     let tr_range_points: Vec<Vec<Ef>> = tr_range_layout.iter().map(|e| e.1.clone()).collect();
-    if !verify_aux_open(thr_range_aux, &tr_range_idxs, &tr_range_points,
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(thr_range_aux, &tr_range_idxs, &tr_range_points,
+            &proof.thr_range_values)?;
+    } else if !verify_aux_open(thr_range_aux, &tr_range_idxs, &tr_range_points,
         &proof.thr_range_values, &proof.thr_range_opening) { return None; }
     for b in 0..TK_SIGNED_BITS {
         if proof.thr_range.final_evals[2 + b] != proof.thr_range_values[b] { return None; }
@@ -1908,7 +1940,9 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let tie_idxs: Vec<usize> = tie_layout.iter().map(|e| e.0).collect();
     let tie_points: Vec<Vec<Ef>> = tie_layout.iter().map(|e| e.1.clone()).collect();
     if proof.tie_aux_values.len() != tie_layout.len() { return None; }
-    if !verify_aux_open(tie_aux, &tie_idxs, &tie_points, &proof.tie_aux_values, &proof.tie_opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(tie_aux, &tie_idxs, &tie_points, &proof.tie_aux_values)?;
+    } else if !verify_aux_open(tie_aux, &tie_idxs, &tie_points, &proof.tie_aux_values, &proof.tie_opening) { return None; }
     let tv = &proof.tie_aux_values;
     let mut to = 0usize;
     let mut ttake = || { let v = tv[to]; to += 1; v };
@@ -1957,7 +1991,9 @@ fn verify_reverse_topk(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let idxs: Vec<usize> = layout.iter().map(|e| e.0).collect();
     let points: Vec<Vec<Ef>> = layout.iter().map(|e| e.1.clone()).collect();
     if proof.aux_values.len() != layout.len() { return None; }
-    if !verify_aux_open(witness, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(witness, &idxs, &points, &proof.aux_values)?;
+    } else if !verify_aux_open(witness, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
 
     // Read the opened values in the layout's exact push order.
     let av = &proof.aux_values;
@@ -2786,7 +2822,8 @@ fn prove_reverse_softmax(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let lookup_value = ef_eval(&pairs.columns[1], &q);
     let fake = Op::Lookup { idx, out: e, table };
     let (lookup, claims, _) = prove_reverse_lookup(
-        store, &fake, &q, lookup_value, pairs, mult, model, dynamic_table, None, transcript)?;
+        store, &fake, &q, lookup_value, pairs, mult, model, dynamic_table, None, transcript,
+        rec.as_deref_mut())?;
     Some((ReverseSoftmaxProof { lookup, lookup_value, row_sum, rescale, bind,
         out_opening, sum_opening, e_opening, rem_opening }, claims))
 }
@@ -2867,7 +2904,7 @@ fn verify_reverse_softmax(op: &Op, point: &[Ef], value: Ef,
         &rem_values, &proof.rem_opening) { return None; }
     let fake = Op::Lookup { idx, out: e, table };
     let lk = verify_reverse_lookup(&fake, &q, proof.lookup_value, pairs, mult, model, dynamic_table,
-        None, &proof.lookup, transcript).map(|(claims, _)| claims);
+        None, &proof.lookup, transcript, rec.as_deref_mut()).map(|(claims, _)| claims);
     lk
 }
 
@@ -4938,7 +4975,8 @@ fn scatter_order_layout(zk: &[Ef], zkb: &[Ef], zd: &[Ef],
 }
 
 fn prove_reverse_scatter(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
-    aux: PreparedAux, order_aux: PreparedAux, transcript: &mut Transcript)
+    aux: PreparedAux, order_aux: PreparedAux, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseScatterProof, Vec<EfClaim>)>
 {
     let (sel, token_id, expert_of, m, n) = scatter_dims(op)?;
@@ -5049,6 +5087,9 @@ fn prove_reverse_scatter(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let idxs: Vec<usize> = layout.iter().map(|e| e.0).collect();
     let points: Vec<Vec<Ef>> = layout.iter().map(|e| e.1.clone()).collect();
     let values: Vec<Ef> = layout.iter().map(|e| ef_eval(&aux.columns[e.0], &e.1)).collect();
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&aux.descriptor, &idxs, &points, &values)?;
+    }
     let opening = open_aux(aux, &idxs, &points, &values)?;
 
     let olayout = scatter_order_layout(&zk, &zkb, &zd, &za, &q_den_a, &q_den_b, b_bits, arity);
@@ -5056,6 +5097,9 @@ fn prove_reverse_scatter(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let opoints: Vec<Vec<Ef>> = olayout.iter().map(|e| e.1.clone()).collect();
     let ovalues: Vec<Ef> = olayout.iter()
         .map(|e| ef_eval(&order_aux.columns[e.0], &e.1)).collect();
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&order_aux.descriptor, &oidxs, &opoints, &ovalues)?;
+    }
     let order_opening = open_aux(order_aux, &oidxs, &opoints, &ovalues)?;
     let _ = padded;
     let _ = v_tok;
@@ -5073,8 +5117,8 @@ fn prove_reverse_scatter(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 
 fn verify_reverse_scatter(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     descriptor: &AuxDescriptor, order_descriptor: &AuxDescriptor,
-    proof: &ReverseScatterProof, transcript: &mut Transcript)
-    -> Option<Vec<EfClaim>>
+    proof: &ReverseScatterProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
 {
     let (sel, token_id, expert_of, m, n) = scatter_dims(op)?;
     if descriptor.role != AuxRole::ScatterRouting || descriptor.columns != m.checked_add(n)? {
@@ -5178,7 +5222,9 @@ fn verify_reverse_scatter(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let idxs: Vec<usize> = layout.iter().map(|e| e.0).collect();
     let points: Vec<Vec<Ef>> = layout.iter().map(|e| e.1.clone()).collect();
     if proof.aux_values.len() != layout.len() { return None; }
-    if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(descriptor, &idxs, &points, &proof.aux_values)?;
+    } else if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
 
     let av = &proof.aux_values;
     let mut o = 0usize;
@@ -5206,7 +5252,9 @@ fn verify_reverse_scatter(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let oidxs: Vec<usize> = olayout.iter().map(|e| e.0).collect();
     let opoints: Vec<Vec<Ef>> = olayout.iter().map(|e| e.1.clone()).collect();
     if proof.order_aux_values.len() != olayout.len() { return None; }
-    if !verify_aux_open(order_descriptor, &oidxs, &opoints, &proof.order_aux_values, &proof.order_opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(order_descriptor, &oidxs, &opoints, &proof.order_aux_values)?;
+    } else if !verify_aux_open(order_descriptor, &oidxs, &opoints, &proof.order_aux_values, &proof.order_opening) { return None; }
     let ov = &proof.order_aux_values;
     let mut oo = 0usize;
     let mut otake = || { let v = ov[oo]; oo += 1; v };
@@ -5344,7 +5392,8 @@ fn reverse_tensor_values(store: &Store, id: T) -> Option<Cow<'_, [Goldilocks]>> 
 }
 
 fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
-    point: &[Ef], value: Ef, range_aux: PreparedAux, transcript: &mut Transcript)
+    point: &[Ef], value: Ef, range_aux: PreparedAux, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseGeluIndexProof, Vec<(Vec<Ef>, Ef)>)>
 {
     // Project ② domain contract: table_len a power of two <= 2^24, offset
@@ -5405,6 +5454,9 @@ fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
     let points = vec![range_point.clone(); GELU_XRANGE_BITS];
     let values = x_range.final_evals[2..].to_vec();
     let range_commitment = range_aux.descriptor.commitment.clone();
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&range_aux.descriptor, &idxs, &points, &values)?;
+    }
     let range_opening = open_aux(range_aux, &idxs, &points, &values)?;
     let range_claim = unpad_relu_claim(&range_point, x_range.final_evals[1], input_arity)?;
     let (upper, upper_inputs) = prove_reverse_relu(&upper_input, point, lower_at_output - value, GELU_BITS, transcript)?;
@@ -5420,7 +5472,8 @@ fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
 }
 
 fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Ef], value: Ef,
-    range_aux: Option<&AuxDescriptor>, proof: &ReverseGeluIndexProof, transcript: &mut Transcript)
+    range_aux: Option<&AuxDescriptor>, proof: &ReverseGeluIndexProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<Vec<(Vec<Ef>, Ef)>>
 {
     if table_len == 0 || !table_len.is_power_of_two() || table_len > GELU_BOUND as usize
@@ -5454,7 +5507,9 @@ fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Ef], value:
     let desc = range_aux.unwrap_or(&local);
     let idxs: Vec<usize> = (0..GELU_XRANGE_BITS).collect();
     let points = vec![range_point.clone(); GELU_XRANGE_BITS];
-    if !verify_aux_open(desc, &idxs, &points, &proof.range_aux_values, &proof.range_opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(desc, &idxs, &points, &proof.range_aux_values)?;
+    } else if !verify_aux_open(desc, &idxs, &points, &proof.range_aux_values, &proof.range_opening) { return None; }
     for b in 0..GELU_XRANGE_BITS {
         if proof.x_range.final_evals[2 + b] != proof.range_aux_values[b] { return None; }
     }
@@ -6117,7 +6172,8 @@ fn gather_matmul_dims(op: &Op) -> Option<(T, T, T, T, usize, usize, usize, usize
 }
 
 fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
-    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseGatherMatmulProof, Vec<EfClaim>)>
+    aux: PreparedAux, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<(ReverseGatherMatmulProof, Vec<EfClaim>)>
 {
     let (a, expert_of, w, c, s, k, n, e_count) = gather_matmul_dims(op)?;
     let lgk = k.trailing_zeros() as usize;
@@ -6200,6 +6256,9 @@ fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)]
     for e in 0..e_count {
         idxs.push(e); points.push(zp.clone()); values.push(ef_eval(&aux.columns[e], &zp));
     }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&aux.descriptor, &idxs, &points, &values)?;
+    }
     let opening = open_aux(aux, &idxs, &points, &values)?;
 
     let fe = &matmul.sumcheck.final_evals;
@@ -6228,8 +6287,8 @@ fn prove_reverse_gather_matmul(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)]
 }
 
 fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
-    descriptor: &AuxDescriptor, proof: &ReverseGatherMatmulProof, transcript: &mut Transcript)
-    -> Option<Vec<EfClaim>>
+    descriptor: &AuxDescriptor, proof: &ReverseGatherMatmulProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
 {
     let (a, expert_of, w, c, s, k, n, e_count) = gather_matmul_dims(op)?;
     let lgk = k.trailing_zeros() as usize;
@@ -6268,7 +6327,9 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let mut points = Vec::with_capacity(2 * e_count);
     for e in 0..e_count { idxs.push(e); points.push(chp.clone()); }
     for e in 0..e_count { idxs.push(e); points.push(zp.clone()); }
-    if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(descriptor, &idxs, &points, &proof.aux_values)?;
+    } else if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
 
     // counts are the ch_pos openings; the weight terminal is locked by the
     // sumcheck; the table values are the opened manifest weight blocks.
@@ -8358,7 +8419,8 @@ fn lookup_prefix_eval(len: usize, point: &[Ef]) -> Ef {
 
 fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
     pairs: PreparedAux, multiplicity: PreparedAux, model: &TrustedModelManifest, dynamic_table: bool,
-    group: Option<LookupGroupMemberProve<'_>>, transcript: &mut Transcript)
+    group: Option<LookupGroupMemberProve<'_>>, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseLookupProof, Vec<EfClaim>, (Ef, Ef))>
 {
     let (idx, out, table_id) = match op { Op::Lookup { idx, out, table } => (*idx, *out, *table), _ => return None };
@@ -8405,6 +8467,12 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
         let pair_idxs = [0, 1, 0, 1];
         let pair_points = vec![output_point.clone(), output_point.clone(), w_den_point.clone(), w_den_point];
         let pair_values = [output_index, value, witness_index, witness_value];
+        if let Some(r) = rec.as_deref_mut() {
+            r.record(&pairs.descriptor, &pair_idxs, &pair_points, &pair_values)?;
+            r.record(&multiplicity.descriptor, &[0, 0],
+                &[g.identity_point.to_vec(), padding_point.clone()],
+                &[g.member_eval, padding_value])?;
+        }
         let pairs_opening = open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?;
         let multiplicity_opening = open_aux(multiplicity, &[0, 0],
             &[g.identity_point.to_vec(), padding_point],
@@ -8466,6 +8534,11 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let pair_idxs = [0, 1, 0, 1];
     let pair_points = vec![output_point.clone(), output_point.clone(), w_den_point.clone(), w_den_point];
     let pair_values = [output_index, value, witness_index, witness_value];
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&pairs.descriptor, &pair_idxs, &pair_points, &pair_values)?;
+        r.record(&multiplicity.descriptor, &[0, 0],
+            &[t_num_point.clone(), padding_point.clone()], &[mult_eval, padding_value])?;
+    }
     let pairs_opening = open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?;
     let multiplicity_opening = open_aux(multiplicity, &[0, 0], &[t_num_point, padding_point], &[mult_eval, padding_value])?;
     let table_opening = if dynamic_table {
@@ -8510,7 +8583,8 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
 fn verify_reverse_lookup(op: &Op, point: &[Ef], value: Ef, pairs: &AuxDescriptor,
     multiplicity: &AuxDescriptor, model: &TrustedModelManifest, dynamic_table: bool,
     group: Option<LookupGroupMemberVerify<'_>>,
-    proof: &ReverseLookupProof, transcript: &mut Transcript)
+    proof: &ReverseLookupProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(Vec<EfClaim>, (Ef, Ef))>
 {
     let (idx, table_id) = match op { Op::Lookup { idx, table, .. } => (*idx, *table), _ => return None };
@@ -8548,7 +8622,12 @@ fn verify_reverse_lookup(op: &Op, point: &[Ef], value: Ef, pairs: &AuxDescriptor
             * (Ef::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) { return None; }
         let points = vec![output_point.clone(), output_point, witness.q_den.clone(), witness.q_den];
         let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
-        if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
+        if let Some(r) = rec.as_deref_mut() {
+            r.record(pairs, &[0, 1, 0, 1], &points, &values)?;
+            r.record(multiplicity, &[0, 0],
+                &[g.identity_point.to_vec(), padding_point.clone()],
+                &[proof.multiplicity, proof.padding.final_evals[1]])?;
+        } else if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
             || !verify_aux_open(multiplicity, &[0, 0],
                 &[g.identity_point.to_vec(), padding_point],
                 &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) { return None; }
@@ -8572,7 +8651,11 @@ fn verify_reverse_lookup(op: &Op, point: &[Ef], value: Ef, pairs: &AuxDescriptor
         * (Ef::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) { return None; }
     let points = vec![output_point.clone(), output_point, witness.q_den.clone(), witness.q_den];
     let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
-    if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(pairs, &[0, 1, 0, 1], &points, &values)?;
+        r.record(multiplicity, &[0, 0], &[table.q_num.clone(), padding_point.clone()],
+            &[proof.multiplicity, proof.padding.final_evals[1]])?;
+    } else if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
         || !verify_aux_open(multiplicity, &[0, 0], &[table.q_num, padding_point], &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) { return None; }
     if dynamic_table {
         if proof.table_opening.is_some() { return None; }
@@ -8896,7 +8979,8 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                         build_gelu_range_aux(xv, op_index, xv.len(), xv.len().trailing_zeros().max(5) as usize)?
                     }
                 };
-                let (proof, incoming) = prove_reverse_gelu_index(store.get(*x), *offset, *table_len, &point, value, range_aux, transcript)?;
+                let (proof, incoming) = prove_reverse_gelu_index(store.get(*x), *offset, *table_len, &point, value, range_aux,
+                    transcript, aux_rec.as_deref_mut())?;
                 for (p, v) in incoming {
                     absorb_reverse_claim(transcript, *x, &p, v);
                     claims.entry(*x).or_default().push((p, v));
@@ -8924,7 +9008,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 let r = prove_reverse_lookup(store, op, &point, value,
                     aux.remove(&(op_index, AuxRole::LookupPairs))?,
                     aux.remove(&(op_index, AuxRole::LookupMultiplicity))?, model?, dynamic_table,
-                    group_member, transcript);
+                    group_member, transcript, aux_rec.as_deref_mut());
                 let (proof, incoming, roots) = r?;
                 if grouped { group_roots.entry(table_id).or_default().push(roots); }
                 for c in incoming {
@@ -8965,7 +9049,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
             Op::GatherMatMul { .. } => {
                 let pairs: Vec<(T, Vec<Ef>, Ef)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
                 let prepared_aux = aux.remove(&(op_index, AuxRole::ExpertRouting))?;
-                let (proof, incoming) = prove_reverse_gather_matmul(store, op, &pairs, prepared_aux, transcript)?;
+                let (proof, incoming) = prove_reverse_gather_matmul(store, op, &pairs, prepared_aux, transcript, aux_rec.as_deref_mut())?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -8975,7 +9059,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
             Op::Gather { .. } => {
                 let auxp = aux.remove(&(op_index, AuxRole::GatherRouting))?;
                 let pairs = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect::<Vec<_>>();
-                let r = prove_reverse_gather(store, op, &pairs, auxp, transcript);
+                let r = prove_reverse_gather(store, op, &pairs, auxp, transcript, aux_rec.as_deref_mut());
                 let (proof, incoming) = r?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
@@ -8992,7 +9076,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 let thr_range_aux = aux.remove(&(op_index, AuxRole::TopKSelectThrRange))?;
                 let tie_aux = aux.remove(&(op_index, AuxRole::TopKSelectTie))?;
                 let (proof, incoming) = prove_reverse_topk(store, op, &pairs, witness, thr_aux,
-                    range_aux, thr_range_aux, tie_aux, transcript)?;
+                    range_aux, thr_range_aux, tie_aux, transcript, aux_rec.as_deref_mut())?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -9004,7 +9088,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                     .map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
                 let auxp = aux.remove(&(op_index, AuxRole::ScatterRouting))?;
                 let order_auxp = aux.remove(&(op_index, AuxRole::ScatterOrder))?;
-                let r = prove_reverse_scatter(store, op, &pairs, auxp, order_auxp, transcript);
+                let r = prove_reverse_scatter(store, op, &pairs, auxp, order_auxp, transcript, aux_rec.as_deref_mut());
                 let (proof, incoming) = r?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
@@ -9349,7 +9433,8 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
             }
             (Op::GeluIndex { x, offset, table_len, .. }, ReverseReduction::GeluIndex { proof }) => {
                 let range_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::GeluIndexXRange);
-                for (p, v) in verify_reverse_gelu_index(*offset, *table_len, &point, value, range_aux, proof, transcript)? {
+                for (p, v) in verify_reverse_gelu_index(*offset, *table_len, &point, value, range_aux, proof,
+                    transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, *x, &p, v);
                     claims.entry(*x).or_default().push((p, v));
                 }
@@ -9375,7 +9460,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 };
                 let grouped = group_member.is_some();
                 let (incoming, roots) = verify_reverse_lookup(op, &point, value, pairs, multiplicity, model?, dynamic_table,
-                    group_member, proof, transcript)?;
+                    group_member, proof, transcript, aux_rec.as_deref_mut())?;
                 if grouped {
                     group_roots.entry(table_id).or_default().push(roots);
                 }
@@ -9408,14 +9493,14 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
             }
             (Op::GatherMatMul { .. }, ReverseReduction::GatherMatMul { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ExpertRouting)?;
-                for c in verify_reverse_gather_matmul(op, &merged_out, descriptor, proof, transcript)? {
+                for c in verify_reverse_gather_matmul(op, &merged_out, descriptor, proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
             }
             (Op::Gather { .. }, ReverseReduction::Gather { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::GatherRouting)?;
-                for c in verify_reverse_gather(op, &merged_out, descriptor, proof, transcript)? {
+                for c in verify_reverse_gather(op, &merged_out, descriptor, proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -9426,7 +9511,8 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 let range_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::TopKSelectXRange)?;
                 let thr_range_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::TopKSelectThrRange)?;
                 let tie_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::TopKSelectTie)?;
-                for c in verify_reverse_topk(op, &merged_out, witness, thr_aux, range_aux, thr_range_aux, tie_aux, proof, transcript)? {
+                for c in verify_reverse_topk(op, &merged_out, witness, thr_aux, range_aux,
+                    thr_range_aux, tie_aux, proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -9434,7 +9520,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
             (Op::Scatter { .. }, ReverseReduction::Scatter { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ScatterRouting)?;
                 let order_descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ScatterOrder)?;
-                for c in verify_reverse_scatter(op, &merged_out, descriptor, order_descriptor, proof, transcript)? {
+                for c in verify_reverse_scatter(op, &merged_out, descriptor, order_descriptor, proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -16578,8 +16664,10 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.fractional(&proof.witness)?;
                 b.fractional(&proof.table)?;
                 b.virtual_proof(&proof.padding, 3)?;
-                b.opening(&proof.pairs_opening, max_aux_columns)?;
-                b.opening(&proof.multiplicity_opening, 2)?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.pairs_opening, max_aux_columns)?;
+                    b.opening(&proof.multiplicity_opening, 2)?;
+                }
                 if proof.table_opening.is_some() { b.base_opening()?; }
             }
             ReverseReduction::GeluIndex { proof } => {
@@ -16589,7 +16677,9 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                     b.opening(&r.bit_opening, GELU_BITS + 1)?;
                 }
                 b.virtual_proof(&proof.x_range, 3)?;
-                b.opening(&proof.range_opening, proof.range_aux_values.len())?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.range_opening, proof.range_aux_values.len())?;
+                }
             }
             ReverseReduction::Scale { proof } => {
                 if let Some(v) = &proof.booleanity { b.virtual_proof(v, 3)?; }
@@ -16612,12 +16702,16 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             ReverseReduction::GatherMatMul { proof } => {
                 b.virtual_proof(&proof.matmul.sumcheck, 3)?;
                 b.virtual_proof(&proof.routing, 3)?;
-                b.opening(&proof.opening, proof.aux_values.len())?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.opening, proof.aux_values.len())?;
+                }
             }
             ReverseReduction::Gather { proof } => {
                 b.virtual_proof(&proof.routing, 3)?;
                 b.virtual_proof(&proof.sum, 3)?;
-                b.opening(&proof.opening, proof.aux_values.len())?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.opening, proof.aux_values.len())?;
+                }
             }
             ReverseReduction::TopKSelect { proof } => {
                 for v in [&proof.bools, &proof.row_sums, &proof.gate, &proof.d1, &proof.d2s,
@@ -16631,11 +16725,13 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.virtual_proof(&proof.tie_zero, 4)?;
                 b.virtual_proof(&proof.tie_less, 5)?;
                 for p in [&proof.perm_p, &proof.perm_t, &proof.perm_b] { b.permutation(p)?; }
-                b.opening(&proof.opening, proof.aux_values.len())?;
-                b.opening(&proof.thr_opening, proof.thr_values.len())?;
-                b.opening(&proof.range_opening, proof.range_aux_values.len())?;
-                b.opening(&proof.thr_range_opening, proof.thr_range_values.len())?;
-                b.opening(&proof.tie_opening, proof.tie_aux_values.len())?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.opening, proof.aux_values.len())?;
+                    b.opening(&proof.thr_opening, proof.thr_values.len())?;
+                    b.opening(&proof.range_opening, proof.range_aux_values.len())?;
+                    b.opening(&proof.thr_range_opening, proof.thr_range_values.len())?;
+                    b.opening(&proof.tie_opening, proof.tie_aux_values.len())?;
+                }
             }
             ReverseReduction::Scatter { proof } => {
                 for v in [&proof.bools, &proof.mask_tok, &proof.mask_exp, &proof.counts,
@@ -16644,8 +16740,10 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                     b.virtual_proof(v, 3)?;
                 }
                 b.permutation(&proof.perm)?;
-                b.opening(&proof.opening, proof.aux_values.len())?;
-                b.opening(&proof.order_opening, proof.order_aux_values.len())?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.opening, proof.aux_values.len())?;
+                    b.opening(&proof.order_opening, proof.order_aux_values.len())?;
+                }
             }
             ReverseReduction::BroadcastScale { proof } => {
                 b.virtual_proof(&proof.prod, 3)?;
@@ -16676,8 +16774,10 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.fractional(&proof.lookup.witness)?;
                 b.fractional(&proof.lookup.table)?;
                 b.virtual_proof(&proof.lookup.padding, 3)?;
-                b.opening(&proof.lookup.pairs_opening, 4)?;
-                b.opening(&proof.lookup.multiplicity_opening, 2)?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.lookup.pairs_opening, 4)?;
+                    b.opening(&proof.lookup.multiplicity_opening, 2)?;
+                }
                 if proof.lookup.table_opening.is_some() { b.base_opening()?; }
                 b.virtual_proof(&proof.row_sum, 3)?;
                 b.virtual_proof(&proof.rescale, 3)?;
@@ -18463,9 +18563,9 @@ mod tests {
                 input.len().trailing_zeros().max(5) as usize).unwrap();
             let aux_desc = aux.descriptor.clone();
             let mut tp = Transcript::new(b"gelu-boundaries");
-            let (proof, _) = prove_reverse_gelu_index(&input, offset, 4, &point, value, aux, &mut tp).unwrap();
+            let (proof, _) = prove_reverse_gelu_index(&input, offset, 4, &point, value, aux, &mut tp, None).unwrap();
             let mut tv = Transcript::new(b"gelu-boundaries");
-            let leaves = verify_reverse_gelu_index(offset, 4, &point, value, Some(&aux_desc), &proof, &mut tv).unwrap();
+            let leaves = verify_reverse_gelu_index(offset, 4, &point, value, Some(&aux_desc), &proof, &mut tv, None).unwrap();
             assert!(leaves.iter().all(|(p, v)| ef_eval(&input, p) == *v));
         }
     }
@@ -18492,9 +18592,9 @@ mod tests {
             input.len().trailing_zeros().max(5) as usize).unwrap();
         let desc = aux.descriptor.clone();
         let (proof, _) = prove_reverse_gelu_index(input, offset, table_len, &point, value, aux,
-            &mut Transcript::new(b"gelu-bounds")).unwrap();
+            &mut Transcript::new(b"gelu-bounds"), None).unwrap();
         let leaves = verify_reverse_gelu_index(offset, table_len, &point, value, Some(&desc), &proof,
-            &mut Transcript::new(b"gelu-bounds")).unwrap();
+            &mut Transcript::new(b"gelu-bounds"), None).unwrap();
         leaves.iter().all(|(p, v)| ef_eval(input, p) == *v)
     }
 
@@ -18536,18 +18636,18 @@ mod tests {
         let aux = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
         let desc = aux.descriptor.clone();
         let (proof, _) = prove_reverse_gelu_index(&good, 0, 1, &point, value, aux,
-            &mut Transcript::new(b"gelu-neg")).unwrap();
+            &mut Transcript::new(b"gelu-neg"), None).unwrap();
         assert!(verify_reverse_gelu_index(0, 1, &point, value, Some(&desc), &proof,
-            &mut Transcript::new(b"gelu-neg")).is_some());
+            &mut Transcript::new(b"gelu-neg"), None).is_some());
 
         // Contract: non-power-of-two / > 2^24 table_len and |offset| > 2^24.
         for (off, tl) in [(0i64, 3usize), (0, 1usize << 25), (bound + 1, 1)] {
             let aux2 = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
             assert!(prove_reverse_gelu_index(&good, off, tl, &point, value, aux2,
-                &mut Transcript::new(b"gelu-neg")).is_none(),
+                &mut Transcript::new(b"gelu-neg"), None).is_none(),
                 "prover must reject contract violation off={off} tl={tl}");
             assert!(verify_reverse_gelu_index(off, tl, &point, value, Some(&desc), &proof,
-                &mut Transcript::new(b"gelu-neg")).is_none(),
+                &mut Transcript::new(b"gelu-neg"), None).is_none(),
                 "verifier must reject contract violation off={off} tl={tl}");
         }
 
@@ -18561,7 +18661,7 @@ mod tests {
         // consistency check still rejects.
         let aux3 = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
         assert!(prove_reverse_gelu_index(&low, 0, 1, &point, value, aux3,
-            &mut Transcript::new(b"gelu-neg")).is_none());
+            &mut Transcript::new(b"gelu-neg"), None).is_none());
 
         // Field-wrap attack: x = -(2^24+1) (to_i64 out of domain) but
         // x + offset mod p = 0 with offset = 2^24+1, inside the ReLU domain.
@@ -18573,7 +18673,7 @@ mod tests {
             "wrap input has no 25-bit x witness");
         let aux4 = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
         assert!(prove_reverse_gelu_index(&wrap_input, wrap_off, 1, &point, value, aux4,
-            &mut Transcript::new(b"gelu-neg")).is_none(),
+            &mut Transcript::new(b"gelu-neg"), None).is_none(),
             "wrap attack must fail closed at the x-range witness");
 
         // Verifier side: a forged x range eval is rejected by the aux-opening
@@ -18582,7 +18682,7 @@ mod tests {
         let mut forged = proof;
         forged.x_range.final_evals[1] += Ef::ONE;
         assert!(verify_reverse_gelu_index(0, 1, &point, value, Some(&desc), &forged,
-            &mut Transcript::new(b"gelu-neg")).is_none(),
+            &mut Transcript::new(b"gelu-neg"), None).is_none(),
             "forged range x eval must be rejected");
     }
 
@@ -18880,9 +18980,9 @@ mod tests {
         let pair_desc = pairs.descriptor.clone();
         let mult_desc = mult.descriptor.clone();
         let mut prover = Transcript::new(b"padded-identity-forgery");
-        let (proof, _, _) = prove_reverse_lookup(&store, &ops[0], &[], Ef::from(from_i64(3)), pairs, mult, &model, false, None, &mut prover).unwrap();
+        let (proof, _, _) = prove_reverse_lookup(&store, &ops[0], &[], Ef::from(from_i64(3)), pairs, mult, &model, false, None, &mut prover, None).unwrap();
         let mut verifier = Transcript::new(b"padded-identity-forgery");
-        assert!(verify_reverse_lookup(&ops[0], &[], Ef::from(from_i64(3)), &pair_desc, &mult_desc, &model, false, None, &proof, &mut verifier).is_none());
+        assert!(verify_reverse_lookup(&ops[0], &[], Ef::from(from_i64(3)), &pair_desc, &mult_desc, &model, false, None, &proof, &mut verifier, None).is_none());
     }
 
     #[test]
@@ -22580,10 +22680,10 @@ mod tests {
         let tie = topk_test_tie_commit(&sel_v, &d1_v, &d2_v, m, n, arity, 0);
         let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-test");
-        let (proof, claims) = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp)
+        let (proof, claims) = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp, None)
             .expect("honest reduction proof");
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-test");
-        let vclaims = verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &proof, &mut tv)
+        let vclaims = verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &proof, &mut tv, None)
             .expect("honest reduction must verify");
         assert_eq!(vclaims, claims);
         let _ = lgn;
@@ -22611,12 +22711,12 @@ mod tests {
         let bad_tie = topk_test_tie_commit(&sel_v, &bad_d1, &bad_d2s, m, n, arity, 0);
         let bad_tiedesc = bad_tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-bad-broadcast");
-        let bad = prove_reverse_topk(&store, &op, &bad_outs, bad_witness, bad_thr_aux, bad_range, bad_thr_range, bad_tie, &mut tp);
+        let bad = prove_reverse_topk(&store, &op, &bad_outs, bad_witness, bad_thr_aux, bad_range, bad_thr_range, bad_tie, &mut tp, None);
         assert!(bad.is_some(), "a malicious prover can commit and prove any witness columns");
         let (bad_proof, _) = bad.unwrap();
         let bad_thr_desc = topk_test_commit(0, AuxRole::TopKSelectThr, m, thr_arity, tcols).descriptor;
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-bad-broadcast");
-        assert!(verify_reverse_topk(&op, &bad_outs, &bad_wdesc, &bad_thr_desc, &bad_rdesc, &bad_trdesc, &bad_tiedesc, &bad_proof, &mut tv).is_none(),
+        assert!(verify_reverse_topk(&op, &bad_outs, &bad_wdesc, &bad_thr_desc, &bad_rdesc, &bad_trdesc, &bad_tiedesc, &bad_proof, &mut tv, None).is_none(),
             "non-broadcast thr_b must be rejected");
     }
 
@@ -22687,11 +22787,11 @@ mod tests {
         let tie = topk_test_tie_commit(&sel_v, &d1_v, &d2s_v, m, n, arity, 0);
         let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-no-attain");
-        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp);
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp, None);
         assert!(bad.is_some());
         let (bad_proof, _) = bad.unwrap();
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-no-attain");
-        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv).is_none(),
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv, None).is_none(),
             "a threshold not attained by a selected position must be rejected");
     }
 
@@ -22761,11 +22861,11 @@ mod tests {
         let tie = topk_test_tie_commit(&sel_v, &d1_v, &d2s_v, m, n, arity, 0);
         let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-tie");
-        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp);
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp, None);
         assert!(bad.is_some());
         let (bad_proof, _) = bad.unwrap();
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-tie");
-        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv).is_none(),
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv, None).is_none(),
             "selecting the larger index at a boundary tie must be rejected");
     }
 
@@ -22840,10 +22940,10 @@ mod tests {
             let trdesc = thr_range.descriptor.clone();
             let tiedesc = tie.descriptor.clone();
             let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-tie-forge");
-            let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp);
+            let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp, None);
             let (bad_proof, _) = match bad { Some(v) => v, None => return true };
             let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-tie-forge");
-            verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv).is_none()
+            verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv, None).is_none()
         };
 
         // A) forged t_b = 2 in row 0 (honest cutoff is 1).
@@ -22993,10 +23093,10 @@ mod tests {
         let trdesc = thr_range.descriptor.clone();
         let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-forged-bits");
-        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp)
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp, None)
             .expect("malicious tie witness is producible");
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-forged-bits");
-        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad.0, &mut tv).is_none(),
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad.0, &mut tv, None).is_none(),
             "sum-preserving forged bit decompositions must be rejected");
     }
 
@@ -23088,11 +23188,11 @@ mod tests {
         let tie = topk_test_tie_commit(&sel_v, &d1_v, &d2s_v, m, n, arity, 0);
         let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-wrap");
-        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp);
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp, None);
         assert!(bad.is_some(), "the prover can always emit rounds; the verifier must reject");
         let (bad_proof, _) = bad.unwrap();
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-wrap");
-        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv).is_none(),
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv, None).is_none(),
             "signed-range wrap (A=2^63, B=2^63-1) must be rejected");
     }
 
@@ -23194,11 +23294,11 @@ mod tests {
         let tie = topk_test_tie_commit(&sel_v, &d1_v, &d2s_v, m, n, arity, 0);
         let tiedesc = tie.descriptor.clone();
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-topk-nonbool");
-        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp);
+        let bad = prove_reverse_topk(&store, &op, &outs, witness, thr_aux, range, thr_range, tie, &mut tp, None);
         assert!(bad.is_some());
         let (bad_proof, _) = bad.unwrap();
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-topk-nonbool");
-        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv).is_none(),
+        assert!(verify_reverse_topk(&op, &outs, &wdesc, &tdesc, &rdesc, &trdesc, &tiedesc, &bad_proof, &mut tv, None).is_none(),
             "non-Boolean range bits must be rejected (Booleanity is essential)");
     }
     /// Review coverage: k = n selects every position, so row 1 (values
@@ -23577,7 +23677,7 @@ mod tests {
         let sout = vec![(tk, q_tok, v_tok), (ek, q_exp, v_exp)];
 
         let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-scatter-dup");
-        let (sproof, sclaims) = prove_reverse_scatter(&store, &scatter_op, &sout, scatter_aux, scatter_order, &mut tp)
+        let (sproof, sclaims) = prove_reverse_scatter(&store, &scatter_op, &sout, scatter_aux, scatter_order, &mut tp, None)
             .expect("malicious scatter proof is producible");
         assert_eq!(sclaims.len(), 1);
         let forged_sel_point = sclaims[0].point.clone();
@@ -23609,11 +23709,11 @@ mod tests {
             }
         }
         let (tproof, _) = prove_reverse_topk(&store, &topk_op, &tk_outs, witness, thr_aux,
-            range_aux, thr_range_aux, tie_aux, &mut tp)
+            range_aux, thr_range_aux, tie_aux, &mut tp, None)
             .expect("topk proof is producible with the forged sel claim");
 
         let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-scatter-dup");
-        assert!(verify_reverse_scatter(&scatter_op, &sout, &sdesc, &odesc, &sproof, &mut tv).is_none(),
+        assert!(verify_reverse_scatter(&scatter_op, &sout, &sdesc, &odesc, &sproof, &mut tv, None).is_none(),
             "duplicated routes violate the strict expert-major key order");
         let _ = (sclaims, wdesc, tdesc, rdesc, trdesc, tproof, tk_outs);
     }
