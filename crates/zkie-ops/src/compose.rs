@@ -2943,6 +2943,7 @@ fn prove_reverse_stable_softmax_index(store: &Store, op: &Op, point: &[Ef], valu
         || aux.descriptor.len != len || aux.descriptor.arity != lgl
         || aux.descriptor.columns != cols || aux.columns.len() != cols
         || aux.columns.iter().any(|c| c.len() != len) { return None; }
+    transcript.absorb(&bincode::serialize(&aux.descriptor.commitment).ok()?);
     let xv = store.get(x);
     let mv = store.get(mask);
     let idxs = store.idx.get(out)?;
@@ -3035,7 +3036,7 @@ fn prove_reverse_stable_softmax_index(store: &Store, op: &Op, point: &[Ef], valu
     let (range, z_c) = efo::prove_virtual(&range_mles, &range_terms, Ef::ZERO, transcript);
     let fe_c_len = 6 + cols - 6;
     if z_c.len() != lgl || range.final_evals.len() != fe_c_len { return None; }
-    let (bind, _) = efo::prove_same_poly_ef(
+    let (bind, merged) = efo::prove_same_poly_ef(
         &c[4], &[(point.to_vec(), value), (z_f.clone(), formula.final_evals[5])], transcript);
     let x_eval = ef_eval(xv, &z_f);
     let mask_eval = ef_eval(mv, &z_f);
@@ -3057,6 +3058,9 @@ fn prove_reverse_stable_softmax_index(store: &Store, op: &Op, point: &[Ef], valu
         idxs_o.push(col); points_o.push(z_c.clone());
         values_o.push(range.final_evals[col]);
     }
+    let mut r_pad = bind.merged_point.clone();
+    r_pad.resize(aux.descriptor.arity, Ef::ZERO);
+    idxs_o.push(4); points_o.push(r_pad); values_o.push(merged);
     let opening = open_aux(aux, &idxs_o, &points_o, &values_o)?;
     Some((ReverseStableSoftmaxIndexProof { formula, row, range, bind, x_eval, mask_eval, opening },
         vec![
@@ -3080,6 +3084,7 @@ fn verify_reverse_stable_softmax_index(op: &Op, point: &[Ef], value: Ef,
         || aux.len != len || aux.arity != lgl || aux.columns != cols
         || proof.formula.final_evals.len() != 7 || proof.row.final_evals.len() != 5
         || proof.range.final_evals.len() != cols { return None; }
+    transcript.absorb(&bincode::serialize(&aux.commitment).ok()?);
     transcript.absorb(b"zkie-stable-softmax-index-v1");
     transcript.absorb_u64(m as u64);
     transcript.absorb_u64(n as u64);
@@ -3116,8 +3121,10 @@ fn verify_reverse_stable_softmax_index(op: &Op, point: &[Ef], value: Ef,
     let fc = &proof.range.final_evals;
     if fc[0] != ef_eq_poly(&qc, &z_c) || fcc != efo::virtual_eval(&range_terms, fc) { return None; }
     if proof.x_eval + proof.mask_eval != ff[1] { return None; }
-    if efo::verify_same_poly(&proof.bind,
-        &[(point.to_vec(), value), (z_f.clone(), ff[5])], transcript).is_none() { return None; }
+    let (merged_point, merged) = efo::verify_same_poly(&proof.bind,
+        &[(point.to_vec(), value), (z_f.clone(), ff[5])], transcript)?;
+    let mut r_pad = merged_point;
+    r_pad.resize(aux.arity, Ef::ZERO);
     let mut idxs = Vec::new();
     let mut points = Vec::new();
     let mut values = Vec::new();
@@ -3134,6 +3141,7 @@ fn verify_reverse_stable_softmax_index(op: &Op, point: &[Ef], value: Ef,
     for col in 6..cols {
         idxs.push(col); points.push(z_c.clone()); values.push(fc[col]);
     }
+    idxs.push(4); points.push(r_pad); values.push(merged);
     if !verify_aux_open(aux, &idxs, &points, &values, &proof.opening) { return None; }
     Some(vec![
         EfClaim { tensor_id: x, point: z_f.clone(), value: proof.x_eval },
@@ -15940,9 +15948,9 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
     // safe and the verifier still checks the exact descriptor opening.
     let ssi_open_claims = ops.iter().filter_map(|op| match op {
         Op::StableSoftmaxIndex { table_len, .. } if table_len.is_power_of_two() =>
-            Some(13 + 3 * SSI_RANGE_BITS + table_len.trailing_zeros() as usize),
+            Some(14 + 3 * SSI_RANGE_BITS + table_len.trailing_zeros() as usize),
         _ => None,
-    }).max().unwrap_or(13 + 3 * SSI_RANGE_BITS);
+    }).max().unwrap_or(14 + 3 * SSI_RANGE_BITS);
     // B1 RmsNorm row opening: all row columns at the row endpoint plus
     // sum_sq/rstd/s_index at the broadcast points.
     let rms_row_claims = ops.iter().filter_map(|op| match op {
@@ -25728,6 +25736,91 @@ mod tests {
                 &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &e),
                 "tampered SSI execution {bad} must be rejected");
         }
+    }
+
+    /// AUDIT RED→GREEN (StableSoftmaxIndex): forged caller out claim with an
+    /// interpolating same_poly fake; the committed idx_f column at the merged
+    /// point rejects it.
+    #[test]
+    fn audit_stable_softmax_index_forged_output_claim_must_reject() {
+        let mut store = Store::new();
+        let (m, n, table_len, offset) = (4usize, 8usize, 16usize, 20i64);
+        let len = m * n;
+        let xv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64) * 7 % 23) - 11)).collect();
+        let mv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64) * 5 % 7) - 3)).collect();
+        let x = store.push(xv);
+        let mask = store.push(mv);
+        let out = store.push_idx(vec![]);
+        let ops = vec![Op::StableSoftmaxIndex { x, mask, out, offset, table_len, m, n }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops).with_index_shapes(&[(out, len)].into());
+        let lgl = len.trailing_zeros() as usize;
+        let point: Vec<Ef> = (0..lgl).map(|b| ef_u64(13 + b as u64)).collect();
+        let out_col: Vec<Goldilocks> = store.idx[out].iter()
+            .map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let genuine = ef_eval(&out_col, &point);
+        let forged = genuine + Ef::ONE;
+        let aux_prove = prepare_stable_softmax_index_aux(&store, &ops, &model)
+            .expect("aux").remove(0);
+        let commit = aux_prove.descriptor.commitment.clone();
+        let mut tp = Transcript::new(b"audit-ssi");
+        let (proof, _claims) = prove_reverse_stable_softmax_index(
+            &store, &ops[0], &point, genuine, aux_prove, &mut tp).expect("honest proof");
+        let mut tp = Transcript::new(b"audit-ssi");
+        tp.absorb(&bincode::serialize(&commit).unwrap());
+        tp.absorb(b"zkie-stable-softmax-index-v1");
+        tp.absorb_u64(m as u64); tp.absorb_u64(n as u64);
+        tp.absorb_u64(offset as u64); tp.absorb_u64(table_len as u64);
+        let _qf: Vec<Ef> = tp.ef_field_vec(lgl);
+        let g1 = tp.ef_field(); let g2 = tp.ef_field(); let g3 = tp.ef_field();
+        let ofs = ef_i64(offset);
+        let l1 = ef_u64((table_len - 1) as u64);
+        let f_terms = ssi_formula_terms(g1, g2, g3, ofs, l1);
+        let (okf, z_f, _fcf) = efo::verify_virtual(&proof.formula, &f_terms,
+            Ef::ZERO, lgl, &mut tp);
+        assert!(okf);
+        let r1 = tp.ef_field(); let r2 = tp.ef_field(); let r3 = tp.ef_field();
+        let n_inv = ef_u64(n as u64).inverse();
+        let row_terms = ssi_row_terms(r1, r2, r3, n_inv);
+        let (okr, _zr, _fcr) = efo::verify_virtual(&proof.row, &row_terms,
+            Ef::ZERO, lgl, &mut tp);
+        assert!(okr);
+        let _qc: Vec<Ef> = tp.ef_field_vec(lgl);
+        let gc = tp.ef_field();
+        let lg_l = table_len.trailing_zeros() as usize;
+        let range_terms = ssi_range_terms(gc, lg_l);
+        let (okc, _zc, _fcc) = efo::verify_virtual(&proof.range, &range_terms,
+            Ef::ZERO, lgl, &mut tp);
+        assert!(okc);
+        let ff5 = proof.formula.final_evals[5];
+        let out_ef = ef_lift(&out_col);
+        let d = forged - genuine;
+        let u0 = vec![Ef::ZERO; lgl];
+        let u1 = vec![Ef::ONE; lgl];
+        let v00 = efo::eq_poly(&u0, &point).unwrap();
+        let v01 = efo::eq_poly(&u1, &point).unwrap();
+        let v10 = efo::eq_poly(&u0, &z_f).unwrap();
+        let v11 = efo::eq_poly(&u1, &z_f).unwrap();
+        let det = v00 * v11 - v01 * v10;
+        let a = d * v11 * det.inverse();
+        let b = -d * v10 * det.inverse();
+        let chi0 = efo::eq_evals(&u0);
+        let chi1 = efo::eq_evals(&u1);
+        let f_fake: Vec<Ef> = (0..len).map(|i| out_ef[i] + a * chi0[i] + b * chi1[i]).collect();
+        let fake_bind = efo::prove_same_poly_ef(&f_fake,
+            &[(point.clone(), forged), (z_f.clone(), ff5)], &mut tp).0;
+        let mut forged_proof = proof;
+        forged_proof.bind = fake_bind;
+        let desc = prepare_stable_softmax_index_aux(&store, &ops, &model)
+            .expect("aux2").remove(0).descriptor;
+        let mut tv = Transcript::new(b"audit-ssi");
+        let got = verify_reverse_stable_softmax_index(&ops[0], &point, forged,
+            &desc, &forged_proof, &mut tv);
+        assert!(got.is_none(),
+            "AUDIT FAILURE: forged StableSoftmaxIndex output claim was ACCEPTED");
     }
 
     /// PR#45 B1: the RmsNorm row gadget must be pointwise zero for every
