@@ -12,8 +12,8 @@ was needed. GPT-2/TimesFM weight sets are present as well.
 Both examples fail closed exactly at the previously declared out-of-scope
 `LayerNormCentered` op, before any proof:
 
-- `docs/b2-evidence/gpt2-exit2.log`: exit 2, 13.57 s, peak RSS 5,982,908 KiB.
-- `docs/b2-evidence/timesfm-exit2.log`: exit 2 (see log).
+- `docs/b2-evidence/gpt2-exit2.txt`: exit 2, 13.57 s, peak RSS 5,982,908 KiB.
+- `docs/b2-evidence/timesfm-exit2.txt`: exit 2 (see log).
 
 No graph change was made.
 
