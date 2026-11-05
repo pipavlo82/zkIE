@@ -29,6 +29,12 @@ fn main() {
     let cached = commit_model_weights(&store, &ops, &cache_dir);
     let model = TrustedModelManifest::from_offline_commitment(
         &cached, &store.owned_slices(), &ops).with_index_shapes(&index_shapes(&store));
+    if std::env::var("ZKIE_BUDGET_ESTIMATE").is_ok() {
+        let ub = zkie_ops::compose::opening_upper_bound(&ops, &model)
+            .expect("opening upper bound");
+        println!("timesfm opening upper bound = {ub} (cap 64)");
+        return;
+    }
     let execution = match public_execution(&store, &ops, &cached) {
         Some(e) => e,
         None => {

@@ -137,13 +137,29 @@ Every widening keeps the Boolean decomposition canonical and charges one
 extra column/claim (Softmax: +1 remainder bit; SSI: +3 range columns per
 bit). The PCS opening count K is unchanged by these width changes.
 
-**Full-graph K implication.** With per-op static-table openings still
-charged, the monolithic B2 proof exceeds the 64-opening cap before any
-cryptographic check: GPT-2 has 144 Softmax exp-table + 25 LNC rsqrt
-openings (>=169) plus Argmax selectors (16), static lookup groups, token
-binding, pooled groups and weight batches; TimesFM has 320 + 20 (>=340).
-M4 per-table LogUp aggregation is required to collapse these to one per
-table before a complete bundle can verify.
+**M4a: per-table internal lookup commitments/openings.** All non-identity
+internal lookup tables (rsqrt for LNC/RmsNorm, exp for Softmax, range tables)
+are now committed once per proof (`prepare_static_lookup_commits`), and every
+per-op table opening is deferred into ONE batch opening per table
+(`BoundExecutionProof.internal_table_openings`, bundle version 4). In pooled
+mode a reduction records `(table_id, leaf point, leaf value)`; the verifier
+replays the same claims and checks one batch opening per table against the
+trusted root. This removes the per-op table commitments and openings but
+keeps the per-op LogUp witness/table fraction trees and multiplicity columns;
+M4b (aggregate multiplicity `M = Σ m_op` and a shared table fraction tree)
+remains for the memory/time reduction.
+
+Verifier-derived opening upper bound
+(`opening_upper_bound`, conservative): pooled aux groups + one internal table
+batch per shared table + two openings per static lookup group + one selector
+opening per Argmax + token binding + weight batches + Relu/Gelu bit openings.
+Measured: **GPT-2 51, TimesFM 48**, both below 64. (The S6 selector proof is
+one batch opening per Argmax with m claims, not m openings.)
+
+**Full-graph K implication.** Before M4a, per-op static-table openings put the monolithic B2 proof over
+the 64-opening cap by construction: GPT-2 had 144 Softmax exp-table + 25 LNC
+rsqrt openings (>=169) and TimesFM 320 + 20 (>=340). M4a collapses each
+table's openings to one, bringing the conservative bounds to 51 and 48.
 
 **Lesson (recorded per TL):** the first failure under a given width is not
 the maximum. A full-graph scan is required before sizing a range constant;

@@ -341,6 +341,8 @@ fn prepare_static_lookup_commits(
             // across all norm ops; commit each non-identity table once.
             Op::RmsNorm { rsqrt_table, limb_table, .. } =>
                 vec![*rsqrt_table, *limb_table],
+            Op::LayerNormCentered { rsqrt_table, .. } => vec![*rsqrt_table],
+            Op::Softmax { table, .. } => vec![*table],
             Op::RoPE { range_table, .. } => vec![*range_table],
             _ => continue,
         };
@@ -3771,6 +3773,10 @@ fn internal_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
     let table_opening = if model.identity_tables.contains_key(&table_id) {
         if table_eval != lookup_index_eval(&t_den_point) { return None; }
         None
+    } else if let Some(r) = rec.as_deref_mut() {
+        // M4: defer the table opening to one per-table batch proof.
+        r.record_table(table_id, &t_den_point, table_eval);
+        None
     } else if let Some((values, committed)) = store.static_table_commits.get(&table_id) {
         let arity = values.len().trailing_zeros() as usize;
         let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
@@ -3856,6 +3862,10 @@ fn internal_lookup_verify(table_id: T, pairs: &AuxDescriptor, multiplicity: &Aux
         if proof.table_opening.is_some() || proof.table_value != lookup_index_eval(&table.q_den) {
             return None;
         }
+    } else if let Some(r) = rec.as_deref_mut() {
+        // M4: the per-table batch opening is checked after the DAG.
+        if proof.table_opening.is_some() { return None; }
+        r.record_table(table_id, &table.q_den, proof.table_value);
     } else {
         let root = model.lookup_roots.get(&table_id)?;
         let opening = proof.table_opening.as_ref()?;
@@ -8738,13 +8748,31 @@ struct AuxOpenClaim {
     value: Ef,
 }
 
+/// M4: one deferred internal-table opening claim (non-identity table).
+#[derive(Clone)]
+struct InternalTableClaim {
+    table_id: T,
+    point: Vec<Ef>,
+    value: Ef,
+}
+
+/// M4: one per-table batch opening covering all internal lookups of a table.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InternalTableOpening {
+    table_id: T,
+    proof: EfBatchOpeningProof,
+}
+
 struct AuxOpenRecorder {
     plan: AuxPlan,
     claims: Vec<AuxOpenClaim>,
+    table_claims: Vec<InternalTableClaim>,
 }
 
 impl AuxOpenRecorder {
-    fn new(plan: AuxPlan) -> Self { Self { plan, claims: Vec::new() } }
+    fn new(plan: AuxPlan) -> Self {
+        Self { plan, claims: Vec::new(), table_claims: Vec::new() }
+    }
 
     fn record(&mut self, descriptor: &AuxDescriptor, idxs: &[usize],
         points: &[Vec<Ef>], values: &[Ef]) -> Option<()>
@@ -8758,6 +8786,31 @@ impl AuxOpenRecorder {
             });
         }
         Some(())
+    }
+
+    fn record_table(&mut self, table_id: T, point: &[Ef], value: Ef) {
+        self.table_claims.push(InternalTableClaim {
+            table_id, point: point.to_vec(), value,
+        });
+    }
+
+    fn table_ids(&self) -> Vec<T> {
+        let mut v: Vec<T> = self.table_claims.iter().map(|c| c.table_id).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn table_claims_for(&self, table_id: T) -> Vec<(Vec<Ef>, Ef)> {
+        let mut v: Vec<(Vec<Ef>, Ef)> = self.table_claims.iter()
+            .filter(|c| c.table_id == table_id)
+            .map(|c| (c.point.clone(), c.value)).collect();
+        v.sort_by(|a, b| {
+            let ka = bincode::serialize(&(&a.0, a.1)).unwrap_or_default();
+            let kb = bincode::serialize(&(&b.0, b.1)).unwrap_or_default();
+            ka.cmp(&kb)
+        });
+        v
     }
 
     fn groups_with_claims(&self) -> Vec<usize> {
@@ -8812,6 +8865,131 @@ fn build_pooled_aux_openings(rec: &AuxOpenRecorder,
         out.push(AuxGroupOpening { group, proof });
     }
     Some(out)
+}
+
+/// Number of internal-lookup table-opening claims contributed by each
+/// non-identity shared table, derived from the trusted graph. Used by the
+/// verifier budget (one batch opening per table, claims = member count).
+/// Verifier-derived upper bound on `ProofBudget.openings` for a monolithic
+/// proof of `ops`: pooled aux groups (at most one opening each), one internal
+/// table batch per shared non-identity table, two openings per static lookup
+/// group, one selector opening per Argmax position, one token binding, and
+/// one weight-batch opening per manifest batch. Per-op internal table
+/// openings are batched away by M4, and identity/dynamic tables do not open.
+pub fn opening_upper_bound(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<usize>
+{
+    let plan = build_aux_plan(ops, model)?;
+    let aux_groups = plan.groups.len();
+    let internal_tables = internal_lookup_member_counts(ops, model).len();
+    let lookup_groups = static_lookup_groups(ops, model)?.len();
+    // S6 selector openings: ONE batch opening per Argmax op (its m points are
+    // claims of that single opening), not m openings.
+    let sel: usize = ops.iter().filter(|op| matches!(op, Op::Argmax { .. })).count();
+    // Relu and GeluIndex keep per-op committed bit openings in every layout
+    // (they do not have an aux-group opening): one for Relu, two for
+    // GeluIndex (upper and lower range proofs).
+    let relu_ops = ops.iter().filter(|o| matches!(o, Op::Relu { .. })).count();
+    let gelu_ops = ops.iter().filter(|o| matches!(o, Op::GeluIndex { .. })).count();
+    let mut total = aux_groups;
+    total = total.checked_add(internal_tables)?;
+    total = total.checked_add(lookup_groups.checked_mul(2)?)?;
+    total = total.checked_add(sel)?;
+    total = total.checked_add(relu_ops)?;
+    total = total.checked_add(gelu_ops.checked_mul(2)?)?;
+    total = total.checked_add(1)?; // token binding (upper bound)
+    total = total.checked_add(model.batches.len())?;
+    Some(total)
+}
+
+fn internal_lookup_member_counts(ops: &[Op], model: &TrustedModelManifest)
+    -> std::collections::BTreeMap<T, usize>
+{
+    let mut out: std::collections::BTreeMap<T, usize> = Default::default();
+    let mut add = |t: T, n: usize| {
+        if !model.identity_tables.contains_key(&t) {
+            *out.entry(t).or_default() += n;
+        }
+    };
+    for op in ops {
+        match op {
+            Op::Softmax { table, .. } => add(*table, 1),
+            Op::LayerNormCentered { rsqrt_table, .. } => add(*rsqrt_table, 1),
+            // RmsNorm: one rsqrt lookup plus four limb lookups (the limb
+            // table is identity by contract; counting it here keeps the
+            // budget safe if that ever changes).
+            Op::RmsNorm { rsqrt_table, limb_table, .. } => {
+                add(*rsqrt_table, 1);
+                add(*limb_table, 4);
+            }
+            // RoPE performs two internal lookups on the same range table.
+            Op::RoPE { range_table, .. } => add(*range_table, 2),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// M4: one batch opening per non-identity internal table, covering every
+/// per-op table leaf (same table index at multiple points).
+fn build_internal_table_openings(rec: &AuxOpenRecorder, store: &Store,
+    model: &TrustedModelManifest) -> Option<Vec<InternalTableOpening>>
+{
+    let mut out = Vec::new();
+    for tid in rec.table_ids() {
+        let claims = rec.table_claims_for(tid);
+        if claims.is_empty() { continue; }
+        let len = *model.lookup_lengths.get(&tid)?;
+        let arity = table_pad_arity(len)?;
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let (values, commitment, prover_data) =
+            if let Some((values, committed)) = store.static_table_commits.get(&tid) {
+                (values.clone(), committed.commitment.clone(), committed.prover_data.clone())
+            } else {
+                let values = pad_lookup_table(store.get(tid));
+                if values.len() != padded { return None; }
+                let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+                let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+                let committed = zkie_core::pcs::committed::commit(&whir, &values);
+                if bincode::serialize(&committed.commitment).ok()?
+                    != bincode::serialize(model.lookup_roots.get(&tid)?).ok()? { return None; }
+                (values, committed.commitment, committed.prover_data)
+            };
+        if values.len() != padded { return None; }
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+        let protocol = whir.batch_opening_protocol(1, arity);
+        let idxs = vec![0usize; claims.len()];
+        let points: Vec<Vec<Ef>> = claims.iter().map(|c| c.0.clone()).collect();
+        let values_claimed: Vec<Ef> = claims.iter().map(|c| c.1).collect();
+        let proof = prove_batch_open_committed_ef(&whir, &commitment, &protocol, 1,
+            prover_data, &idxs, vec![values], &points, &values_claimed).ok()?;
+        out.push(InternalTableOpening { table_id: tid, proof });
+    }
+    Some(out)
+}
+
+fn verify_internal_table_openings(rec: &AuxOpenRecorder,
+    model: &TrustedModelManifest, openings: &[InternalTableOpening]) -> bool
+{
+    let want = rec.table_ids();
+    if openings.len() != want.len() { return false; }
+    for (o, tid) in openings.iter().zip(want) {
+        if o.table_id != tid { return false; }
+        let claims = rec.table_claims_for(tid);
+        if claims.is_empty() { return false; }
+        let len = match model.lookup_lengths.get(&tid) { Some(v) => *v, None => return false };
+        let arity = match table_pad_arity(len) { Some(v) => v, None => return false };
+        let root = match model.lookup_roots.get(&tid) { Some(v) => v, None => return false };
+        let whir = match verifier_whir(arity) { Some(w) => w, None => return false };
+        let protocol = whir.batch_opening_protocol(1, arity);
+        let idxs = vec![0usize; claims.len()];
+        let points: Vec<Vec<Ef>> = claims.iter().map(|c| c.0.clone()).collect();
+        let values: Vec<Ef> = claims.iter().map(|c| c.1).collect();
+        if !verify_batch_open_committed_ef(&whir, root, &protocol, 1,
+            &idxs, &points, &values, &o.proof) { return false; }
+    }
+    true
 }
 
 fn verify_pooled_aux_openings(rec: &AuxOpenRecorder, groups: &[AuxGroupDescriptor],
@@ -9425,6 +9603,11 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
     } else if model.identity_tables.contains_key(&table_id) {
         if table_eval != lookup_index_eval(&t_den_point) { return None; }
         None
+    } else if let Some(r) = rec.as_deref_mut() {
+        // M4: the Softmax fake-Lookup path defers its static table opening to
+        // the per-table batch proof.
+        r.record_table(table_id, &t_den_point, table_eval);
+        None
     } else if let Some((values, committed)) = store.static_table_commits.get(&table_id) {
         let arity = values.len().trailing_zeros() as usize;
         let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
@@ -9538,6 +9721,11 @@ fn verify_reverse_lookup(op: &Op, point: &[Ef], value: Ef, pairs: &AuxDescriptor
     } else if let Some(&len) = model.identity_tables.get(&table_id) {
         if model.lookup_lengths.get(&table_id) != Some(&len) || proof.table_opening.is_some()
             || proof.table_value != lookup_index_eval(&table.q_den) { return None; }
+    } else if let Some(r) = rec.as_deref_mut() {
+        // M4: batch this table leaf with every other internal lookup of the
+        // same table; checked once after the DAG.
+        if proof.table_opening.is_some() { return None; }
+        r.record_table(table_id, &table.q_den, proof.table_value);
     } else {
         let root = model.lookup_roots.get(&table_id)?;
         let opening = proof.table_opening.as_ref()?;
@@ -16372,6 +16560,9 @@ pub struct BoundExecutionProof {
     aux_layout: u32,
     /// O7-deep M2: deferred pooled aux openings (one per group with claims).
     aux_pooled: Vec<AuxGroupOpening>,
+    /// M4: one batch opening per non-identity internal lookup table,
+    /// covering every per-op table leaf (replaces per-op table openings).
+    internal_table_openings: Vec<InternalTableOpening>,
     reverse: ReverseDagProof,
     weight_openings: Vec<WeightBatchOpening>,
     sel_openings: Vec<BoundSelOpening>,
@@ -17299,6 +17490,9 @@ pub fn prove_committed_shard_dag_bound(
     let (reverse, prover_leaves) = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution), &lookup_groups, Some(&mut aux_recorder))?;
     if trace { eprintln!("PROVE stage pooled aux openings"); }
     let aux_pooled = build_pooled_aux_openings(&aux_recorder, &aux_prepared_groups)?;
+    if trace { eprintln!("PROVE stage internal table openings"); }
+    let internal_table_openings =
+        build_internal_table_openings(&aux_recorder, store, model)?;
     if trace { eprintln!("PROVE stage weight grouping"); }
     // O2 (TL Q3): the prover uses its own residual claims; the verifier-side
     // replay is optional, for separately-accounted self-verify measurements
@@ -17394,7 +17588,8 @@ pub fn prove_committed_shard_dag_bound(
         weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: Some(opening) });
     }
     Some(BoundExecutionProof { aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION,
-        aux_pooled, reverse, weight_openings, sel_openings, token_binding })
+        aux_pooled, internal_table_openings, reverse, weight_openings,
+        sel_openings, token_binding })
 }
 
 /// S9 2c verifier budget over the proof's randomized checks. Degrees are
@@ -17823,6 +18018,13 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             b.opening(&o.proof, cols)?;
         }
     }
+    // M4: one internal-table batch opening per shared table; the claim count
+    // is verifier-derived from the trusted graph (not proof-supplied).
+    let internal_members = internal_lookup_member_counts(ops, model);
+    for t in &proof.internal_table_openings {
+        let claims = *internal_members.get(&t.table_id)?;
+        b.opening(&t.proof, claims)?;
+    }
     for w in &proof.weight_openings {
         if let Some(p) = &w.proof { b.opening(p, w.points.len())?; }
     }
@@ -17901,6 +18103,9 @@ pub fn verify_committed_shard_dag_bound(
         Some(v) => v, None => return false,
     };
     if !verify_pooled_aux_openings(&aux_recorder, &proof.aux_groups, &proof.aux_pooled) {
+        return false;
+    }
+    if !verify_internal_table_openings(&aux_recorder, model, &proof.internal_table_openings) {
         return false;
     }
     let weights: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
@@ -24462,7 +24667,8 @@ mod tests {
             Some(&model), Some(&certified), Some(&execution), &std::collections::BTreeMap::new(), None).expect("forged bound proof is producible");
         let proof = BoundExecutionProof {
             aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION, aux_pooled: Vec::new(),
-            reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None,
+            internal_table_openings: Vec::new(), reverse, weight_openings: vec![],
+            sel_openings: vec![], token_binding: None,
         };
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
             &PublicStatement::Generic, &model, &execution),
@@ -24771,8 +24977,8 @@ mod tests {
         let (reverse, _leaves) = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
             Some(&model), Some(&certified), Some(&execution), &std::collections::BTreeMap::new(), None).expect("forged proof producible");
         let proof = BoundExecutionProof { aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION,
-            aux_pooled: Vec::new(), reverse, weight_openings: vec![], sel_openings: vec![],
-            token_binding: None };
+            aux_pooled: Vec::new(), internal_table_openings: Vec::new(), reverse,
+            weight_openings: vec![], sel_openings: vec![], token_binding: None };
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
             &PublicStatement::Generic, &model, &execution),
             "the signed order proof must reject the swapped expert-major enumeration");
@@ -27997,6 +28203,147 @@ mod tests {
                 refs, &model, &proof, &mut tv, None).is_none(),
                 "edge n_real={n_real} forged value accepted");
         }
+    }
+
+    /// M4: two LNC ops sharing one rsqrt table produce ONE per-table batch
+    /// opening (not two), the pooled proof verifies, and the budget charges a
+    /// single internal-table opening.
+    #[test]
+    fn m4_lnc_shared_table_batch_roundtrip() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let (m, d, n_real) = (4usize, 8usize, 5usize);
+        let len = m * d;
+        let mk = |off: i64| -> Vec<Goldilocks> {
+            (0..len).map(|i| from_i64(((i as i64 * 7 + off) % 17) - 8)).collect()
+        };
+        let x1v = mk(0); let x2v = mk(3);
+        let w1v: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 5) % 9) + 1)).collect();
+        let w2v: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 3) % 7) + 1)).collect();
+        let b1v: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 2) % 5) - 2)).collect();
+        let b2v: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 3) % 5) - 2)).collect();
+        let x1 = store.push(x1v.clone());
+        let x2 = store.push(x2v.clone());
+        let w1 = store.push(w1v);
+        let w2 = store.push(w2v);
+        let b1 = store.push(b1v);
+        let b2 = store.push(b2v);
+        let out1 = store.push(vec![Goldilocks::ZERO; len]);
+        let out2 = store.push(vec![Goldilocks::ZERO; len]);
+        let rsqrt_t = store.push((0..32).map(|i| from_i64(1000 + i as i64)).collect());
+        let ops = vec![
+            Op::LayerNormCentered { x: x1, w: w1, b: b1, out: out1,
+                rsqrt_table: rsqrt_t, m, d, n_real },
+            Op::LayerNormCentered { x: x2, w: w2, b: b2, out: out2,
+                rsqrt_table: rsqrt_t, m, d, n_real },
+        ];
+        forward_ops(&mut store, &ops);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-m4-lnc");
+        let model = TrustedModelManifest::from_offline_commitment(
+            &cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(x1, x1v), (x2, x2v)].into(),
+            outputs: [(out1, store.get(out1).to_vec()),
+                      (out2, store.get(out2).to_vec())].into(),
+        };
+        let whir = Whir::new_testing(5);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir,
+            &cached, 0, 0, &PublicStatement::Generic, &model, &execution)
+            .expect("M4 shared-table bound proof");
+        assert_eq!(proof.internal_table_openings.len(), 1,
+            "one batch opening per shared rsqrt table");
+        let budget = proof_budget(&proof, &proof.aux, &ops, &model).expect("budget");
+        let ub = opening_upper_bound(&ops, &model).expect("upper bound");
+        assert!(budget.openings <= ub,
+            "actual K={} exceeds verifier upper bound {ub}", budget.openings);
+        assert!(budget.openings <= MAX_EFFECTIVE_OPENINGS,
+            "M4 shared-table K={} exceeds cap", budget.openings);
+        let mut lnc_steps = 0usize;
+        for step in &proof.reverse.steps {
+            if let ReverseReduction::Lnc { proof } = &step.reduction {
+                lnc_steps += 1;
+                assert!(proof.rsqrt.table_opening.is_none(),
+                    "pooled LNC must defer the table opening");
+            }
+        }
+        assert_eq!(lnc_steps, 2);
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution),
+            "M4 shared-table proof must verify");
+        let mut bad = proof;
+        bad.internal_table_openings[0].proof.evals[0] += Ef::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad,
+            &PublicStatement::Generic, &model, &execution),
+            "tampered per-table batch opening must be rejected");
+    }
+
+    /// M4: two Softmax ops sharing one exp table produce one batch table
+    /// opening and verify through the bound entry.
+    #[test]
+    fn m4_softmax_shared_table_batch_roundtrip() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let (m, n) = (4usize, 8usize);
+        let len = m * n;
+        let table = store.push((0..32)
+            .map(|i| from_i64(10842 + (i % 2) as i64)).collect());
+        let idx1 = store.push_idx((0..len)
+            .map(|i| [1u32, 1, 1, 1, 1, 0, 0, 0][i % 8]).collect());
+        let idx2 = store.push_idx((0..len)
+            .map(|i| [0u32, 1, 1, 1, 0, 1, 0, 1][i % 8]).collect());
+        let e1 = store.push(vec![Goldilocks::ZERO; len]);
+        let e2 = store.push(vec![Goldilocks::ZERO; len]);
+        let out1 = store.push(vec![Goldilocks::ZERO; len]);
+        let out2 = store.push(vec![Goldilocks::ZERO; len]);
+        let ops = vec![
+            Op::Softmax { idx: idx1, e: e1, out: out1, table, m, n },
+            Op::Softmax { idx: idx2, e: e2, out: out2, table, m, n },
+        ];
+        forward_ops(&mut store, &ops);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-m4-softmax");
+        let model = TrustedModelManifest::from_offline_commitment(
+            &cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx1, len), (idx2, len)].into());
+        let idx_g = |id: usize| -> Vec<Goldilocks> {
+            store.idx[id].iter().map(|&x| Goldilocks::from_u64(x as u64)).collect()
+        };
+        let execution = TrustedExecution {
+            inputs: [(TensorKey::Index(idx1).encoded().unwrap(), idx_g(idx1)),
+                     (TensorKey::Index(idx2).encoded().unwrap(), idx_g(idx2))].into(),
+            outputs: [(out1, store.get(out1).to_vec()),
+                      (out2, store.get(out2).to_vec())].into(),
+        };
+        let whir = Whir::new_testing(5);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir,
+            &cached, 0, 0, &PublicStatement::Generic, &model, &execution)
+            .expect("M4 softmax shared-table bound proof");
+        eprintln!("M4 softmax table openings = {}", proof.internal_table_openings.len());
+        assert_eq!(proof.internal_table_openings.len(), 1,
+            "one batch opening per shared exp table");
+        let budget = proof_budget(&proof, &proof.aux, &ops, &model).expect("budget");
+        assert!(budget.openings <= MAX_EFFECTIVE_OPENINGS,
+            "M4 softmax shared-table K={} exceeds cap", budget.openings);
+        let mut sm_steps = 0usize;
+        for step in &proof.reverse.steps {
+            if let ReverseReduction::Softmax { proof } = &step.reduction {
+                sm_steps += 1;
+                assert!(proof.lookup.table_opening.is_none(),
+                    "pooled Softmax must defer the table opening");
+            }
+        }
+        assert_eq!(sm_steps, 2);
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution),
+            "M4 softmax shared-table proof must verify");
+        let mut bad = proof;
+        bad.internal_table_openings[0].proof.evals[0] += Ef::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad,
+            &PublicStatement::Generic, &model, &execution),
+            "tampered Softmax per-table batch opening must be rejected");
     }
 
     /// AUDIT (LNC): a malicious prover keeps the honest virtual proofs and

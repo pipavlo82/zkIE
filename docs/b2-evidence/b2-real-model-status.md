@@ -147,3 +147,21 @@ Rerun on `fix/soundness-repair` after the eight per-op out-witness fixes
   aux preparation. M4 per-table LogUp aggregation is the required next step
   (it collapses the 144/320 Softmax openings and 25/20 LNC rsqrt openings
   to one per table).
+
+## Diagnosis of the commit_aux_groups stop, and M4a
+
+The GPT-2 and TimesFM runs that stopped after `PROVE stage
+commit_aux_groups` were terminated by the operator (`SIGTERM`, exit 143)
+after the structural over-cap result; they did not panic. stderr contained
+only the stage markers; dmesg shows no OOM; RSS at stop was ~108 GB
+(GPT-2) and ~72 GB (TimesFM). GPT-2 had already completed
+`commit_aux_groups` (10 groups) and was in the next stage; TimesFM was
+inside the group commit for 4534 aux descriptors.
+
+M4a (this push): static table commits now include the Softmax exp table and
+the LayerNormCentered rsqrt table (once per proof), and every per-op
+internal table opening is deferred to one batch opening per table
+(`internal_table_openings`, bundle version 4). Verifier-derived opening
+upper bounds are now GPT-2 51 and TimesFM 48, below the 64 cap. The per-op
+LogUp table fraction trees and multiplicity columns remain (M4b), which is
+where the remaining time/memory for rsqrt/exp aggregation sits.
