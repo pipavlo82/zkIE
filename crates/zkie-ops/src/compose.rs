@@ -335,29 +335,35 @@ fn prepare_static_lookup_commits(
     let written = op_field_writes(ops);
     let mut seen = std::collections::BTreeSet::new();
     for op in ops {
-        let tid = match op {
-            Op::Lookup { table, .. } => *table,
+        let tids: Vec<T> = match op {
+            Op::Lookup { table, .. } => vec![*table],
+            // B1: RmsNorm's rsqrt/limb lookups share the same static tables
+            // across all norm ops; commit each non-identity table once.
+            Op::RmsNorm { rsqrt_table, limb_table, .. } =>
+                vec![*rsqrt_table, *limb_table],
             _ => continue,
         };
-        if written.contains(&tid) || model.identity_tables.contains_key(&tid) {
-            continue; // dynamic table or identity table: no static opening
+        for tid in tids {
+            if written.contains(&tid) || model.identity_tables.contains_key(&tid) {
+                continue; // dynamic table or identity table: no static opening
+            }
+            if !seen.insert(tid) {
+                continue;
+            }
+            let values = pad_lookup_table(store.get(tid));
+            let arity = values.len().trailing_zeros() as usize;
+            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+            let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+            let committed = zkie_core::pcs::committed::commit(&whir, &values);
+            if bincode::serialize(&committed.commitment).ok()?
+                != bincode::serialize(model.lookup_roots.get(&tid)?).ok()?
+            {
+                return None;
+            }
+            store.o7_table_commits.fetch_add(1, Ordering::Relaxed);
+            store.o7_table_scan_bytes.fetch_add((values.len() * std::mem::size_of::<Goldilocks>()) as u64, Ordering::Relaxed);
+            store.static_table_commits.insert(tid, (values, committed));
         }
-        if !seen.insert(tid) {
-            continue;
-        }
-        let values = pad_lookup_table(store.get(tid));
-        let arity = values.len().trailing_zeros() as usize;
-        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
-        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
-        let committed = zkie_core::pcs::committed::commit(&whir, &values);
-        if bincode::serialize(&committed.commitment).ok()?
-            != bincode::serialize(model.lookup_roots.get(&tid)?).ok()?
-        {
-            return None;
-        }
-        store.o7_table_commits.fetch_add(1, Ordering::Relaxed);
-        store.o7_table_scan_bytes.fetch_add((values.len() * std::mem::size_of::<Goldilocks>()) as u64, Ordering::Relaxed);
-        store.static_table_commits.insert(tid, (values, committed));
     }
     Some(())
 }
@@ -450,6 +456,10 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
         // the reduction, so both field tensors are reverse inputs.
         Op::StableSoftmaxIndex { x, mask, out, .. } =>
             Some((vec![f(*x)?, f(*mask)?], vec![i(*out)?])),
+        // B1: RMSNorm reads x and the (possibly broadcast) weight w; the
+        // rsqrt/limb tables are trusted static tables authenticated by the
+        // manifest roots, not execution inputs.
+        Op::RmsNorm { x, w, out, .. } => Some((vec![f(*x)?, f(*w)?], vec![f(*out)?])),
         _ => None,
     }
 }
@@ -2996,6 +3006,905 @@ fn verify_reverse_stable_softmax_index(op: &Op, point: &[Ef], value: Ef,
     ])
 }
 
+// PR#45 B1: RmsNorm reverse reduction.
+//
+// Forward (rms_norm.rs): ms = round(sum_j<n_real x_j^2 / n_real);
+// s_index = rsqrt_index(ms) (public round + three-branch piecewise shift);
+// rstd = rsqrt_table[s_index]; out = round(x * rstd * w / 2^32) with
+// rem_out = x*rstd*w - 2^32*out + 2^31 in [0,2^32), split into two 16-bit
+// limbs. The reduction commits every internal scalar and proves:
+//   * row virtual: mean-square truncation, rem_s/delta range, the
+//     rsqrt_index piecewise map (rounding + branch ranges + 8/16 shifts);
+//   * mean-square virtual over the m*d domain: sum_j<n_real x_j^2 equals the
+//     committed per-row sum_sq (public prefix selector, no padding trust);
+//   * out virtual over the m*d domain: the 2^32 rounding identity, with
+//     rstd broadcast from the committed row vector;
+//   * aux-only lookups: rstd = rsqrt_table[s_index] and rem_lo/rem_hi in
+//     [0,2^16) via the trusted limb table.
+const RMS_RAW_BITS: usize = 40;
+const RMS_REM_RAW_BITS: usize = 18;
+const RMS_FINE: i64 = 1 << 20;
+const RMS_COARSE: i64 = 1 << 22;
+const RMS_COARSE_END: i64 = RMS_FINE + (RMS_COARSE << 8);
+const RMS_D0_BITS: usize = 20;
+const RMS_D1B_BITS: usize = 30;
+const RMS_M1_BITS: usize = RMS_RAW_BITS - 8;
+const RMS_M2_BITS: usize = 24;
+const RMS_U1_BITS: usize = 8;
+const RMS_U2_BITS: usize = 16;
+const RMS_MS: usize = 0;
+const RMS_SUM_SQ: usize = 1;
+const RMS_REM_S: usize = 2;
+const RMS_RSTD: usize = 3;
+const RMS_SIDX: usize = 4;
+const RMS_RAW: usize = 5;
+const RMS_VALUE_COLS: usize = 6;
+
+#[derive(Clone, Copy)]
+struct RmsRowLayout {
+    b: usize,
+    rem_s_off: usize,
+    delta_off: usize,
+    rem_raw_off: usize,
+    br_off: usize,
+    d0_off: usize,
+    d1a_off: usize,
+    d1b_off: usize,
+    d2_off: usize,
+    m1_off: usize,
+    u1_off: usize,
+    m2_off: usize,
+    u2_off: usize,
+    raw_off: usize,
+    columns: usize,
+}
+
+fn rms_row_layout(n_real: usize) -> Option<RmsRowLayout> {
+    let b = n_real.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let mut off = RMS_VALUE_COLS;
+    let rem_s_off = off; off = off.checked_add(b)?;
+    let delta_off = off; off = off.checked_add(b)?;
+    let rem_raw_off = off; off = off.checked_add(RMS_REM_RAW_BITS)?;
+    let br_off = off; off = off.checked_add(3)?;
+    let d0_off = off; off = off.checked_add(RMS_D0_BITS)?;
+    let d1a_off = off; off = off.checked_add(RMS_RAW_BITS)?;
+    let d1b_off = off; off = off.checked_add(RMS_D1B_BITS)?;
+    let d2_off = off; off = off.checked_add(RMS_RAW_BITS)?;
+    let m1_off = off; off = off.checked_add(RMS_M1_BITS)?;
+    let u1_off = off; off = off.checked_add(RMS_U1_BITS)?;
+    let m2_off = off; off = off.checked_add(RMS_M2_BITS)?;
+    let u2_off = off; off = off.checked_add(RMS_U2_BITS)?;
+    let raw_off = off; off = off.checked_add(RMS_RAW_BITS)?;
+    Some(RmsRowLayout { b, rem_s_off, delta_off, rem_raw_off, br_off, d0_off,
+        d1a_off, d1b_off, d2_off, m1_off, u1_off, m2_off, u2_off, raw_off, columns: off })
+}
+
+fn rms_round_div(a: i64, b: i64) -> i64 {
+    let q = a.div_euclid(b);
+    let r = a.rem_euclid(b);
+    if r * 2 >= b { q + 1 } else { q }
+}
+
+fn rms_bits(cols: &mut [Vec<Goldilocks>], row: usize, off: usize, width: usize, val: u64)
+    -> Option<()>
+{
+    if width < 64 && (val >> width) != 0 { return None; }
+    for k in 0..width {
+        cols[off + k][row] = Goldilocks::from_u64((val >> k) & 1);
+    }
+    Some(())
+}
+
+/// Build one row of the RmsNorm witness from the forward scalars. Rejects any
+/// value that does not satisfy the exact integer rounding/branch relations.
+fn rms_row_witness(ms: i64, sum_sq: i64, rem_s: i64, rstd: Goldilocks,
+    s_index: u32, n_real: usize, lay: &RmsRowLayout, cols: &mut [Vec<Goldilocks>], row: usize)
+    -> Option<()>
+{
+    if n_real == 0 || n_real > (1usize << 32) { return None; }
+    let n = n_real as i64;
+    let half = n / 2;
+    let raw = rms_round_div(ms, 1i64 << 18);
+    if !(0..(1i64 << RMS_RAW_BITS)).contains(&raw) { return None; }
+    let rem_raw = ms.checked_sub(raw.checked_mul(1i64 << 18)?)?
+        .checked_add(1i64 << 17)?;
+    if !(0..(1i64 << RMS_REM_RAW_BITS)).contains(&rem_raw) { return None; }
+    let delta = n.checked_sub(1)?.checked_sub(rem_s)?;
+    if rem_s < 0 || delta < 0 || rem_s >= n { return None; }
+    let bwidth = lay.b;
+    if bwidth < 63 && ((rem_s as u64) >> bwidth) != 0 { return None; }
+    if bwidth < 63 && ((delta as u64) >> bwidth) != 0 { return None; }
+    let b0: i64;
+    let b1: i64;
+    let b2: i64;
+    let (d0, d1a, d1b, d2, m1, u1, m2, u2);
+    if raw < RMS_FINE {
+        b0 = 1; b1 = 0; b2 = 0;
+        let expect = raw;
+        if expect != s_index as i64 { return None; }
+        d0 = RMS_FINE - 1 - raw;
+        d1a = 0; d1b = 0; d2 = 0; m1 = 0; u1 = 0; m2 = 0; u2 = 0;
+    } else if raw < RMS_COARSE_END {
+        b0 = 0; b1 = 1; b2 = 0;
+        let diff = raw - RMS_FINE;
+        let expect = RMS_FINE + (diff >> 8);
+        if expect != s_index as i64 { return None; }
+        d0 = 0;
+        d1a = diff;
+        d1b = RMS_COARSE_END - 1 - raw;
+        d2 = 0;
+        m1 = diff >> 8;
+        u1 = diff & 0xff;
+        m2 = 0; u2 = 0;
+    } else {
+        b0 = 0; b1 = 0; b2 = 1;
+        let diff = raw - RMS_COARSE_END;
+        let expect = RMS_FINE + RMS_COARSE + (diff >> 16);
+        if expect != s_index as i64 { return None; }
+        d0 = 0; d1a = 0; d1b = 0;
+        d2 = diff;
+        m1 = 0; u1 = 0;
+        m2 = diff >> 16;
+        u2 = diff & 0xffff;
+    }
+    if !(0..(1i64 << RMS_D0_BITS)).contains(&d0) { return None; }
+    if !(0..(1i64 << RMS_RAW_BITS)).contains(&d1a) { return None; }
+    if !(0..(1i64 << RMS_D1B_BITS)).contains(&d1b) { return None; }
+    if !(0..(1i64 << RMS_RAW_BITS)).contains(&d2) { return None; }
+    if !(0..(1i64 << RMS_M1_BITS)).contains(&m1) { return None; }
+    if !(0..(1i64 << RMS_U1_BITS)).contains(&u1) { return None; }
+    if !(0..(1i64 << RMS_M2_BITS)).contains(&m2) { return None; }
+    if !(0..(1i64 << RMS_U2_BITS)).contains(&u2) { return None; }
+    // Exact integer identities (the virtual proves them over the field).
+    if n.checked_mul(ms)?.checked_add(rem_s)?.checked_sub(sum_sq)?
+        .checked_sub(half)? != 0 { return None; }
+    if ms != raw.checked_mul(1i64 << 18)?.checked_add(rem_raw)?
+        .checked_sub(1i64 << 17)? { return None; }
+    if b0 == 1 && raw.checked_add(d0)? != RMS_FINE - 1 { return None; }
+    if b1 == 1 {
+        if raw.checked_sub(RMS_FINE)? != d1a
+            || RMS_COARSE_END - 1 - raw != d1b
+            || d1a.checked_sub(m1.checked_mul(256)?.checked_add(u1)?)? != 0
+            || s_index as i64 != RMS_FINE + m1 { return None; }
+    }
+    if b2 == 1 {
+        if raw.checked_sub(RMS_COARSE_END)? != d2
+            || d2.checked_sub(m2.checked_mul(65536)?.checked_add(u2)?)? != 0
+            || s_index as i64 != RMS_FINE + RMS_COARSE + m2 { return None; }
+    }
+    if b0 == 1 && s_index as i64 != raw { return None; }
+    cols[RMS_MS][row] = from_i64(ms);
+    cols[RMS_SUM_SQ][row] = from_i64(sum_sq);
+    cols[RMS_REM_S][row] = from_i64(rem_s);
+    cols[RMS_RSTD][row] = rstd;
+    cols[RMS_SIDX][row] = Goldilocks::from_u64(s_index as u64);
+    cols[RMS_RAW][row] = from_i64(raw);
+    rms_bits(cols, row, lay.rem_s_off, lay.b, rem_s as u64)?;
+    rms_bits(cols, row, lay.delta_off, lay.b, delta as u64)?;
+    rms_bits(cols, row, lay.rem_raw_off, RMS_REM_RAW_BITS, rem_raw as u64)?;
+    cols[lay.br_off][row] = Goldilocks::from_u64(b0 as u64);
+    cols[lay.br_off + 1][row] = Goldilocks::from_u64(b1 as u64);
+    cols[lay.br_off + 2][row] = Goldilocks::from_u64(b2 as u64);
+    rms_bits(cols, row, lay.d0_off, RMS_D0_BITS, d0 as u64)?;
+    rms_bits(cols, row, lay.d1a_off, RMS_RAW_BITS, d1a as u64)?;
+    rms_bits(cols, row, lay.d1b_off, RMS_D1B_BITS, d1b as u64)?;
+    rms_bits(cols, row, lay.d2_off, RMS_RAW_BITS, d2 as u64)?;
+    rms_bits(cols, row, lay.m1_off, RMS_M1_BITS, m1 as u64)?;
+    rms_bits(cols, row, lay.u1_off, RMS_U1_BITS, u1 as u64)?;
+    rms_bits(cols, row, lay.m2_off, RMS_M2_BITS, m2 as u64)?;
+    rms_bits(cols, row, lay.u2_off, RMS_U2_BITS, u2 as u64)?;
+    rms_bits(cols, row, lay.raw_off, RMS_RAW_BITS, raw as u64)?;
+    Some(())
+}
+
+fn rms_row_terms(gamma: Ef, n_real: usize, lay: &RmsRowLayout)
+    -> Vec<(Ef, Vec<usize>)>
+{
+    let n = ef_u64(n_real as u64);
+    let half = ef_u64((n_real / 2) as u64);
+    let mut t: Vec<(Ef, Vec<usize>)> = Vec::new();
+    let mut gp = Ef::ONE;
+    let mut next = |gp: &mut Ef| { let w = *gp; *gp = *gp * gamma; w };
+    let ix = |col: usize| 1 + col;
+    let bits = |t: &mut Vec<(Ef, Vec<usize>)>, w: Ef, off: usize, width: usize,
+        extra: Option<usize>| {
+        for k in 0..width {
+            let c = w * ef_u64(1u64 << k);
+            let mut idxs = vec![0usize];
+            if let Some(e) = extra { idxs.push(e); }
+            idxs.push(ix(off + k));
+            t.push((c, idxs));
+        }
+    };
+    // E1: n*ms + rem_s - sum_sq - n/2 = 0.
+    let w = next(&mut gp);
+    t.push((w * n, vec![0, ix(RMS_MS)]));
+    t.push((w, vec![0, ix(RMS_REM_S)]));
+    t.push((-w, vec![0, ix(RMS_SUM_SQ)]));
+    t.push((-w * half, vec![0]));
+    // E2: rem_s + delta - (n-1) = 0, delta from its bits.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(RMS_REM_S)]));
+    bits(&mut t, w, lay.delta_off, lay.b, None);
+    t.push((-w * ef_u64((n_real - 1) as u64), vec![0]));
+    // E3: rem_s decomposition.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(RMS_REM_S)]));
+    bits(&mut t, -w, lay.rem_s_off, lay.b, None);
+    // E5: ms - 2^18*raw - rem_raw + 2^17 = 0, rem_raw from its bits.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(RMS_MS)]));
+    t.push((-w * ef_u64(1u64 << 18), vec![0, ix(RMS_RAW)]));
+    bits(&mut t, -w, lay.rem_raw_off, RMS_REM_RAW_BITS, None);
+    t.push((w * ef_u64(1u64 << 17), vec![0]));
+    // E6: raw decomposition (non-negative, < 2^40).
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(RMS_RAW)]));
+    bits(&mut t, -w, lay.raw_off, RMS_RAW_BITS, None);
+    // E8: branch one-hot.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(lay.br_off)]));
+    t.push((w, vec![0, ix(lay.br_off + 1)]));
+    t.push((w, vec![0, ix(lay.br_off + 2)]));
+    t.push((-w, vec![0]));
+    // E10: b0*(raw + d0 - (FINE-1)) = 0.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(lay.br_off), ix(RMS_RAW)]));
+    bits(&mut t, w, lay.d0_off, RMS_D0_BITS, Some(ix(lay.br_off)));
+    t.push((-w * ef_u64((RMS_FINE - 1) as u64), vec![0, ix(lay.br_off)]));
+    // E12: b1*(raw - FINE - d1a) = 0.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(lay.br_off + 1), ix(RMS_RAW)]));
+    bits(&mut t, -w, lay.d1a_off, RMS_RAW_BITS, Some(ix(lay.br_off + 1)));
+    t.push((-w * ef_u64(RMS_FINE as u64), vec![0, ix(lay.br_off + 1)]));
+    // E14: b1*(COARSE_END-1 - raw - d1b) = 0.
+    let w = next(&mut gp);
+    t.push((-w, vec![0, ix(lay.br_off + 1), ix(RMS_RAW)]));
+    bits(&mut t, -w, lay.d1b_off, RMS_D1B_BITS, Some(ix(lay.br_off + 1)));
+    t.push((w * ef_u64((RMS_COARSE_END - 1) as u64), vec![0, ix(lay.br_off + 1)]));
+    // E16: b2*(raw - COARSE_END - d2) = 0.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(lay.br_off + 2), ix(RMS_RAW)]));
+    bits(&mut t, -w, lay.d2_off, RMS_RAW_BITS, Some(ix(lay.br_off + 2)));
+    t.push((-w * ef_u64(RMS_COARSE_END as u64), vec![0, ix(lay.br_off + 2)]));
+    // E18: b1*(raw - FINE - 256*m1 - u1) = 0.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(lay.br_off + 1), ix(RMS_RAW)]));
+    bits(&mut t, -w * ef_u64(256), lay.m1_off, RMS_M1_BITS, Some(ix(lay.br_off + 1)));
+    bits(&mut t, -w, lay.u1_off, RMS_U1_BITS, Some(ix(lay.br_off + 1)));
+    t.push((-w * ef_u64(RMS_FINE as u64), vec![0, ix(lay.br_off + 1)]));
+    // E21: b1*(s_index - FINE - m1) = 0.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(lay.br_off + 1), ix(RMS_SIDX)]));
+    bits(&mut t, -w, lay.m1_off, RMS_M1_BITS, Some(ix(lay.br_off + 1)));
+    t.push((-w * ef_u64(RMS_FINE as u64), vec![0, ix(lay.br_off + 1)]));
+    // E22: b2*(raw - COARSE_END - 65536*m2 - u2) = 0.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(lay.br_off + 2), ix(RMS_RAW)]));
+    bits(&mut t, -w * ef_u64(65536), lay.m2_off, RMS_M2_BITS, Some(ix(lay.br_off + 2)));
+    bits(&mut t, -w, lay.u2_off, RMS_U2_BITS, Some(ix(lay.br_off + 2)));
+    t.push((-w * ef_u64(RMS_COARSE_END as u64), vec![0, ix(lay.br_off + 2)]));
+    // E25: b2*(s_index - FINE - COARSE - m2) = 0.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(lay.br_off + 2), ix(RMS_SIDX)]));
+    bits(&mut t, -w, lay.m2_off, RMS_M2_BITS, Some(ix(lay.br_off + 2)));
+    t.push((-w * ef_u64((RMS_FINE + RMS_COARSE) as u64), vec![0, ix(lay.br_off + 2)]));
+    // E26: b0*(s_index - raw) = 0.
+    let w = next(&mut gp);
+    t.push((w, vec![0, ix(lay.br_off), ix(RMS_SIDX)]));
+    t.push((-w, vec![0, ix(lay.br_off), ix(RMS_RAW)]));
+    // Booleanity of every bit column, one gamma power per constraint.
+    let groups = [
+        (lay.rem_s_off, lay.b), (lay.delta_off, lay.b),
+        (lay.rem_raw_off, RMS_REM_RAW_BITS), (lay.br_off, 3),
+        (lay.d0_off, RMS_D0_BITS), (lay.d1a_off, RMS_RAW_BITS),
+        (lay.d1b_off, RMS_D1B_BITS), (lay.d2_off, RMS_RAW_BITS),
+        (lay.m1_off, RMS_M1_BITS), (lay.u1_off, RMS_U1_BITS),
+        (lay.m2_off, RMS_M2_BITS), (lay.u2_off, RMS_U2_BITS),
+        (lay.raw_off, RMS_RAW_BITS),
+    ];
+    for (off, width) in groups {
+        for k in 0..width {
+            let c = gp;
+            gp = gp * gamma;
+            t.push((c, vec![0, ix(off + k), ix(off + k)]));
+            t.push((-c, vec![0, ix(off + k)]));
+        }
+    }
+    t
+}
+
+fn rms_norm_dims(op: &Op) -> Option<(T, T, T, T, T, usize, usize, usize)> {
+    match op {
+        Op::RmsNorm { x, w, out, rsqrt_table, limb_table, m, d, n_real } => {
+            if !m.is_power_of_two() || !d.is_power_of_two() || *n_real == 0
+                || *n_real > *d { return None; }
+            let len = m.checked_mul(*d)?;
+            if len < 32 || !len.is_power_of_two() { return None; }
+            Some((*x, *w, *out, *rsqrt_table, *limb_table, *m, *d, *n_real))
+        }
+        _ => None,
+    }
+}
+
+fn rms_row_arity(m: usize) -> Option<usize> {
+    let lg = m.trailing_zeros() as usize;
+    Some(lg.max(5))
+}
+
+fn table_pad_arity(len: usize) -> Option<usize> {
+    if len == 0 { return None; }
+    Some(len.checked_next_power_of_two()?.max(32).trailing_zeros() as usize)
+}
+
+struct RmsWitness {
+    row: Vec<Vec<Goldilocks>>,
+    out: Vec<Vec<Goldilocks>>,
+    rsqrt_pairs: Vec<Vec<Goldilocks>>,
+    limb_pairs: Vec<Vec<Goldilocks>>,
+    rsqrt_mult: Vec<Goldilocks>,
+    limb_lo_mult: Vec<Goldilocks>,
+    limb_hi_mult: Vec<Goldilocks>,
+}
+
+/// Recompute the complete RmsNorm witness from the forward tensors. Shared by
+/// aux preparation and the prover's fail-closed self-check.
+fn build_rms_witness(store: &Store, op: &Op, model: &TrustedModelManifest)
+    -> Option<RmsWitness>
+{
+    let (_x, _w, out, rsqrt_table, limb_table, m, d, n_real) = rms_norm_dims(op)?;
+    let len = m.checked_mul(d)?;
+    let lay = rms_row_layout(n_real)?;
+    let arity = rms_row_arity(m)?;
+    let padded_rows = 1usize.checked_shl(arity as u32)?;
+    let rsqrt_len = *model.lookup_lengths.get(&rsqrt_table)?;
+    let limb_len = *model.lookup_lengths.get(&limb_table)?;
+    if rsqrt_len == 0 || limb_len == 0 { return None; }
+    let rsqrt_values = store.get(rsqrt_table);
+    if rsqrt_values.len() != rsqrt_len { return None; }
+    let limb_values = store.get(limb_table);
+    if limb_values.len() != limb_len { return None; }
+    let (ms, s_index, rstd, fwd_out, _rem_out, rem_lo, rem_hi, sum_sq, rem_s) =
+        rms_norm_forward(store.get(_x), store.get(_w), rsqrt_values, m, d, n_real);
+    if fwd_out.as_slice() != store.get(out) || ms.len() != m || rstd.len() != m
+        || sum_sq.len() != m || rem_s.len() != m { return None; }
+    let mut row = vec![vec![Goldilocks::ZERO; padded_rows]; lay.columns];
+    for r in 0..m {
+        rms_row_witness(to_i64(ms[r]), to_i64(sum_sq[r]), to_i64(rem_s[r]),
+            rstd[r], s_index[r], n_real, &lay, &mut row, r)?;
+    }
+    let table0 = rsqrt_values[0];
+    for r in m..padded_rows {
+        rms_row_witness(0, 0, (n_real / 2) as i64, table0, 0, n_real,
+            &lay, &mut row, r)?;
+    }
+    let mut out_cols = vec![vec![Goldilocks::ZERO; len]; 2];
+    for i in 0..len {
+        out_cols[0][i] = rem_lo[i];
+        out_cols[1][i] = rem_hi[i];
+    }
+    let mut rsqrt_pairs = vec![vec![Goldilocks::ZERO; padded_rows]; 2];
+    for r in 0..m {
+        rsqrt_pairs[0][r] = Goldilocks::from_u64(s_index[r] as u64);
+        rsqrt_pairs[1][r] = rstd[r];
+    }
+    let limb_pairs = out_cols.clone();
+    let mut rsqrt_mult = vec![Goldilocks::ZERO; rsqrt_len];
+    for r in 0..m { rsqrt_mult[s_index[r] as usize] += Goldilocks::ONE; }
+    let mut limb_lo_mult = vec![Goldilocks::ZERO; limb_len];
+    let mut limb_hi_mult = vec![Goldilocks::ZERO; limb_len];
+    for i in 0..len {
+        let lo = to_i64(rem_lo[i]);
+        let hi = to_i64(rem_hi[i]);
+        if !(0..limb_len as i64).contains(&lo) || !(0..limb_len as i64).contains(&hi) {
+            return None;
+        }
+        limb_lo_mult[lo as usize] += Goldilocks::ONE;
+        limb_hi_mult[hi as usize] += Goldilocks::ONE;
+    }
+    let _ = limb_values;
+    Some(RmsWitness { row, out: out_cols, rsqrt_pairs, limb_pairs,
+        rsqrt_mult, limb_lo_mult, limb_hi_mult })
+}
+
+struct RmsAux {
+    row: PreparedAux,
+    out: PreparedAux,
+    rsqrt_pairs: PreparedAux,
+    rsqrt_mult: PreparedAux,
+    limb_lo_pairs: PreparedAux,
+    limb_lo_mult: PreparedAux,
+    limb_hi_pairs: PreparedAux,
+    limb_hi_mult: PreparedAux,
+}
+
+#[derive(Clone, Copy)]
+struct RmsAuxRefs<'a> {
+    row: &'a AuxDescriptor,
+    out: &'a AuxDescriptor,
+    rsqrt_pairs: &'a AuxDescriptor,
+    rsqrt_mult: &'a AuxDescriptor,
+    limb_lo_pairs: &'a AuxDescriptor,
+    limb_lo_mult: &'a AuxDescriptor,
+    limb_hi_pairs: &'a AuxDescriptor,
+    limb_hi_mult: &'a AuxDescriptor,
+}
+
+/// Aux-only static-table lookup: the index/value pair columns live in
+/// `pairs`, the occurrence counts in `multiplicity`, and the table is the
+/// trusted tensor `table_id` (identity or committed root). No store index
+/// tensor and no returned claim.
+fn rms_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
+    multiplicity: PreparedAux, idx_col: usize, val_col: usize,
+    xs: &[u32], ys: &[Goldilocks], point: &[Ef], value: Ef,
+    model: &TrustedModelManifest, transcript: &mut Transcript)
+    -> Option<RmsInternalLookupProof>
+{
+    if idx_col >= 2 || val_col >= 2 || point.len() != pairs.descriptor.arity
+        || pairs.descriptor.columns != 2 ||
+        multiplicity.descriptor.columns != 1 || xs.len() != pairs.descriptor.len
+        || ys.len() != xs.len() { return None; }
+    let table_len = *model.lookup_lengths.get(&table_id)?;
+    if multiplicity.descriptor.len != table_len { return None; }
+    let output_index = ef_eval(&pairs.columns[idx_col], point);
+    if ef_eval(&pairs.columns[val_col], point) != value { return None; }
+    transcript.absorb_ef(output_index);
+    let alpha = transcript.ef_field();
+    let beta = transcript.ef_field();
+    let (witness, _, _, w_num_col, w_den_col) =
+        zkie_core::common::ef_logup::prove_lookup_witness_batch_columns(
+            &[xs], &[ys], alpha, beta, transcript);
+    let (w_final_num, w_final_den) = fraction_root(w_num_col, w_den_col)?;
+    if w_final_den == Ef::ZERO { return None; }
+    let (w_num_point, w_num, w_den_point, w_den) =
+        zkie_core::common::ef_logup::fractional_leaf(&witness);
+    if w_num != lookup_prefix_eval(xs.len(), &w_num_point) { return None; }
+    let witness_index = ef_eval(&pairs.columns[idx_col], &w_den_point);
+    let witness_value = ef_eval(&pairs.columns[val_col], &w_den_point);
+    if w_den != alpha + witness_index + beta * witness_value { return None; }
+
+    let cached_values = store.static_table_commits.get(&table_id).map(|(v, _)| v.as_slice());
+    let table_values_owned = if cached_values.is_none() {
+        Some(pad_lookup_table(store.get(table_id)))
+    } else { None };
+    let table_values: &[Goldilocks] = cached_values
+        .unwrap_or_else(|| table_values_owned.as_deref().unwrap());
+    if table_values.len() != (1usize << multiplicity.descriptor.arity) { return None; }
+    let counts: Vec<u64> = multiplicity.columns[0].iter()
+        .map(|&v| to_i64(v) as u64).collect();
+    let (tnum, tden) = zkie_core::common::ef_logup::build_lookup_table_num_den(
+        &counts, table_values, alpha, beta);
+    let table = zkie_core::common::ef_logup::prove_fractional(tnum, tden, transcript);
+    let (t_num_point, t_num, t_den_point, t_den) =
+        zkie_core::common::ef_logup::fractional_leaf(&table);
+    let mult_eval = ef_eval(&multiplicity.columns[0], &t_num_point);
+    let table_eval = ef_eval(table_values, &t_den_point);
+    if t_num != mult_eval
+        || t_den != alpha + lookup_index_eval(&t_den_point) + beta * table_eval {
+        return None;
+    }
+    transcript.absorb_efs(&[witness_index, witness_value, mult_eval, table_eval]);
+    let q = transcript.ef_field_vec(multiplicity.descriptor.arity);
+    let eq = efo::eq_evals(&q);
+    let mult_cols = lift_columns(&multiplicity.columns);
+    let mut padding_mask = vec![Ef::ZERO; multiplicity.columns[0].len()];
+    for v in padding_mask.iter_mut().skip(multiplicity.descriptor.len) { *v = Ef::ONE; }
+    let padding_terms = vec![(Ef::ONE, vec![0usize, 1usize, 2usize])];
+    let (padding, padding_point) = efo::prove_virtual(
+        &[&eq, &mult_cols[0], &padding_mask], &padding_terms, Ef::ZERO, transcript);
+    let padding_value = padding.final_evals[1];
+    let pairs_opening = open_aux(pairs, &[idx_col, val_col, idx_col, val_col],
+        &[point.to_vec(), point.to_vec(), w_den_point.clone(), w_den_point],
+        &[output_index, value, witness_index, witness_value])?;
+    let multiplicity_opening = open_aux(multiplicity, &[0, 0],
+        &[t_num_point, padding_point], &[mult_eval, padding_value])?;
+    let table_opening = if model.identity_tables.contains_key(&table_id) {
+        if table_eval != lookup_index_eval(&t_den_point) { return None; }
+        None
+    } else if let Some((values, committed)) = store.static_table_commits.get(&table_id) {
+        let arity = values.len().trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+        let (opening, opened) = whir.open_ef(committed.prover_data.clone(),
+            &committed.protocol, &t_den_point);
+        if opened != table_eval { return None; }
+        Some(opening)
+    } else {
+        let arity = table_values.len().trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+        let committed = zkie_core::pcs::committed::commit(&whir, table_values);
+        if bincode::serialize(model.lookup_roots.get(&table_id)?).ok()?
+            != bincode::serialize(&committed.commitment).ok()? { return None; }
+        let (opening, opened) = whir.open_ef(committed.prover_data,
+            &committed.protocol, &t_den_point);
+        if opened != table_eval { return None; }
+        Some(opening)
+    };
+    Some(RmsInternalLookupProof { witness, table, output_index, witness_index,
+        witness_value, multiplicity: mult_eval, table_value: table_eval, padding,
+        pairs_opening, multiplicity_opening, table_opening })
+}
+
+fn rms_lookup_verify(table_id: T, pairs: &AuxDescriptor, multiplicity: &AuxDescriptor,
+    idx_col: usize, val_col: usize, point: &[Ef], value: Ef,
+    model: &TrustedModelManifest, proof: &RmsInternalLookupProof,
+    transcript: &mut Transcript) -> Option<()>
+{
+    if idx_col >= 2 || val_col >= 2 || point.len() != pairs.arity
+        || pairs.columns != 2 || multiplicity.columns != 1
+        || multiplicity.arity >= usize::BITS as usize { return None; }
+    if multiplicity.len != *model.lookup_lengths.get(&table_id)? { return None; }
+    transcript.absorb_ef(proof.output_index);
+    let alpha = transcript.ef_field();
+    let beta = transcript.ef_field();
+    let witness = zkie_core::common::ef_logup::verify_fractional_chain_core(
+        &proof.witness, pairs.arity, transcript)?;
+    if witness.final_den == Ef::ZERO
+        || witness.num_leaf != lookup_prefix_eval(pairs.len, &witness.q_num)
+        || witness.den_leaf != alpha + proof.witness_index + beta * proof.witness_value {
+        return None;
+    }
+    let table = zkie_core::common::ef_logup::verify_fractional_chain_core(
+        &proof.table, multiplicity.arity, transcript)?;
+    if table.final_den == Ef::ZERO
+        || witness.final_num * table.final_den != table.final_num * witness.final_den
+        || table.num_leaf != proof.multiplicity
+        || table.den_leaf != alpha + lookup_index_eval(&table.q_den) + beta * proof.table_value {
+        return None;
+    }
+    transcript.absorb_efs(&[proof.witness_index, proof.witness_value,
+        proof.multiplicity, proof.table_value]);
+    if proof.padding.final_evals.len() != 3 { return None; }
+    let q = transcript.ef_field_vec(multiplicity.arity);
+    let padding_terms = vec![(Ef::ONE, vec![0usize, 1usize, 2usize])];
+    let (ok, padding_point, fc) = efo::verify_virtual(&proof.padding, &padding_terms,
+        Ef::ZERO, multiplicity.arity, transcript);
+    if !ok || fc != ef_eq_poly(&q, &padding_point) * proof.padding.final_evals[1]
+        * (Ef::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) {
+        return None;
+    }
+    let points = vec![point.to_vec(), point.to_vec(),
+        witness.q_den.clone(), witness.q_den.clone()];
+    let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
+    if !verify_aux_open(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values, &proof.pairs_opening) {
+        return None;
+    }
+    if !verify_aux_open(multiplicity, &[0, 0],
+        &[table.q_num.clone(), padding_point],
+        &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) {
+        return None;
+    }
+    if model.identity_tables.contains_key(&table_id) {
+        if proof.table_opening.is_some() || proof.table_value != lookup_index_eval(&table.q_den) {
+            return None;
+        }
+    } else {
+        let root = model.lookup_roots.get(&table_id)?;
+        let opening = proof.table_opening.as_ref()?;
+        let whir = verifier_whir(multiplicity.arity)?;
+        let protocol = whir.opening_protocol(multiplicity.arity, 1);
+        if whir.verify_ef(root, opening, &protocol, &table.q_den).ok()
+            != Some(proof.table_value) { return None; }
+    }
+    Some(())
+}
+
+fn rms_mult_matches(columns: &[Vec<Goldilocks>], expected: &[Goldilocks]) -> bool {
+    if columns.len() != 1 { return false; }
+    let col = &columns[0];
+    if expected.len() > col.len() || col[..expected.len()] != *expected { return false; }
+    col[expected.len()..].iter().all(|&v| v == Goldilocks::ZERO)
+}
+
+fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    aux: RmsAux, model: &TrustedModelManifest, transcript: &mut Transcript)
+    -> Option<(ReverseRmsNormProof, Vec<EfClaim>)>
+{
+    let (x, w, out, rsqrt_id, limb_id, m, d, n_real) = rms_norm_dims(op)?;
+    let len = m.checked_mul(d)?;
+    let lg_len = len.trailing_zeros() as usize;
+    let lg_d = d.trailing_zeros() as usize;
+    let lg_m = m.trailing_zeros() as usize;
+    let arity = rms_row_arity(m)?;
+    let padded_rows = 1usize << arity;
+    let lay = rms_row_layout(n_real)?;
+    let rsqrt_len = *model.lookup_lengths.get(&rsqrt_id)?;
+    let limb_len = *model.lookup_lengths.get(&limb_id)?;
+    let rsqrt_ar = table_pad_arity(rsqrt_len)?;
+    let limb_ar = table_pad_arity(limb_len)?;
+    let rmult = 1usize << rsqrt_ar;
+    let lmult = 1usize << limb_ar;
+    if point.len() != lg_len
+        || aux.row.descriptor.role != AuxRole::RmsNormRowWitness
+        || aux.row.descriptor.len != m || aux.row.descriptor.arity != arity
+        || aux.row.descriptor.columns != lay.columns
+        || aux.row.columns.len() != lay.columns
+        || aux.row.columns.iter().any(|c| c.len() != padded_rows)
+        || aux.out.descriptor.role != AuxRole::RmsNormOutWitness
+        || aux.out.descriptor.len != len || aux.out.descriptor.arity != lg_len
+        || aux.out.descriptor.columns != 2 || aux.out.columns.len() != 2
+        || aux.out.columns.iter().any(|c| c.len() != len)
+        || aux.rsqrt_pairs.descriptor.role != AuxRole::RmsNormRsqrtPairs
+        || aux.rsqrt_pairs.descriptor.len != m || aux.rsqrt_pairs.descriptor.arity != arity
+        || aux.rsqrt_pairs.descriptor.columns != 2 || aux.rsqrt_pairs.columns.len() != 2
+        || aux.rsqrt_pairs.columns.iter().any(|c| c.len() != padded_rows)
+        || aux.rsqrt_mult.descriptor.role != AuxRole::RmsNormRsqrtMultiplicity
+        || aux.rsqrt_mult.descriptor.len != rsqrt_len
+        || aux.rsqrt_mult.descriptor.arity != rsqrt_ar
+        || aux.rsqrt_mult.descriptor.columns != 1
+        || aux.rsqrt_mult.columns.len() != 1 || aux.rsqrt_mult.columns[0].len() != rmult
+        || aux.limb_lo_pairs.descriptor.role != AuxRole::RmsNormLimbLoPairs
+        || aux.limb_lo_pairs.descriptor.len != len || aux.limb_lo_pairs.descriptor.arity != lg_len
+        || aux.limb_lo_pairs.descriptor.columns != 2 || aux.limb_lo_pairs.columns.len() != 2
+        || aux.limb_lo_pairs.columns.iter().any(|c| c.len() != len)
+        || aux.limb_hi_pairs.descriptor.role != AuxRole::RmsNormLimbHiPairs
+        || aux.limb_hi_pairs.descriptor.len != len || aux.limb_hi_pairs.descriptor.arity != lg_len
+        || aux.limb_hi_pairs.descriptor.columns != 2 || aux.limb_hi_pairs.columns.len() != 2
+        || aux.limb_hi_pairs.columns.iter().any(|c| c.len() != len)
+        || aux.limb_lo_mult.descriptor.role != AuxRole::RmsNormLimbLoMultiplicity
+        || aux.limb_lo_mult.descriptor.len != limb_len
+        || aux.limb_lo_mult.descriptor.arity != limb_ar
+        || aux.limb_lo_mult.descriptor.columns != 1
+        || aux.limb_lo_mult.columns.len() != 1 || aux.limb_lo_mult.columns[0].len() != lmult
+        || aux.limb_hi_mult.descriptor.role != AuxRole::RmsNormLimbHiMultiplicity
+        || aux.limb_hi_mult.descriptor.len != limb_len
+        || aux.limb_hi_mult.descriptor.arity != limb_ar
+        || aux.limb_hi_mult.descriptor.columns != 1
+        || aux.limb_hi_mult.columns.len() != 1 || aux.limb_hi_mult.columns[0].len() != lmult
+    { return None; }
+    let expected = build_rms_witness(store, op, model)?;
+    if aux.row.columns != expected.row || aux.out.columns != expected.out
+        || aux.rsqrt_pairs.columns != expected.rsqrt_pairs
+        || aux.limb_lo_pairs.columns != expected.limb_pairs
+        || aux.limb_hi_pairs.columns != expected.limb_pairs
+        || !rms_mult_matches(&aux.rsqrt_mult.columns, &expected.rsqrt_mult)
+        || !rms_mult_matches(&aux.limb_lo_mult.columns, &expected.limb_lo_mult)
+        || !rms_mult_matches(&aux.limb_hi_mult.columns, &expected.limb_hi_mult)
+    { return None; }
+
+    transcript.absorb(b"zkie-rmsnorm-v1");
+    transcript.absorb_u64(m as u64);
+    transcript.absorb_u64(d as u64);
+    transcript.absorb_u64(n_real as u64);
+    transcript.absorb_u64(rsqrt_len as u64);
+    transcript.absorb_u64(limb_len as u64);
+    let u_row = transcript.ef_field_vec(arity);
+    let g_row = transcript.ef_field();
+    let row_terms = rms_row_terms(g_row, n_real, &lay);
+    let eq_u = efo::eq_evals(&u_row);
+    let row_cols_ef = lift_columns(&aux.row.columns);
+    let mut row_mles: Vec<&[Ef]> = Vec::with_capacity(1 + lay.columns);
+    row_mles.push(&eq_u);
+    for c in &row_cols_ef { row_mles.push(c.as_slice()); }
+    let (row_vp, z_row) = efo::prove_virtual(&row_mles, &row_terms, Ef::ZERO, transcript);
+    if z_row.len() != arity || row_vp.final_evals.len() != 1 + lay.columns {
+        return None;
+    }
+
+    let mut rstd_b = vec![Ef::ZERO; len];
+    let mut sum_sq_b = vec![Ef::ZERO; len];
+    for i in 0..len {
+        rstd_b[i] = Ef::from(aux.row.columns[RMS_RSTD][i / d]);
+        sum_sq_b[i] = Ef::from(aux.row.columns[RMS_SUM_SQ][i / d]);
+    }
+    let x_ef = ef_lift(store.get(x));
+    let w_ef = ef_lift(store.get(w));
+    let out_ef = ef_lift(store.get(out));
+    if x_ef.len() != len || w_ef.len() != len || out_ef.len() != len { return None; }
+
+    let u_ms = transcript.ef_field_vec(lg_m);
+    let g_ms = transcript.ef_field();
+    let eq_r = efo::eq_evals(&u_ms);
+    let mut eq_b = vec![Ef::ZERO; len];
+    for i in 0..len { eq_b[i] = eq_r[i / d]; }
+    let mut rho = vec![Ef::ZERO; len];
+    for i in 0..len { if i % d < n_real { rho[i] = Ef::ONE; } }
+    let d_inv = ef_u64(d as u64).inverse();
+    let ms_terms = vec![
+        (g_ms, vec![0usize, 1usize, 2usize, 2usize]),
+        (-g_ms * d_inv, vec![0usize, 3usize]),
+    ];
+    let (ms_vp, z_ms) = efo::prove_virtual(
+        &[&eq_b, &rho, &x_ef, &sum_sq_b], &ms_terms, Ef::ZERO, transcript);
+    if z_ms.len() != lg_len || ms_vp.final_evals.len() != 4 { return None; }
+
+    let q_out = transcript.ef_field_vec(lg_len);
+    let g_out = transcript.ef_field();
+    let eq_out = efo::eq_evals(&q_out);
+    let rem_lo_ef = ef_lift(&aux.out.columns[0]);
+    let rem_hi_ef = ef_lift(&aux.out.columns[1]);
+    let ones = vec![Ef::ONE; len];
+    let two32 = ef_u64(1u64 << 32);
+    let half32 = ef_u64(1u64 << 31);
+    let out_terms = vec![
+        (g_out, vec![0usize, 1usize, 2usize, 3usize]),
+        (-g_out * two32, vec![0usize, 4usize]),
+        (-g_out, vec![0usize, 5usize]),
+        (-g_out * ef_u64(1u64 << 16), vec![0usize, 6usize]),
+        (g_out * half32, vec![0usize, 7usize]),
+    ];
+    let (out_vp, z_out) = efo::prove_virtual(
+        &[&eq_out, &x_ef, &w_ef, &rstd_b, &out_ef, &rem_lo_ef, &rem_hi_ef, &ones],
+        &out_terms, Ef::ZERO, transcript);
+    if z_out.len() != lg_len || out_vp.final_evals.len() != 8 { return None; }
+    let (bind, _) = efo::prove_same_poly_ef(&out_ef,
+        &[(point.to_vec(), value), (z_out.clone(), out_vp.final_evals[4])], transcript);
+
+    let mut p_sq = z_ms[lg_d..].to_vec();
+    p_sq.resize(arity, Ef::ZERO);
+    let mut p_rstd = z_out[lg_d..].to_vec();
+    p_rstd.resize(arity, Ef::ZERO);
+
+    let RmsAux { row, out: out_aux, rsqrt_pairs, rsqrt_mult, limb_lo_pairs,
+        limb_lo_mult, limb_hi_pairs, limb_hi_mult } = aux;
+    let rsqrt_xs: Vec<u32> = (0..m)
+        .map(|r| to_i64(rsqrt_pairs.columns[0][r]) as u32).collect();
+    let rsqrt_ys: Vec<Goldilocks> = (0..m).map(|r| rsqrt_pairs.columns[1][r]).collect();
+    let rsqrt = rms_lookup_prove(store, rsqrt_id, rsqrt_pairs, rsqrt_mult, 0, 1,
+        &rsqrt_xs, &rsqrt_ys, &p_rstd, out_vp.final_evals[3], model, transcript)?;
+    let lo_xs: Vec<u32> = limb_lo_pairs.columns[0].iter()
+        .map(|&v| to_i64(v) as u32).collect();
+    let lo_ys: Vec<Goldilocks> = limb_lo_pairs.columns[0].clone();
+    let limb_lo = rms_lookup_prove(store, limb_id, limb_lo_pairs, limb_lo_mult, 0, 0,
+        &lo_xs, &lo_ys, &z_out, out_vp.final_evals[5], model, transcript)?;
+    let hi_xs: Vec<u32> = limb_hi_pairs.columns[1].iter()
+        .map(|&v| to_i64(v) as u32).collect();
+    let hi_ys: Vec<Goldilocks> = limb_hi_pairs.columns[1].clone();
+    let limb_hi = rms_lookup_prove(store, limb_id, limb_hi_pairs, limb_hi_mult, 1, 1,
+        &hi_xs, &hi_ys, &z_out, out_vp.final_evals[6], model, transcript)?;
+
+    let mut ridx = Vec::new();
+    let mut rpoints = Vec::new();
+    let mut rvalues = Vec::new();
+    for c in 0..lay.columns {
+        ridx.push(c); rpoints.push(z_row.clone()); rvalues.push(row_vp.final_evals[1 + c]);
+    }
+    ridx.push(RMS_SUM_SQ); rpoints.push(p_sq); rvalues.push(ms_vp.final_evals[3]);
+    ridx.push(RMS_RSTD); rpoints.push(p_rstd.clone()); rvalues.push(out_vp.final_evals[3]);
+    ridx.push(RMS_SIDX); rpoints.push(p_rstd); rvalues.push(rsqrt.output_index);
+    let row_opening = open_aux(row, &ridx, &rpoints, &rvalues)?;
+    let out_opening = open_aux(out_aux, &[0, 1],
+        &[z_out.clone(), z_out.clone()],
+        &[out_vp.final_evals[5], out_vp.final_evals[6]])?;
+    let x_ms = ms_vp.final_evals[2];
+    let x_out = out_vp.final_evals[1];
+    let w_out = out_vp.final_evals[2];
+    Some((ReverseRmsNormProof { row: row_vp, ms: ms_vp, out: out_vp, bind,
+        rsqrt, limb_lo, limb_hi, row_opening, out_opening },
+        vec![
+            EfClaim { tensor_id: x, point: z_ms, value: x_ms },
+            EfClaim { tensor_id: x, point: z_out.clone(), value: x_out },
+            EfClaim { tensor_id: w, point: z_out, value: w_out },
+        ]))
+}
+
+fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
+    aux: RmsAuxRefs<'_>, model: &TrustedModelManifest,
+    proof: &ReverseRmsNormProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
+{
+    let (x, w, _out, rsqrt_id, limb_id, m, d, n_real) = rms_norm_dims(op)?;
+    let len = m.checked_mul(d)?;
+    let lg_len = len.trailing_zeros() as usize;
+    let lg_d = d.trailing_zeros() as usize;
+    let lg_m = m.trailing_zeros() as usize;
+    let arity = rms_row_arity(m)?;
+    let lay = rms_row_layout(n_real)?;
+    let rsqrt_len = *model.lookup_lengths.get(&rsqrt_id)?;
+    let limb_len = *model.lookup_lengths.get(&limb_id)?;
+    let rsqrt_ar = table_pad_arity(rsqrt_len)?;
+    let limb_ar = table_pad_arity(limb_len)?;
+    if point.len() != lg_len
+        || aux.row.role != AuxRole::RmsNormRowWitness || aux.row.len != m
+        || aux.row.arity != arity || aux.row.columns != lay.columns
+        || aux.out.role != AuxRole::RmsNormOutWitness || aux.out.len != len
+        || aux.out.arity != lg_len || aux.out.columns != 2
+        || aux.rsqrt_pairs.role != AuxRole::RmsNormRsqrtPairs
+        || aux.rsqrt_pairs.len != m || aux.rsqrt_pairs.arity != arity
+        || aux.rsqrt_pairs.columns != 2
+        || aux.rsqrt_mult.role != AuxRole::RmsNormRsqrtMultiplicity
+        || aux.rsqrt_mult.len != rsqrt_len || aux.rsqrt_mult.arity != rsqrt_ar
+        || aux.rsqrt_mult.columns != 1
+        || aux.limb_lo_pairs.role != AuxRole::RmsNormLimbLoPairs
+        || aux.limb_lo_pairs.len != len || aux.limb_lo_pairs.arity != lg_len
+        || aux.limb_lo_pairs.columns != 2
+        || aux.limb_hi_pairs.role != AuxRole::RmsNormLimbHiPairs
+        || aux.limb_hi_pairs.len != len || aux.limb_hi_pairs.arity != lg_len
+        || aux.limb_hi_pairs.columns != 2
+        || aux.limb_lo_mult.role != AuxRole::RmsNormLimbLoMultiplicity
+        || aux.limb_lo_mult.len != limb_len || aux.limb_lo_mult.arity != limb_ar
+        || aux.limb_lo_mult.columns != 1
+        || aux.limb_hi_mult.role != AuxRole::RmsNormLimbHiMultiplicity
+        || aux.limb_hi_mult.len != limb_len || aux.limb_hi_mult.arity != limb_ar
+        || aux.limb_hi_mult.columns != 1
+        || proof.row.final_evals.len() != 1 + lay.columns
+        || proof.ms.final_evals.len() != 4 || proof.out.final_evals.len() != 8
+    { return None; }
+    transcript.absorb(b"zkie-rmsnorm-v1");
+    transcript.absorb_u64(m as u64);
+    transcript.absorb_u64(d as u64);
+    transcript.absorb_u64(n_real as u64);
+    transcript.absorb_u64(rsqrt_len as u64);
+    transcript.absorb_u64(limb_len as u64);
+    let u_row = transcript.ef_field_vec(arity);
+    let g_row = transcript.ef_field();
+    let row_terms = rms_row_terms(g_row, n_real, &lay);
+    let (okr, z_row, _) = efo::verify_virtual(&proof.row, &row_terms, Ef::ZERO, arity, transcript);
+    if !okr || z_row.len() != arity
+        || proof.row.final_evals[0] != ef_eq_poly(&u_row, &z_row)
+        || proof.row.final_evals.len() != 1 + lay.columns { return None; }
+
+    let u_ms = transcript.ef_field_vec(lg_m);
+    let g_ms = transcript.ef_field();
+    let d_inv = ef_u64(d as u64).inverse();
+    let ms_terms = vec![
+        (g_ms, vec![0usize, 1usize, 2usize, 2usize]),
+        (-g_ms * d_inv, vec![0usize, 3usize]),
+    ];
+    let (okm, z_ms, fcm) = efo::verify_virtual(&proof.ms, &ms_terms, Ef::ZERO, lg_len, transcript);
+    if !okm || z_ms.len() != lg_len { return None; }
+    let fm = &proof.ms.final_evals;
+    if fm[0] != ef_eq_poly(&u_ms, &z_ms[lg_d..])
+        || fcm != efo::virtual_eval(&ms_terms, fm) { return None; }
+    let eq_col = efo::eq_evals(&z_ms[..lg_d]);
+    if eq_col.len() != d { return None; }
+    let mut rho_eval = Ef::ZERO;
+    for j in 0..n_real { rho_eval = rho_eval + eq_col[j]; }
+    if fm[1] != rho_eval { return None; }
+
+    let q_out = transcript.ef_field_vec(lg_len);
+    let g_out = transcript.ef_field();
+    let two32 = ef_u64(1u64 << 32);
+    let half32 = ef_u64(1u64 << 31);
+    let out_terms = vec![
+        (g_out, vec![0usize, 1usize, 2usize, 3usize]),
+        (-g_out * two32, vec![0usize, 4usize]),
+        (-g_out, vec![0usize, 5usize]),
+        (-g_out * ef_u64(1u64 << 16), vec![0usize, 6usize]),
+        (g_out * half32, vec![0usize, 7usize]),
+    ];
+    let (oko, z_out, fco) = efo::verify_virtual(&proof.out, &out_terms, Ef::ZERO, lg_len, transcript);
+    if !oko || z_out.len() != lg_len { return None; }
+    let fo = &proof.out.final_evals;
+    if fo[0] != ef_eq_poly(&q_out, &z_out) || fo[7] != Ef::ONE
+        || fco != efo::virtual_eval(&out_terms, fo) { return None; }
+    if efo::verify_same_poly(&proof.bind,
+        &[(point.to_vec(), value), (z_out.clone(), fo[4])], transcript).is_none() {
+        return None;
+    }
+    let mut p_sq = z_ms[lg_d..].to_vec();
+    p_sq.resize(arity, Ef::ZERO);
+    let mut p_rstd = z_out[lg_d..].to_vec();
+    p_rstd.resize(arity, Ef::ZERO);
+
+    rms_lookup_verify(rsqrt_id, aux.rsqrt_pairs, aux.rsqrt_mult, 0, 1, &p_rstd,
+        fo[3], model, &proof.rsqrt, transcript)?;
+    rms_lookup_verify(limb_id, aux.limb_lo_pairs, aux.limb_lo_mult, 0, 0, &z_out,
+        fo[5], model, &proof.limb_lo, transcript)?;
+    rms_lookup_verify(limb_id, aux.limb_hi_pairs, aux.limb_hi_mult, 1, 1, &z_out,
+        fo[6], model, &proof.limb_hi, transcript)?;
+
+    let mut ridx = Vec::new();
+    let mut rpoints = Vec::new();
+    let mut rvalues = Vec::new();
+    for c in 0..lay.columns {
+        ridx.push(c); rpoints.push(z_row.clone()); rvalues.push(proof.row.final_evals[1 + c]);
+    }
+    ridx.push(RMS_SUM_SQ); rpoints.push(p_sq); rvalues.push(fm[3]);
+    ridx.push(RMS_RSTD); rpoints.push(p_rstd.clone()); rvalues.push(fo[3]);
+    ridx.push(RMS_SIDX); rpoints.push(p_rstd); rvalues.push(proof.rsqrt.output_index);
+    if !verify_aux_open(aux.row, &ridx, &rpoints, &rvalues, &proof.row_opening) {
+        return None;
+    }
+    if !verify_aux_open(aux.out, &[0, 1], &[z_out.clone(), z_out.clone()],
+        &[fo[5], fo[6]], &proof.out_opening) { return None; }
+    Some(vec![
+        EfClaim { tensor_id: x, point: z_ms, value: fm[2] },
+        EfClaim { tensor_id: x, point: z_out.clone(), value: fo[1] },
+        EfClaim { tensor_id: w, point: z_out, value: fo[2] },
+    ])
+}
+
 // S7c Scatter reverse reduction: the routing arrays token_id/expert_of are
 // authenticated as one-hot token/expert selectors over the padded position
 // domain, and their active-pair multiset is bound to the (downstream
@@ -3625,6 +4534,8 @@ enum ReverseReduction {
     Softmax { proof: ReverseSoftmaxProof },
     /// PR#45 B1: stable row-max index (clamped relu of masked-row max).
     StableSoftmaxIndex { proof: ReverseStableSoftmaxIndexProof },
+    /// PR#45 B1: RMSNorm (mean-square / rsqrt lookup / rounding).
+    RmsNorm { proof: ReverseRmsNormProof },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4618,7 +5529,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -4689,6 +5600,40 @@ struct ReverseStableSoftmaxIndexProof {
     x_eval: Ef,
     mask_eval: Ef,
     opening: EfBatchOpeningProof,
+}
+
+/// PR#45 B1: aux-only table lookup used by RmsNorm (internal index arrays;
+/// no store tensor and no returned claim). Mirrors the ungrouped reverse
+/// lookup path: witness fraction, table fraction, padding-zero virtual and
+/// the pair/multiplicity/table openings.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RmsInternalLookupProof {
+    witness: EfFractionalProof,
+    table: EfFractionalProof,
+    output_index: Ef,
+    witness_index: Ef,
+    witness_value: Ef,
+    multiplicity: Ef,
+    table_value: Ef,
+    padding: EfVirtualProof,
+    pairs_opening: EfBatchOpeningProof,
+    multiplicity_opening: EfBatchOpeningProof,
+    table_opening: Option<zkie_core::pcs::whir::Proof>,
+}
+
+/// PR#45 B1: RmsNorm reverse reduction. See the block comment near the row
+/// layout for the relation set.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseRmsNormProof {
+    row: EfVirtualProof,
+    ms: EfVirtualProof,
+    out: EfVirtualProof,
+    bind: EfSamePolyProof,
+    rsqrt: RmsInternalLookupProof,
+    limb_lo: RmsInternalLookupProof,
+    limb_hi: RmsInternalLookupProof,
+    row_opening: EfBatchOpeningProof,
+    out_opening: EfBatchOpeningProof,
 }
 
 /// Deep O7 (b): per-group shared proof data, in ascending trusted-id order.
@@ -5109,6 +6054,74 @@ fn prepare_stable_softmax_index_aux(store: &Store, ops: &[Op], model: &TrustedMo
         prepared.push(PreparedAux {
             descriptor: AuxDescriptor { op_index, role: AuxRole::StableSoftmaxIndexWitness, len, arity, columns: cols, commitment },
             columns: col, prover_data, protocol, whir,
+        });
+    }
+    Some(prepared)
+}
+
+fn rms_norm_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, AuxRole, usize, usize, usize)>>
+{
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::RmsNorm { rsqrt_table, limb_table, .. } = op {
+            let (_, _, _, _, _, m, d, n_real) = rms_norm_dims(op)?;
+            let len = m.checked_mul(d)?;
+            let lay = rms_row_layout(n_real)?;
+            let arity = rms_row_arity(m)?;
+            let lg_len = len.trailing_zeros() as usize;
+            let rsqrt_len = *model.lookup_lengths.get(rsqrt_table)?;
+            let limb_len = *model.lookup_lengths.get(limb_table)?;
+            let rsqrt_ar = table_pad_arity(rsqrt_len)?;
+            let limb_ar = table_pad_arity(limb_len)?;
+            specs.push((i, AuxRole::RmsNormRowWitness, m, arity, lay.columns));
+            specs.push((i, AuxRole::RmsNormOutWitness, len, lg_len, 2));
+            specs.push((i, AuxRole::RmsNormRsqrtPairs, m, arity, 2));
+            specs.push((i, AuxRole::RmsNormRsqrtMultiplicity, rsqrt_len, rsqrt_ar, 1));
+            specs.push((i, AuxRole::RmsNormLimbLoPairs, len, lg_len, 2));
+            specs.push((i, AuxRole::RmsNormLimbLoMultiplicity, limb_len, limb_ar, 1));
+            specs.push((i, AuxRole::RmsNormLimbHiPairs, len, lg_len, 2));
+            specs.push((i, AuxRole::RmsNormLimbHiMultiplicity, limb_len, limb_ar, 1));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_rms_norm_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<PreparedAux>>
+{
+    let specs = rms_norm_aux_specs(ops, model)?;
+    let mut witnesses: std::collections::BTreeMap<usize, RmsWitness> = Default::default();
+    for (i, op) in ops.iter().enumerate() {
+        if matches!(op, Op::RmsNorm { .. }) {
+            witnesses.insert(i, build_rms_witness(store, op, model)?);
+        }
+    }
+    let mut prepared = Vec::new();
+    for (op_index, role, len, arity, cols) in specs {
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let w = witnesses.get(&op_index)?;
+        let mut columns: Vec<Vec<Goldilocks>> = match role {
+            AuxRole::RmsNormRowWitness => w.row.clone(),
+            AuxRole::RmsNormOutWitness => w.out.clone(),
+            AuxRole::RmsNormRsqrtPairs => w.rsqrt_pairs.clone(),
+            AuxRole::RmsNormLimbLoPairs | AuxRole::RmsNormLimbHiPairs => w.limb_pairs.clone(),
+            AuxRole::RmsNormRsqrtMultiplicity => vec![w.rsqrt_mult.clone()],
+            AuxRole::RmsNormLimbLoMultiplicity => vec![w.limb_lo_mult.clone()],
+            AuxRole::RmsNormLimbHiMultiplicity => vec![w.limb_hi_mult.clone()],
+            _ => return None,
+        };
+        if columns.len() != cols { return None; }
+        for c in &mut columns { c.resize(padded, Goldilocks::ZERO); }
+        if columns.iter().any(|c| c.len() != padded) { return None; }
+        let vars = cols.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        prepared.push(PreparedAux {
+            descriptor: AuxDescriptor { op_index, role, len, arity, columns: cols, commitment },
+            columns, prover_data, protocol, whir,
         });
     }
     Some(prepared)
@@ -5603,6 +6616,10 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::StableSoftmaxIndexWitness, len, arity, cols))),
         None => return false,
     };
+    match rms_norm_aux_specs(ops, model) {
+        Some(v) => all.extend(v),
+        None => return false,
+    };
     match softmax_aux_specs(ops, model) {
         Some((sums, rems)) => {
             all.extend(sums.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::SoftmaxSum, len, arity, cols)));
@@ -5627,7 +6644,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -6696,6 +7713,26 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 }
                 ReverseReduction::StableSoftmaxIndex { proof }
             }
+            Op::RmsNorm { .. } => {
+                let mut take = |role: AuxRole| aux.remove(&(op_index, role));
+                let auxp = RmsAux {
+                    row: take(AuxRole::RmsNormRowWitness)?,
+                    out: take(AuxRole::RmsNormOutWitness)?,
+                    rsqrt_pairs: take(AuxRole::RmsNormRsqrtPairs)?,
+                    rsqrt_mult: take(AuxRole::RmsNormRsqrtMultiplicity)?,
+                    limb_lo_pairs: take(AuxRole::RmsNormLimbLoPairs)?,
+                    limb_lo_mult: take(AuxRole::RmsNormLimbLoMultiplicity)?,
+                    limb_hi_pairs: take(AuxRole::RmsNormLimbHiPairs)?,
+                    limb_hi_mult: take(AuxRole::RmsNormLimbHiMultiplicity)?,
+                };
+                let (proof, incoming) = prove_reverse_rms_norm(
+                    store, op, &point, value, auxp, model?, transcript)?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::RmsNorm { proof }
+            }
             Op::CombineIdx { a, b, scale, out: out_t, .. } => {
                 // S5 (reverse): out = scale*a + b at the claim point. When the
                 // verifier can replay the output (and inputs) from public
@@ -7054,6 +8091,23 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                     && a.role == AuxRole::StableSoftmaxIndexWitness)?;
                 for c in verify_reverse_stable_softmax_index(op, &point, value, descriptor,
                     proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+            }
+            (Op::RmsNorm { .. }, ReverseReduction::RmsNorm { proof }) => {
+                let find = |role: AuxRole| aux.iter().find(|a| a.op_index == op_index && a.role == role);
+                let refs = RmsAuxRefs {
+                    row: find(AuxRole::RmsNormRowWitness)?,
+                    out: find(AuxRole::RmsNormOutWitness)?,
+                    rsqrt_pairs: find(AuxRole::RmsNormRsqrtPairs)?,
+                    rsqrt_mult: find(AuxRole::RmsNormRsqrtMultiplicity)?,
+                    limb_lo_pairs: find(AuxRole::RmsNormLimbLoPairs)?,
+                    limb_lo_mult: find(AuxRole::RmsNormLimbLoMultiplicity)?,
+                    limb_hi_pairs: find(AuxRole::RmsNormLimbHiPairs)?,
+                    limb_hi_mult: find(AuxRole::RmsNormLimbHiMultiplicity)?,
+                };
+                for c in verify_reverse_rms_norm(op, &point, value, refs, model?, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -13734,6 +14788,7 @@ pub fn prove_committed_shard_dag_bound(
     prepared.extend(prepare_scale_gate_aux(store, ops, model)?);
     prepared.extend(prepare_softmax_aux(store, ops, model)?);
     prepared.extend(prepare_stable_softmax_index_aux(store, ops, model)?);
+    prepared.extend(prepare_rms_norm_aux(store, ops, model)?);
     prepared.extend(prepare_argmax_aux(store, ops)?);
     prepared.extend(prepare_expert_routing_aux(store, ops)?);
     prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
@@ -14036,6 +15091,12 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             Some(13 + 3 * SSI_RANGE_BITS + table_len.trailing_zeros() as usize),
         _ => None,
     }).max().unwrap_or(13 + 3 * SSI_RANGE_BITS);
+    // B1 RmsNorm row opening: all row columns at the row endpoint plus
+    // sum_sq/rstd/s_index at the broadcast points.
+    let rms_row_claims = ops.iter().filter_map(|op| match op {
+        Op::RmsNorm { n_real, .. } => rms_row_layout(*n_real).map(|l| l.columns + 3),
+        _ => None,
+    }).max().unwrap_or(3);
     for step in &proof.reverse.steps {
         for out in &step.outputs {
             if let Some(m) = &out.merge { b.same_poly(m)?; }
@@ -14162,6 +15223,22 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.virtual_proof(&proof.range, 3)?;
                 b.same_poly(&proof.bind)?;
                 b.opening(&proof.opening, ssi_open_claims)?;
+            }
+            ReverseReduction::RmsNorm { proof } => {
+                b.virtual_proof(&proof.row, 3)?;
+                b.virtual_proof(&proof.ms, 4)?;
+                b.virtual_proof(&proof.out, 4)?;
+                b.same_poly(&proof.bind)?;
+                for l in [&proof.rsqrt, &proof.limb_lo, &proof.limb_hi] {
+                    b.fractional(&l.witness)?;
+                    b.fractional(&l.table)?;
+                    b.virtual_proof(&l.padding, 3)?;
+                    b.opening(&l.pairs_opening, 4)?;
+                    b.opening(&l.multiplicity_opening, 2)?;
+                    if l.table_opening.is_some() { b.base_opening()?; }
+                }
+                b.opening(&proof.row_opening, rms_row_claims)?;
+                b.opening(&proof.out_opening, 2)?;
             }
             ReverseReduction::LookupGroups { groups } => {
                 for g in groups {
@@ -23671,6 +24748,176 @@ mod tests {
             assert!(!verify_committed_shard_dag_bound_bytes(
                 &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &e),
                 "tampered SSI execution {bad} must be rejected");
+        }
+    }
+
+    /// PR#45 B1: the RmsNorm row gadget must be pointwise zero for every
+    /// rsqrt_index branch (fine / coarse / coarse2), and reject a wrong
+    /// committed index. No commitments are involved.
+    #[test]
+    fn b1_rms_norm_row_gadget_branches() {
+        let n_real = 1usize;
+        let lay = rms_row_layout(n_real).unwrap();
+        let gamma = ef_u64(7);
+        let terms = rms_row_terms(gamma, n_real, &lay);
+        let ms_values = [
+            0i64,
+            1i64 << 18,
+            (RMS_FINE - 1) << 18,
+            RMS_FINE << 18,
+            (RMS_COARSE_END - 1) << 18,
+            RMS_COARSE_END << 18,
+            1i64 << 50,
+        ];
+        for &ms in &ms_values {
+            let mut cols = vec![vec![Goldilocks::ZERO; 32]; lay.columns];
+            let sidx = rsqrt_index(ms);
+            rms_row_witness(ms, ms, 0, Goldilocks::ZERO, sidx, n_real, &lay, &mut cols, 0)
+                .expect("branch witness");
+            for r in 1..32 {
+                rms_row_witness(0, 0, 0, Goldilocks::ZERO, 0, n_real, &lay, &mut cols, r)
+                    .expect("padding witness");
+            }
+            for r in 0..32 {
+                let mut vals = vec![Ef::ZERO; lay.columns + 1];
+                vals[0] = Ef::ONE;
+                for c in 0..lay.columns { vals[1 + c] = Ef::from(cols[c][r]); }
+                assert_eq!(efo::virtual_eval(&terms, &vals), Ef::ZERO,
+                    "row relation must vanish at ms={ms} row={r}");
+            }
+            // A wrong index has no witness.
+            let mut bad = vec![vec![Goldilocks::ZERO; 32]; lay.columns];
+            assert!(rms_row_witness(ms, ms, 0, Goldilocks::ZERO, sidx.wrapping_add(1),
+                n_real, &lay, &mut bad, 0).is_none());
+        }
+    }
+
+    /// PR#45 B1: RmsNorm reverse roundtrip and tamper rejection (direct and
+    /// bound bytes entry). n_real < d exercises the public prefix selector;
+    /// a small non-identity rsqrt table exercises the committed-root path and
+    /// keeps rstd non-zero (so the out identity binds x and w).
+    #[test]
+    fn b1_rms_norm_reverse_roundtrip_and_tamper() {
+        let mut store = Store::new();
+        let (m, d, n_real) = (4usize, 8usize, 5usize);
+        let len = m * d;
+        let xv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 13) % 17) - 8)).collect();
+        let wv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 5) % 9) + 1)).collect();
+        let x = store.push(xv.clone());
+        let w = store.push(wv);
+        let out = store.push(vec![Goldilocks::ZERO; len]);
+        let rsqrt_t = store.push((0..32).map(|i| from_i64(1000 + i as i64)).collect());
+        let limb_t = store.push((0..65536).map(|i| from_i64(i as i64)).collect());
+        let ops = vec![Op::RmsNorm { x, w, out, rsqrt_table: rsqrt_t,
+            limb_table: limb_t, m, d, n_real }];
+        forward_ops(&mut store, &ops);
+        let cache_dir = std::env::temp_dir()
+            .join(format!("zkie-rmsnorm-{}", std::process::id()));
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(
+            &cached, &store.owned_slices(), &ops);
+        let mut auxv = prepare_rms_norm_aux(&store, &ops, &model).expect("rms aux");
+        let take = |v: &mut Vec<PreparedAux>, role: AuxRole| {
+            let pos = v.iter().position(|p| p.descriptor.role == role).unwrap();
+            v.remove(pos)
+        };
+        let descs = [
+            take(&mut auxv, AuxRole::RmsNormRowWitness).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormOutWitness).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormRsqrtPairs).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormRsqrtMultiplicity).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormLimbLoPairs).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormLimbLoMultiplicity).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormLimbHiPairs).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormLimbHiMultiplicity).descriptor.clone(),
+        ];
+        let point: Vec<Ef> = (0..len.trailing_zeros())
+            .map(|b| ef_u64(2 + b as u64)).collect();
+        let value = ef_eval(store.get(out), &point);
+        let mut auxall = prepare_rms_norm_aux(&store, &ops, &model).expect("rms aux3");
+        let auxp = RmsAux {
+            row: take(&mut auxall, AuxRole::RmsNormRowWitness),
+            out: take(&mut auxall, AuxRole::RmsNormOutWitness),
+            rsqrt_pairs: take(&mut auxall, AuxRole::RmsNormRsqrtPairs),
+            rsqrt_mult: take(&mut auxall, AuxRole::RmsNormRsqrtMultiplicity),
+            limb_lo_pairs: take(&mut auxall, AuxRole::RmsNormLimbLoPairs),
+            limb_lo_mult: take(&mut auxall, AuxRole::RmsNormLimbLoMultiplicity),
+            limb_hi_pairs: take(&mut auxall, AuxRole::RmsNormLimbHiPairs),
+            limb_hi_mult: take(&mut auxall, AuxRole::RmsNormLimbHiMultiplicity),
+        };
+        let mut tp = Transcript::new(b"b1-rmsnorm");
+        let (proof, claims) = prove_reverse_rms_norm(
+            &store, &ops[0], &point, value, auxp, &model, &mut tp).expect("rms proof");
+        assert_eq!(claims.len(), 3);
+        let refs = RmsAuxRefs {
+            row: &descs[0], out: &descs[1], rsqrt_pairs: &descs[2],
+            rsqrt_mult: &descs[3], limb_lo_pairs: &descs[4],
+            limb_lo_mult: &descs[5], limb_hi_pairs: &descs[6],
+            limb_hi_mult: &descs[7],
+        };
+        let mut tv = Transcript::new(b"b1-rmsnorm");
+        assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
+            &proof, &mut tv).is_some(), "honest RmsNorm must verify");
+
+        // Tampered output claim, formula/mean-square values and lookups.
+        let mut tv = Transcript::new(b"b1-rmsnorm");
+        assert!(verify_reverse_rms_norm(&ops[0], &point, value + Ef::ONE, refs, &model,
+            &proof, &mut tv).is_none());
+        for idx in [1usize, 2, 3, 7] {
+            let mut bad: ReverseRmsNormProof =
+                bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
+            bad.out.final_evals[idx] += Ef::ONE;
+            let refs = RmsAuxRefs { row: &descs[0], out: &descs[1], rsqrt_pairs: &descs[2],
+                rsqrt_mult: &descs[3], limb_lo_pairs: &descs[4], limb_lo_mult: &descs[5],
+                limb_hi_pairs: &descs[6], limb_hi_mult: &descs[7] };
+            let mut tv = Transcript::new(b"b1-rmsnorm");
+            assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
+                &bad, &mut tv).is_none(), "tampered out eval {idx}");
+        }
+        let mut bad: ReverseRmsNormProof =
+            bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
+        bad.ms.final_evals[2] += Ef::ONE;
+        let refs = RmsAuxRefs { row: &descs[0], out: &descs[1], rsqrt_pairs: &descs[2],
+            rsqrt_mult: &descs[3], limb_lo_pairs: &descs[4], limb_lo_mult: &descs[5],
+            limb_hi_pairs: &descs[6], limb_hi_mult: &descs[7] };
+        let mut tv = Transcript::new(b"b1-rmsnorm");
+        assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
+            &bad, &mut tv).is_none(), "tampered x eval at the ms endpoint");
+        let mut bad: ReverseRmsNormProof =
+            bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
+        bad.rsqrt.table_value += Ef::ONE;
+        let refs = RmsAuxRefs { row: &descs[0], out: &descs[1], rsqrt_pairs: &descs[2],
+            rsqrt_mult: &descs[3], limb_lo_pairs: &descs[4], limb_lo_mult: &descs[5],
+            limb_hi_pairs: &descs[6], limb_hi_mult: &descs[7] };
+        let mut tv = Transcript::new(b"b1-rmsnorm");
+        assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
+            &bad, &mut tv).is_none(), "tampered rsqrt table value");
+
+        // Bound bytes entry.
+        let execution = TrustedExecution {
+            inputs: [(x, xv)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 0);
+        let proof2 = prove_committed_shard_dag_bound(
+            &mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("RmsNorm bound proof");
+        assert!(proof2.aux.iter().any(|a| a.role == AuxRole::RmsNormRowWitness));
+        let bytes = bincode::serialize(&proof2).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        for bad in 0..3usize {
+            let mut e = execution.clone();
+            match bad {
+                0 => e.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE,
+                1 => e.outputs.get_mut(&out).unwrap()[1] += Goldilocks::ONE,
+                _ => e.outputs.get_mut(&out).unwrap()[3] += Goldilocks::ONE,
+            }
+            assert!(!verify_committed_shard_dag_bound_bytes(
+                &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &e),
+                "tampered RmsNorm execution {bad} must be rejected");
         }
     }
 
