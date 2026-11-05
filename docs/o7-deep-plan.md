@@ -132,3 +132,38 @@ segmented S9 proofs remain reproducible from their tagged commits.
 Estimated effort: M1-M2 are the critical path; M3 is mechanical but touches
 every reduction; M4 removes the RmsNorm cost explosion. Requesting TL
 approval of this plan/wire change before M1 starts.
+
+## 6. Hard-gate audit: do PCS openings touch the main transcript?
+
+Result: **no**. Checked line by line:
+
+- `crates/zkie-core/src/pcs/ef_batch_open.rs`
+  - `prove_batch_open_committed_ef` (`:40`) and
+    `verify_batch_open_committed_ef` (`:109`) take **no transcript
+    argument**. They construct a local `Transcript::new(b"zkie-batch-open")`
+    (`:73`, `:132`) and absorb only the commitment, the claim points and the
+    claimed values into it. The main reverse-DAG transcript is not passed in
+    and cannot be mutated.
+  - The PCS call itself (`whir.open_batch_multi_ef`) receives the local
+    challenges, not the main transcript.
+- `crates/zkie-core/src/pcs/whir.rs`
+  - The file has no `Transcript` type at all (`grep Transcript whir.rs` is
+    empty). `open_ef` (`:759`), `verify_ef` (`:781`),
+    `open_batch_multi_ef` (`:932`) and `verify_batch_multi_ef` (`:953`) use
+    `fresh_challenger()` (`:454`), a fresh WHIR challenger seeded by the PCS
+    domain separator. The commitment/opening Fiat-Shamir is entirely inside
+    the PCS.
+- In `compose.rs`, the main transcript is only advanced by the virtual
+  sumchecks, `same_poly`, and the explicit `absorb_*` calls before them.
+  Every opening call (`open_aux`, `prove_batch_open_committed_ef`,
+  `verify_aux_open`, table/weight openings) is transcript-free.
+
+Therefore deferring the opening proofs to a trailing pooled section does not
+change any challenge derivation: the reduction's points/values are already
+fixed by the preceding virtual proofs/absorptions, and the pooled opening is a
+transcript-independent PCS proof over those fixed claims. The batch-opening
+local transcript still binds the commitment + points + claimed values, so the
+deferred proof cannot be re-pointed after the fact.
+
+Conclusion: the deferral pillar holds; no mirror absorption is needed. This
+audit is the M2 pre-gate and is recorded here as required by the TL.
