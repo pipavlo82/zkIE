@@ -43,7 +43,13 @@ use per-op aux openings in M1 (as planned); the **aggregated** group opening
 is what verifies. M2 migrates the reductions and deferred claims so the full
 proof's K becomes the group/table/weight count.
 
-## M2 target (not in this commit)
+## M2 status
+
+The M2 gate is met for the synthetic multi-op RmsNorm graph; see
+`docs/o7-deep-m2.md` (pooled K=9, full proof verifies). RoPE/SSI/ScaleGate/
+Softmax migrations remain in M2b.
+
+## M2 target (original note)
 
 - Replace per-op `open_aux` calls with recorded `AuxOpenClaim { group, col,
   point, value }` + one pooled `EfBatchOpeningProof` per group.

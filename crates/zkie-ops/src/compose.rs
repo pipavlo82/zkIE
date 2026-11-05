@@ -3613,7 +3613,8 @@ struct RmsAuxRefs<'a> {
 fn internal_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
     multiplicity: PreparedAux, idx_col: usize, val_col: usize,
     xs: &[u32], ys: &[Goldilocks], point: &[Ef], value: Ef,
-    model: &TrustedModelManifest, transcript: &mut Transcript)
+    model: &TrustedModelManifest, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<InternalLookupProof>
 {
     if idx_col >= 2 || val_col >= 2 || point.len() != pairs.descriptor.arity
@@ -3669,6 +3670,14 @@ fn internal_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
     let (padding, padding_point) = efo::prove_virtual(
         &[&eq, &mult_cols[0], &padding_mask], &padding_terms, Ef::ZERO, transcript);
     let padding_value = padding.final_evals[1];
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&pairs.descriptor, &[idx_col, val_col, idx_col, val_col],
+            &[point.to_vec(), point.to_vec(), w_den_point.clone(), w_den_point.clone()],
+            &[output_index, value, witness_index, witness_value])?;
+        r.record(&multiplicity.descriptor, &[0, 0],
+            &[t_num_point.clone(), padding_point.clone()],
+            &[mult_eval, padding_value])?;
+    }
     let pairs_opening = open_aux(pairs, &[idx_col, val_col, idx_col, val_col],
         &[point.to_vec(), point.to_vec(), w_den_point.clone(), w_den_point],
         &[output_index, value, witness_index, witness_value])?;
@@ -3705,7 +3714,7 @@ fn internal_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
 fn internal_lookup_verify(table_id: T, pairs: &AuxDescriptor, multiplicity: &AuxDescriptor,
     idx_col: usize, val_col: usize, point: &[Ef], value: Ef,
     model: &TrustedModelManifest, proof: &InternalLookupProof,
-    transcript: &mut Transcript) -> Option<()>
+    transcript: &mut Transcript, mut rec: Option<&mut AuxOpenRecorder>) -> Option<()>
 {
     if idx_col >= 2 || val_col >= 2 || point.len() != pairs.arity
         || pairs.columns != 2 || multiplicity.columns != 1
@@ -3743,13 +3752,20 @@ fn internal_lookup_verify(table_id: T, pairs: &AuxDescriptor, multiplicity: &Aux
     let points = vec![point.to_vec(), point.to_vec(),
         witness.q_den.clone(), witness.q_den.clone()];
     let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
-    if !verify_aux_open(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values, &proof.pairs_opening) {
-        return None;
-    }
-    if !verify_aux_open(multiplicity, &[0, 0],
-        &[table.q_num.clone(), padding_point],
-        &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) {
-        return None;
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values)?;
+        r.record(multiplicity, &[0, 0],
+            &[table.q_num.clone(), padding_point.clone()],
+            &[proof.multiplicity, proof.padding.final_evals[1]])?;
+    } else {
+        if !verify_aux_open(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values, &proof.pairs_opening) {
+            return None;
+        }
+        if !verify_aux_open(multiplicity, &[0, 0],
+            &[table.q_num.clone(), padding_point],
+            &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) {
+            return None;
+        }
     }
     if model.identity_tables.contains_key(&table_id) {
         if proof.table_opening.is_some() || proof.table_value != lookup_index_eval(&table.q_den) {
@@ -3774,7 +3790,8 @@ fn rms_mult_matches(columns: &[Vec<Goldilocks>], expected: &[Goldilocks]) -> boo
 }
 
 fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
-    aux: RmsAux, model: &TrustedModelManifest, transcript: &mut Transcript)
+    aux: RmsAux, model: &TrustedModelManifest, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseRmsNormProof, Vec<EfClaim>)>
 {
     let (x, w, out, rsqrt_id, limb_id, m, d, n_real) = rms_norm_dims(op)?;
@@ -3952,29 +3969,29 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
         .map(|r| to_i64(rsqrt_pairs.columns[0][r]) as u32).collect();
     let rsqrt_ys: Vec<Goldilocks> = (0..m).map(|r| rsqrt_pairs.columns[1][r]).collect();
     let rsqrt = internal_lookup_prove(store, rsqrt_id, rsqrt_pairs, rsqrt_mult, 0, 1,
-        &rsqrt_xs, &rsqrt_ys, &p_rstd, out_vp.final_evals[3], model, transcript)?;
+        &rsqrt_xs, &rsqrt_ys, &p_rstd, out_vp.final_evals[3], model, transcript, rec.as_deref_mut())?;
     let lo_xs: Vec<u32> = limb_lo_pairs.columns[0].iter()
         .map(|&v| to_i64(v) as u32).collect();
     let lo_ys: Vec<Goldilocks> = limb_lo_pairs.columns[0].clone();
     let limb_lo = internal_lookup_prove(store, limb_id, limb_lo_pairs, limb_lo_mult, 0, 0,
-        &lo_xs, &lo_ys, &z_out, out_vp.final_evals[5], model, transcript)?;
+        &lo_xs, &lo_ys, &z_out, out_vp.final_evals[5], model, transcript, rec.as_deref_mut())?;
     let hi_xs: Vec<u32> = limb_hi_pairs.columns[1].iter()
         .map(|&v| to_i64(v) as u32).collect();
     let hi_ys: Vec<Goldilocks> = limb_hi_pairs.columns[1].clone();
     let limb_hi = internal_lookup_prove(store, limb_id, limb_hi_pairs, limb_hi_mult, 1, 1,
-        &hi_xs, &hi_ys, &z_out, out_vp.final_evals[6], model, transcript)?;
+        &hi_xs, &hi_ys, &z_out, out_vp.final_evals[6], model, transcript, rec.as_deref_mut())?;
     let olo_xs: Vec<u32> = out_limb_lo_pairs.columns[0].iter()
         .map(|&v| to_i64(v) as u32).collect();
     let olo_ys: Vec<Goldilocks> = out_limb_lo_pairs.columns[0].clone();
     let out_limb_lo = internal_lookup_prove(store, limb_id, out_limb_lo_pairs,
         out_limb_lo_mult, 0, 0, &olo_xs, &olo_ys, &z_out, out_vp.final_evals[8],
-        model, transcript)?;
+        model, transcript, rec.as_deref_mut())?;
     let ohi_xs: Vec<u32> = out_limb_hi_pairs.columns[1].iter()
         .map(|&v| to_i64(v) as u32).collect();
     let ohi_ys: Vec<Goldilocks> = out_limb_hi_pairs.columns[1].clone();
     let out_limb_hi = internal_lookup_prove(store, limb_id, out_limb_hi_pairs,
         out_limb_hi_mult, 1, 1, &ohi_xs, &ohi_ys, &z_out, out_vp.final_evals[9],
-        model, transcript)?;
+        model, transcript, rec.as_deref_mut())?;
 
     let mut ridx = Vec::new();
     let mut rpoints = Vec::new();
@@ -3985,6 +4002,15 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
     ridx.push(RMS_SUM_SQ); rpoints.push(p_sq); rvalues.push(ms_vp.final_evals[3]);
     ridx.push(RMS_RSTD); rpoints.push(p_rstd.clone()); rvalues.push(out_vp.final_evals[3]);
     ridx.push(RMS_SIDX); rpoints.push(p_rstd); rvalues.push(rsqrt.output_index);
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&row.descriptor, &ridx, &rpoints, &rvalues)?;
+        let mut rp = bind.merged_point.clone();
+        rp.resize(out_aux.descriptor.arity, Ef::ZERO);
+        r.record(&out_aux.descriptor, &[0, 1, 2, 3, 4, 0],
+            &[z_out.clone(), z_out.clone(), z_out.clone(), z_out.clone(), z_out.clone(), rp],
+            &[out_vp.final_evals[4], out_vp.final_evals[5], out_vp.final_evals[6],
+              out_vp.final_evals[8], out_vp.final_evals[9], merged])?;
+    }
     let row_opening = open_aux(row, &ridx, &rpoints, &rvalues)?;
     let mut r_pad = bind.merged_point.clone();
     r_pad.resize(out_aux.descriptor.arity, Ef::ZERO);
@@ -4006,7 +4032,8 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
 
 fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
     aux: RmsAuxRefs<'_>, model: &TrustedModelManifest,
-    proof: &ReverseRmsNormProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
+    proof: &ReverseRmsNormProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
 {
     let (x, w, _out, rsqrt_id, limb_id, m, d, n_real) = rms_norm_dims(op)?;
     let len = m.checked_mul(d)?;
@@ -4117,7 +4144,11 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
         &[(point.to_vec(), value), (z_out.clone(), fo4)], transcript)?;
     let mut r_pad = merged_point;
     r_pad.resize(aux.out.arity, Ef::ZERO);
-    if !verify_aux_open(aux.out, &[0, 1, 2, 3, 4, 0],
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(aux.out, &[0, 1, 2, 3, 4, 0],
+            &[z_out.clone(), z_out.clone(), z_out.clone(), z_out.clone(), z_out.clone(), r_pad],
+            &[fo4, fo5, fo6, fo8, fo9, merged])?;
+    } else if !verify_aux_open(aux.out, &[0, 1, 2, 3, 4, 0],
         &[z_out.clone(), z_out.clone(), z_out.clone(), z_out.clone(), z_out.clone(), r_pad],
         &[fo4, fo5, fo6, fo8, fo9, merged], &proof.out_opening) { return None; }
     let mut p_sq = z_ms[lg_d..].to_vec();
@@ -4126,15 +4157,15 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
     p_rstd.resize(arity, Ef::ZERO);
 
     internal_lookup_verify(rsqrt_id, aux.rsqrt_pairs, aux.rsqrt_mult, 0, 1, &p_rstd,
-        fo[3], model, &proof.rsqrt, transcript)?;
+        fo[3], model, &proof.rsqrt, transcript, rec.as_deref_mut())?;
     internal_lookup_verify(limb_id, aux.limb_lo_pairs, aux.limb_lo_mult, 0, 0, &z_out,
-        fo[5], model, &proof.limb_lo, transcript)?;
+        fo[5], model, &proof.limb_lo, transcript, rec.as_deref_mut())?;
     internal_lookup_verify(limb_id, aux.limb_hi_pairs, aux.limb_hi_mult, 1, 1, &z_out,
-        fo[6], model, &proof.limb_hi, transcript)?;
+        fo[6], model, &proof.limb_hi, transcript, rec.as_deref_mut())?;
     internal_lookup_verify(limb_id, aux.out_limb_lo_pairs, aux.out_limb_lo_mult, 0, 0, &z_out,
-        fo[8], model, &proof.out_limb_lo, transcript)?;
+        fo[8], model, &proof.out_limb_lo, transcript, rec.as_deref_mut())?;
     internal_lookup_verify(limb_id, aux.out_limb_hi_pairs, aux.out_limb_hi_mult, 1, 1, &z_out,
-        fo[9], model, &proof.out_limb_hi, transcript)?;
+        fo[9], model, &proof.out_limb_hi, transcript, rec.as_deref_mut())?;
 
     let mut ridx = Vec::new();
     let mut rpoints = Vec::new();
@@ -4145,7 +4176,9 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
     ridx.push(RMS_SUM_SQ); rpoints.push(p_sq); rvalues.push(fm[3]);
     ridx.push(RMS_RSTD); rpoints.push(p_rstd.clone()); rvalues.push(fo[3]);
     ridx.push(RMS_SIDX); rpoints.push(p_rstd); rvalues.push(proof.rsqrt.output_index);
-    if !verify_aux_open(aux.row, &ridx, &rpoints, &rvalues, &proof.row_opening) {
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(aux.row, &ridx, &rpoints, &rvalues)?;
+    } else if !verify_aux_open(aux.row, &ridx, &rpoints, &rvalues, &proof.row_opening) {
         return None;
     }
     Some(vec![
@@ -4455,11 +4488,11 @@ fn prove_reverse_rope(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let rf_xs: Vec<u32> = rem_f.columns[0].iter().map(|&v| to_i64(v) as u32).collect();
     let rf_ys: Vec<Goldilocks> = rem_f.columns[0].clone();
     let rem_f_proof = internal_lookup_prove(store, range_table, rem_f, mult_f, 0, 0,
-        &rf_xs, &rf_ys, &z_f, first.final_evals[6], model, transcript)?;
+        &rf_xs, &rf_ys, &z_f, first.final_evals[6], model, transcript, None)?;
     let rs_xs: Vec<u32> = rem_s.columns[0].iter().map(|&v| to_i64(v) as u32).collect();
     let rs_ys: Vec<Goldilocks> = rem_s.columns[0].clone();
     let rem_s_proof = internal_lookup_prove(store, range_table, rem_s, mult_s, 0, 0,
-        &rs_xs, &rs_ys, &z_s, second.final_evals[6], model, transcript)?;
+        &rs_xs, &rs_ys, &z_s, second.final_evals[6], model, transcript, None)?;
 
     let table_p_f = rope_table_point(&z_f, half_log, head_log)?;
     let table_p_s = rope_table_point(&z_s, half_log, head_log)?;
@@ -4558,9 +4591,9 @@ fn verify_reverse_rope(op: &Op, point: &[Ef], value: Ef,
     }
 
     internal_lookup_verify(range_table, aux.rem_f, aux.mult_f, 0, 0, &z_f,
-        ff[6], model, &proof.rem_f, transcript)?;
+        ff[6], model, &proof.rem_f, transcript, None)?;
     internal_lookup_verify(range_table, aux.rem_s, aux.mult_s, 0, 0, &z_s,
-        fs[6], model, &proof.rem_s, transcript)?;
+        fs[6], model, &proof.rem_s, transcript, None)?;
 
     let table_p_f = rope_table_point(&z_f, half_log, head_log)?;
     let table_p_s = rope_table_point(&z_s, half_log, head_log)?;
@@ -7668,7 +7701,7 @@ fn aux_specs(ops: &[Op], model: &TrustedModelManifest)
 
 /// O7-deep M1: aux layout version. Bumped on any change to the plan
 /// construction or group encoding; the verifier rejects other layouts.
-pub const AUX_LAYOUT_VERSION: u32 = 1;
+pub const AUX_LAYOUT_VERSION: u32 = 2;
 
 /// One per-arity global aux commitment. `columns` is the total number of
 /// padded columns in the group; the deterministic AuxPlan maps every
@@ -7688,6 +7721,117 @@ pub struct AuxPlan {
     pub groups: Vec<(usize, usize)>,
     /// (op_index, role, column) -> (group index, column offset in group).
     pub slots: std::collections::BTreeMap<(usize, AuxRole, usize), (usize, usize)>,
+}
+
+/// O7-deep M2: one deferred aux opening claim, mapped through the AuxPlan to
+/// a column offset in a per-arity group.
+#[derive(Clone)]
+struct AuxOpenClaim {
+    group: usize,
+    col: usize,
+    point: Vec<Ef>,
+    value: Ef,
+}
+
+struct AuxOpenRecorder {
+    plan: AuxPlan,
+    claims: Vec<AuxOpenClaim>,
+}
+
+impl AuxOpenRecorder {
+    fn new(plan: AuxPlan) -> Self { Self { plan, claims: Vec::new() } }
+
+    fn record(&mut self, descriptor: &AuxDescriptor, idxs: &[usize],
+        points: &[Vec<Ef>], values: &[Ef]) -> Option<()>
+    {
+        if idxs.len() != points.len() || points.len() != values.len() { return None; }
+        for i in 0..idxs.len() {
+            let (group, col) = *self.plan.slots.get(
+                &(descriptor.op_index, descriptor.role, idxs[i]))?;
+            self.claims.push(AuxOpenClaim {
+                group, col, point: points[i].clone(), value: values[i],
+            });
+        }
+        Some(())
+    }
+
+    fn groups_with_claims(&self) -> Vec<usize> {
+        let mut groups: Vec<usize> = self.claims.iter().map(|c| c.group).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        groups
+    }
+
+    fn claims_for(&self, group: usize) -> Vec<(usize, Vec<Ef>, Ef)> {
+        // Canonical claim order: the prover and verifier record in different
+        // reduction-local orders, so sort by the serialized claim tuple. The
+        // batch opening binds exactly this ordered list.
+        let mut v: Vec<(usize, Vec<Ef>, Ef)> = self.claims.iter()
+            .filter(|c| c.group == group)
+            .map(|c| (c.col, c.point.clone(), c.value)).collect();
+        v.sort_by(|a, b| {
+            let ka = bincode::serialize(&(a.0, &a.1, a.2)).unwrap_or_default();
+            let kb = bincode::serialize(&(b.0, &b.1, b.2)).unwrap_or_default();
+            ka.cmp(&kb)
+        });
+        v
+    }
+}
+
+/// Trailing pooled section: one batch opening per aux group with recorded
+/// claims. The verifier reconstructs the claims from its own reductions.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AuxGroupOpening {
+    group: usize,
+    proof: EfBatchOpeningProof,
+}
+
+fn build_pooled_aux_openings(rec: &AuxOpenRecorder,
+    groups: &[PreparedAuxGroup]) -> Option<Vec<AuxGroupOpening>>
+{
+    let mut out = Vec::new();
+    for group in rec.groups_with_claims() {
+        let pg = groups.get(group)?;
+        if pg.descriptor.columns != rec.plan.groups.get(group)?.1 { return None; }
+        let claims = rec.claims_for(group);
+        let idxs: Vec<usize> = claims.iter().map(|(c, _, _)| *c).collect();
+        let points: Vec<Vec<Ef>> = claims.iter().map(|(_, p, _)| p.clone()).collect();
+        let values: Vec<Ef> = claims.iter().map(|(_, _, v)| *v).collect();
+        let mut unique: Vec<usize> = Vec::new();
+        for &c in &idxs { if !unique.contains(&c) { unique.push(c); } }
+        let tensors: Vec<Vec<Goldilocks>> = unique.iter()
+            .map(|&c| pg.columns.get(c).cloned()).collect::<Option<_>>()?;
+        let proof = prove_batch_open_committed_ef(
+            &pg.whir, &pg.descriptor.commitment, &pg.protocol, pg.descriptor.columns,
+            pg.prover_data.clone(), &idxs, tensors, &points, &values).ok()?;
+        out.push(AuxGroupOpening { group, proof });
+    }
+    Some(out)
+}
+
+fn verify_pooled_aux_openings(rec: &AuxOpenRecorder, groups: &[AuxGroupDescriptor],
+    pooled: &[AuxGroupOpening]) -> bool
+{
+    let want = rec.groups_with_claims();
+    if pooled.len() != want.len() { return false; }
+    for (o, &group) in pooled.iter().zip(&want) {
+        if o.group != group { return false; }
+        let g = match groups.get(group) { Some(g) => g, None => return false };
+        let padded = match 1usize.checked_shl(g.arity as u32) { Some(v) => v, None => return false };
+        let vars = match g.columns.checked_mul(padded)
+            .and_then(usize::checked_next_power_of_two) {
+            Some(v) => v.trailing_zeros() as usize, None => return false,
+        };
+        let whir = match verifier_whir(vars) { Some(w) => w, None => return false };
+        let protocol = whir.batch_opening_protocol(g.columns, g.arity);
+        let claims = rec.claims_for(group);
+        let idxs: Vec<usize> = claims.iter().map(|(c, _, _)| *c).collect();
+        let points: Vec<Vec<Ef>> = claims.iter().map(|(_, p, _)| p.clone()).collect();
+        let values: Vec<Ef> = claims.iter().map(|(_, _, v)| *v).collect();
+        if !verify_batch_open_committed_ef(&whir, &g.commitment, &protocol, g.columns,
+            &idxs, &points, &values, &o.proof) { return false; }
+    }
+    true
 }
 
 fn build_aux_plan(ops: &[Op], model: &TrustedModelManifest) -> Option<AuxPlan> {
@@ -8616,12 +8760,12 @@ fn reverse_setup(ops: &[Op], seeds: &[EfClaim], transcript: &mut Transcript)
 }
 
 pub fn prove_reverse_dag(store: &Store, ops: &[Op], seeds: &[EfClaim], transcript: &mut Transcript) -> Option<ReverseDagProof> {
-    prove_reverse_dag_inner(store, ops, seeds, transcript, &mut std::collections::BTreeMap::new(), None, None, None, &std::collections::BTreeMap::new())
+    prove_reverse_dag_inner(store, ops, seeds, transcript, &mut std::collections::BTreeMap::new(), None, None, None, &std::collections::BTreeMap::new(), None)
         .map(|(proof, _leaves)| proof)
 }
 
 
-fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>, lookup_groups: &std::collections::BTreeMap<T, (Ef, Ef)>) -> Option<(ReverseDagProof, Vec<EfClaim>)> {
+fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>, lookup_groups: &std::collections::BTreeMap<T, (Ef, Ef)>, mut aux_rec: Option<&mut AuxOpenRecorder>) -> Option<(ReverseDagProof, Vec<EfClaim>)> {
     let replayed = execution.and_then(|e| replay_index_columns(ops, e));
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
@@ -8885,7 +9029,8 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                     out_limb_hi_mult: take(AuxRole::RmsNormOutLimbHiMultiplicity)?,
                 };
                 let (proof, incoming) = prove_reverse_rms_norm(
-                    store, op, &point, value, auxp, model?, transcript)?;
+                    store, op, &point, value, auxp, model?, transcript,
+                    aux_rec.as_deref_mut())?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -9057,10 +9202,10 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
 }
 
 pub fn verify_reverse_dag(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>> {
-    verify_reverse_dag_inner(ops, seeds, proof, transcript, &[], None, None, None, &std::collections::BTreeMap::new())
+    verify_reverse_dag_inner(ops, seeds, proof, transcript, &[], None, None, None, &std::collections::BTreeMap::new(), None)
 }
 
-fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagProof, transcript: &mut Transcript, aux: &[AuxDescriptor], model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>, lookup_groups: &std::collections::BTreeMap<T, (Ef, Ef)>) -> Option<Vec<EfClaim>> {
+fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagProof, transcript: &mut Transcript, aux: &[AuxDescriptor], model: Option<&TrustedModelManifest>, certified: Option<&std::collections::BTreeSet<T>>, execution: Option<&TrustedExecution>, lookup_groups: &std::collections::BTreeMap<T, (Ef, Ef)>, mut aux_rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>> {
     let replayed = execution.and_then(|e| replay_index_columns(ops, e));
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut claims = reverse_setup(ops, seeds, transcript)?;
@@ -9295,7 +9440,8 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                     out_limb_hi_pairs: find(AuxRole::RmsNormOutLimbHiPairs)?,
                     out_limb_hi_mult: find(AuxRole::RmsNormOutLimbHiMultiplicity)?,
                 };
-                for c in verify_reverse_rms_norm(op, &point, value, refs, model?, proof, transcript)? {
+                for c in verify_reverse_rms_norm(op, &point, value, refs, model?, proof,
+                    transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -15150,6 +15296,8 @@ pub struct BoundExecutionProof {
     /// the deterministic AuxPlan derived from ops/model.
     aux_groups: Vec<AuxGroupDescriptor>,
     aux_layout: u32,
+    /// O7-deep M2: deferred pooled aux openings (one per group with claims).
+    aux_pooled: Vec<AuxGroupOpening>,
     reverse: ReverseDagProof,
     weight_openings: Vec<WeightBatchOpening>,
     sel_openings: Vec<BoundSelOpening>,
@@ -16029,7 +16177,8 @@ pub fn prove_committed_shard_dag_bound(
         }
     }
     let prepared = prepare_all_aux(store, ops, model)?;
-    let (_aux_plan, aux_groups, _aux_prepared_groups) = commit_aux_groups_from(&prepared, ops, model)?;
+    let (aux_plan, aux_groups, aux_prepared_groups) = commit_aux_groups_from(&prepared, ops, model)?;
+    let mut aux_recorder = AuxOpenRecorder::new(aux_plan);
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
     // S6 (bound): selector openings + embedding token binding, built against
     // the same aux commitments the reverse reduction uses.
@@ -16046,7 +16195,8 @@ pub fn prove_committed_shard_dag_bound(
     // Deep O7 (a): derive each static lookup group's common (α, β) after the
     // model/execution/aux absorption and before the reverse DAG.
     let lookup_groups = derive_lookup_group_ab(&mut transcript, ops, model)?;
-    let (reverse, prover_leaves) = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution), &lookup_groups)?;
+    let (reverse, prover_leaves) = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution), &lookup_groups, Some(&mut aux_recorder))?;
+    let aux_pooled = build_pooled_aux_openings(&aux_recorder, &aux_prepared_groups)?;
     // O2 (TL Q3): the prover uses its own residual claims; the verifier-side
     // replay is optional, for separately-accounted self-verify measurements
     // and a leaf consistency check. Default off: no prover self-verification.
@@ -16054,7 +16204,7 @@ pub fn prove_committed_shard_dag_bound(
         let (mut replay, replay_seeds) = execution_seeds(ops, model, execution, &aux, &aux_groups)?;
         let replay_groups = derive_lookup_group_ab(&mut replay, ops, model)?;
         let t_sv = std::time::Instant::now();
-        let verified = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model), Some(&certified), Some(execution), &replay_groups)?;
+        let verified = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model), Some(&certified), Some(execution), &replay_groups, None)?;
         eprintln!("O2-selfverify ms={:.1} leaves={}", t_sv.elapsed().as_secs_f64() * 1e3, verified.len());
         let mut a: Vec<String> = prover_leaves.iter().map(|c| format!("{:?}", c)).collect();
         let mut b: Vec<String> = verified.iter().map(|c| format!("{:?}", c)).collect();
@@ -16141,7 +16291,7 @@ pub fn prove_committed_shard_dag_bound(
         weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: Some(opening) });
     }
     Some(BoundExecutionProof { aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION,
-        reverse, weight_openings, sel_openings, token_binding })
+        aux_pooled, reverse, weight_openings, sel_openings, token_binding })
 }
 
 /// S9 2c verifier budget over the proof's randomized checks. Degrees are
@@ -16327,6 +16477,7 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
         Op::RmsNorm { n_real, .. } => rms_row_layout(*n_real).map(|l| l.columns + 3),
         _ => None,
     }).max().unwrap_or(3);
+    let proof_aux_layout = proof.aux_layout;
     for step in &proof.reverse.steps {
         for out in &step.outputs {
             if let Some(m) = &out.merge { b.same_poly(m)?; }
@@ -16463,17 +16614,22 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.virtual_proof(&proof.ms, 4)?;
                 b.virtual_proof(&proof.out, 4)?;
                 b.same_poly(&proof.bind)?;
+                let pooled = proof_aux_layout >= 2;
                 for l in [&proof.rsqrt, &proof.limb_lo, &proof.limb_hi,
                           &proof.out_limb_lo, &proof.out_limb_hi] {
                     b.fractional(&l.witness)?;
                     b.fractional(&l.table)?;
                     b.virtual_proof(&l.padding, 3)?;
-                    b.opening(&l.pairs_opening, 4)?;
-                    b.opening(&l.multiplicity_opening, 2)?;
+                    if !pooled {
+                        b.opening(&l.pairs_opening, 4)?;
+                        b.opening(&l.multiplicity_opening, 2)?;
+                    }
                     if l.table_opening.is_some() { b.base_opening()?; }
                 }
-                b.opening(&proof.row_opening, rms_row_claims)?;
-                b.opening(&proof.out_opening, 6)?;
+                if !pooled {
+                    b.opening(&proof.row_opening, rms_row_claims)?;
+                    b.opening(&proof.out_opening, 6)?;
+                }
             }
             ReverseReduction::RoPE { proof } => {
                 b.virtual_proof(&proof.first, 3)?;
@@ -16503,6 +16659,13 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             | ReverseReduction::IdxBroadcast { .. }
             | ReverseReduction::PadIdx { .. }
             | ReverseReduction::Transpose => {}
+        }
+    }
+    if proof_aux_layout >= 2 {
+        let plan = build_aux_plan(ops, model)?;
+        for o in &proof.aux_pooled {
+            let cols = plan.groups.get(o.group)?.1;
+            b.opening(&o.proof, cols)?;
         }
     }
     for w in &proof.weight_openings {
@@ -16569,16 +16732,22 @@ pub fn verify_committed_shard_dag_bound(
             return false;
         }
     }
-    if proof.aux_layout != AUX_LAYOUT_VERSION
-        || validate_aux_plan(ops, model, &proof.aux_groups).is_none() { return false; }
+    if proof.aux_layout != AUX_LAYOUT_VERSION { return false; }
+    let aux_plan = match validate_aux_plan(ops, model, &proof.aux_groups) {
+        Some(p) => p, None => return false,
+    };
+    let mut aux_recorder = AuxOpenRecorder::new(aux_plan);
     let (mut transcript, seeds) = match execution_seeds(ops, model, execution, &proof.aux, &proof.aux_groups) { Some(v) => v, None => return false };
     let certified = certified_index_tensors(ops, execution);
     let lookup_groups = match derive_lookup_group_ab(&mut transcript, ops, model) {
         Some(v) => v, None => return false,
     };
-    let leaves = match verify_reverse_dag_inner(ops, &seeds, &proof.reverse, &mut transcript, &proof.aux, Some(model), Some(&certified), Some(execution), &lookup_groups) {
+    let leaves = match verify_reverse_dag_inner(ops, &seeds, &proof.reverse, &mut transcript, &proof.aux, Some(model), Some(&certified), Some(execution), &lookup_groups, Some(&mut aux_recorder)) {
         Some(v) => v, None => return false,
     };
+    if !verify_pooled_aux_openings(&aux_recorder, &proof.aux_groups, &proof.aux_pooled) {
+        return false;
+    }
     let weights: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
     for c in &leaves {
         if weights.contains(&c.tensor_id) { continue; }
@@ -23099,9 +23268,9 @@ mod tests {
         let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux, &aux_groups).unwrap();
         let certified = certified_index_tensors(&ops, &execution);
         let (reverse, _leaves) = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
-            Some(&model), Some(&certified), Some(&execution), &std::collections::BTreeMap::new()).expect("forged bound proof is producible");
+            Some(&model), Some(&certified), Some(&execution), &std::collections::BTreeMap::new(), None).expect("forged bound proof is producible");
         let proof = BoundExecutionProof {
-            aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION,
+            aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION, aux_pooled: Vec::new(),
             reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None,
         };
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
@@ -23409,9 +23578,10 @@ mod tests {
         let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux, &aux_groups).unwrap();
         let certified = certified_index_tensors(&ops, &execution);
         let (reverse, _leaves) = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
-            Some(&model), Some(&certified), Some(&execution), &std::collections::BTreeMap::new()).expect("forged proof producible");
+            Some(&model), Some(&certified), Some(&execution), &std::collections::BTreeMap::new(), None).expect("forged proof producible");
         let proof = BoundExecutionProof { aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION,
-            reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None };
+            aux_pooled: Vec::new(), reverse, weight_openings: vec![], sel_openings: vec![],
+            token_binding: None };
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
             &PublicStatement::Generic, &model, &execution),
             "the signed order proof must reject the swapped expert-major enumeration");
@@ -26275,7 +26445,7 @@ mod tests {
         let auxp = build_aux(&mut auxv);
         let (proof, claims) = prove_reverse_rms_norm(
             &st, &ops[0], &point, value, auxp, &model,
-            &mut Transcript::new(b"rms-low-m32")).expect("m32 proof");
+            &mut Transcript::new(b"rms-low-m32"), None).expect("m32 proof");
         assert_eq!(claims.len(), 3);
         let mut auxv2 = prepare_rms_norm_aux(&st, &ops, &model).unwrap();
         let fill = |v: &mut Vec<PreparedAux>| {
@@ -26299,7 +26469,7 @@ mod tests {
             out_limb_hi_pairs: &dsc[10], out_limb_hi_mult: &dsc[11],
         };
         assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
-            &proof, &mut Transcript::new(b"rms-low-m32")).is_some());
+            &proof, &mut Transcript::new(b"rms-low-m32"), None).is_some());
 
         // Non-identity limb table must fail closed at aux preparation.
         let (st2, x2, w2, out2, model2) = make(4, 8, 5, false).unwrap();
@@ -26331,7 +26501,7 @@ mod tests {
         }
         let badp = build_aux(&mut auxbad);
         assert!(prove_reverse_rms_norm(&st3, &ops3[0], &p3, v3, badp, &model3,
-            &mut Transcript::new(b"rms-low-badlimb")).is_none());
+            &mut Transcript::new(b"rms-low-badlimb"), None).is_none());
         let mut auxneg = prepare_rms_norm_aux(&st3, &ops3, &model3).unwrap();
         {
             let pos = auxneg.iter().position(|p| p.descriptor.role == AuxRole::RmsNormRowWitness).unwrap();
@@ -26339,15 +26509,15 @@ mod tests {
         }
         let negp = build_aux(&mut auxneg);
         assert!(prove_reverse_rms_norm(&st3, &ops3[0], &p3, v3, negp, &model3,
-            &mut Transcript::new(b"rms-low-negms")).is_none());
+            &mut Transcript::new(b"rms-low-negms"), None).is_none());
     }
 
-    /// O7-deep M1 gate: the AuxPlan is deterministic and covers every aux
-    /// column; per-arity group commitments open/verify; a synthetic multi-op
-    /// graph still crosses the 64-opening cap on the per-op wire and the plan
-    /// reports the aggregated group count.
+    /// O7-deep M1/M2 gate: the AuxPlan is deterministic and covers every aux
+    /// column; per-arity group commitments open/verify; the synthetic
+    /// multi-op RmsNorm graph's full pooled proof verifies under the
+    /// 64-opening cap (RmsNorm is a migrated B1 role).
     #[test]
-    fn o7_m1_aux_plan_and_group_opening() {
+    fn o7_m2_pooled_aux_plan_and_group_opening() {
         use zkie_core::pcs::whir::Whir;
         let mut store = Store::new();
         let (m, d, n_real) = (4usize, 8usize, 5usize);
@@ -26418,11 +26588,11 @@ mod tests {
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
             &PublicStatement::Generic, &model, &execution).expect("synthetic proof");
         let budget = proof_budget(&proof, &proof.aux, &ops, &model).expect("budget");
-        assert!(budget.openings > MAX_EFFECTIVE_OPENINGS,
-            "synthetic graph must cross the per-op cap (K={})", budget.openings);
-        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+        assert!(budget.openings <= MAX_EFFECTIVE_OPENINGS,
+            "pooled wire must fit the 64-opening cap (K={})", budget.openings);
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
             &PublicStatement::Generic, &model, &execution),
-            "per-op wire must still be rejected by the 64-opening cap");
+            "pooled synthetic proof must verify");
         // Wire version and layout tampering are rejected.
         let mut bad: BoundExecutionProof =
             bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
@@ -26434,7 +26604,7 @@ mod tests {
         bad.aux_groups[0].columns += 1;
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad,
             &PublicStatement::Generic, &model, &execution));
-        eprintln!("O7-M1 synthetic: old_K={} aux_groups={} group_cols={} (M2 pooling target)",
+        eprintln!("O7-M2 synthetic: pooled_K={} aux_groups={} group_cols={}",
             budget.openings, plan.groups.len(),
             plan.groups.iter().map(|g| g.1).sum::<usize>());
         let _ = std::fs::remove_dir_all(&cache);
@@ -26755,7 +26925,7 @@ mod tests {
         };
         let mut tp = Transcript::new(b"b1-rmsnorm");
         let (proof, claims) = prove_reverse_rms_norm(
-            &store, &ops[0], &point, value, auxp, &model, &mut tp).expect("rms proof");
+            &store, &ops[0], &point, value, auxp, &model, &mut tp, None).expect("rms proof");
         assert_eq!(claims.len(), 3);
         let refs = RmsAuxRefs {
             row: &descs[0], out: &descs[1], rsqrt_pairs: &descs[2],
@@ -26767,12 +26937,12 @@ mod tests {
         };
         let mut tv = Transcript::new(b"b1-rmsnorm");
         assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
-            &proof, &mut tv).is_some(), "honest RmsNorm must verify");
+            &proof, &mut tv, None).is_some(), "honest RmsNorm must verify");
 
         // Tampered output claim, formula/mean-square values and lookups.
         let mut tv = Transcript::new(b"b1-rmsnorm");
         assert!(verify_reverse_rms_norm(&ops[0], &point, value + Ef::ONE, refs, &model,
-            &proof, &mut tv).is_none());
+            &proof, &mut tv, None).is_none());
         for idx in [1usize, 2, 3, 7] {
             let mut bad: ReverseRmsNormProof =
                 bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
@@ -26784,7 +26954,7 @@ mod tests {
                 out_limb_hi_pairs: &descs[10], out_limb_hi_mult: &descs[11] };
             let mut tv = Transcript::new(b"b1-rmsnorm");
             assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
-                &bad, &mut tv).is_none(), "tampered out eval {idx}");
+                &bad, &mut tv, None).is_none(), "tampered out eval {idx}");
         }
         let mut bad: ReverseRmsNormProof =
             bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
@@ -26796,7 +26966,7 @@ mod tests {
             out_limb_hi_pairs: &descs[10], out_limb_hi_mult: &descs[11] };
         let mut tv = Transcript::new(b"b1-rmsnorm");
         assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
-            &bad, &mut tv).is_none(), "tampered x eval at the ms endpoint");
+            &bad, &mut tv, None).is_none(), "tampered x eval at the ms endpoint");
         let mut bad: ReverseRmsNormProof =
             bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
         bad.rsqrt.table_value += Ef::ONE;
@@ -26807,7 +26977,7 @@ mod tests {
             out_limb_hi_pairs: &descs[10], out_limb_hi_mult: &descs[11] };
         let mut tv = Transcript::new(b"b1-rmsnorm");
         assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
-            &bad, &mut tv).is_none(), "tampered rsqrt table value");
+            &bad, &mut tv, None).is_none(), "tampered rsqrt table value");
 
         // Bound bytes entry.
         let execution = TrustedExecution {
@@ -27144,7 +27314,7 @@ mod tests {
         };
         let mut tp = Transcript::new(b"audit-rmsnorm");
         let (proof, _claims) = prove_reverse_rms_norm(
-            &store, &ops[0], &point, genuine, auxp, &model, &mut tp).expect("honest proof");
+            &store, &ops[0], &point, genuine, auxp, &model, &mut tp, None).expect("honest proof");
 
         // Replay the verifier/prover transcript to the bind position.
         let (_, _, _, rsqrt_id, limb_id, mm, dd, nn) = rms_norm_dims(&ops[0]).unwrap();
@@ -27232,18 +27402,18 @@ mod tests {
             .map(|r| rsqrt_pairs.columns[1][r]).collect();
         let rsqrt_atk = internal_lookup_prove(&store, rsqrt_id, rsqrt_pairs,
             rsqrt_mult, 0, 1, &rsqrt_xs, &rsqrt_ys, &p_rstd_atk, fo3,
-            &model, &mut t).expect("rsqrt atk");
+            &model, &mut t, None).expect("rsqrt atk");
         let lo_xs: Vec<u32> = lo_pairs.columns[0].iter()
             .map(|&v| to_i64(v) as u32).collect();
         let lo_ys: Vec<Goldilocks> = lo_pairs.columns[0].clone();
         let limb_lo_atk = internal_lookup_prove(&store, limb_id, lo_pairs,
-            lo_mult, 0, 0, &lo_xs, &lo_ys, &z_out, fo5, &model, &mut t)
+            lo_mult, 0, 0, &lo_xs, &lo_ys, &z_out, fo5, &model, &mut t, None)
             .expect("limb lo atk");
         let hi_xs: Vec<u32> = hi_pairs.columns[1].iter()
             .map(|&v| to_i64(v) as u32).collect();
         let hi_ys: Vec<Goldilocks> = hi_pairs.columns[1].clone();
         let limb_hi_atk = internal_lookup_prove(&store, limb_id, hi_pairs,
-            hi_mult, 1, 1, &hi_xs, &hi_ys, &z_out, fo6, &model, &mut t)
+            hi_mult, 1, 1, &hi_xs, &hi_ys, &z_out, fo6, &model, &mut t, None)
             .expect("limb hi atk");
         let mut forged_proof = proof;
         forged_proof.bind = fake_bind;
@@ -27260,7 +27430,7 @@ mod tests {
         };
         let mut tv = Transcript::new(b"audit-rmsnorm");
         let got = verify_reverse_rms_norm(&ops[0], &point, forged, refs, &model,
-            &forged_proof, &mut tv);
+            &forged_proof, &mut tv, None);
         assert!(got.is_none(),
             "AUDIT FAILURE: forged RmsNorm output claim was ACCEPTED");
     }
