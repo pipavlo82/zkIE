@@ -1,7 +1,7 @@
 //! B2: prove the full TimesFM graph under a Generic statement and write the
-//! public verification bundle. TimesFM still contains the out-of-scope
-//! fail-closed LayerNormCentered op, so this example reports the unsupported
-//! boundary instead of producing an unverified bundle.
+//! public verification bundle. LayerNormCentered is covered by the LNC reverse
+//! reduction; this example exits 2 only if public execution extraction fails
+//! closed for another reason.
 
 use std::path::Path;
 use std::time::Instant;
@@ -32,7 +32,7 @@ fn main() {
     let execution = match public_execution(&store, &ops, &cached) {
         Some(e) => e,
         None => {
-            eprintln!("TimesFM still hits the fail-closed LayerNormCentered gap; no bundle written");
+            eprintln!("TimesFM public execution extraction failed closed; no bundle written");
             std::process::exit(2);
         }
     };

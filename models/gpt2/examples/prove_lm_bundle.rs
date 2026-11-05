@@ -1,7 +1,7 @@
 //! B2: prove the full GPT-2 graph under a LanguageModel statement and write
-//! the public verification bundle. GPT-2 still contains the out-of-scope
-//! fail-closed LayerNormCentered op, so this example reports the unsupported
-//! boundary instead of producing an unverified bundle.
+//! the public verification bundle. LayerNormCentered is covered by the LNC
+//! reverse reduction; this example exits 2 only if public execution
+//! extraction fails closed for another reason.
 
 use std::path::Path;
 use std::time::Instant;
@@ -33,7 +33,7 @@ fn main() {
     let execution = match public_execution(&store, &ops, &cached) {
         Some(e) => e,
         None => {
-            eprintln!("GPT-2 still hits the fail-closed LayerNormCentered gap; no bundle written");
+            eprintln!("GPT-2 public execution extraction failed closed; no bundle written");
             std::process::exit(2);
         }
     };
@@ -42,9 +42,18 @@ fn main() {
         eprintln!("expected a {m}-token public sequence, got {}", tokens.len());
         std::process::exit(2);
     }
+    // The real prompt for the canonical input is "The sky is" (3 GPT-2
+    // tokens); the teacher-forcing check runs from prompt_len-1. Defaults to
+    // the canonical prompt; PROMPT_LEN overrides for other inputs.
+    let prompt_len = std::env::var("PROMPT_LEN").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(3);
+    if prompt_len == 0 || prompt_len >= m {
+        eprintln!("prompt_len={prompt_len} out of range for m={m}");
+        std::process::exit(2);
+    }
     let stmt = PublicStatement::LanguageModel {
-        prompt: tokens[..1].to_vec(),
-        response: tokens[1..].to_vec(),
+        prompt: tokens[..prompt_len].to_vec(),
+        response: tokens[prompt_len..].to_vec(),
         next_token: None,
     };
     let whir = Whir::new_testing(5);

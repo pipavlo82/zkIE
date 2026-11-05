@@ -81,3 +81,22 @@ Rerun on `fix/soundness-repair` after the eight per-op out-witness fixes
 - B2 bundle/independent-verifier infrastructure remains accepted. The
   path to a monolithic real-model bundle is O7-deep M1 (AuxPlan with
   aggregated out-witness commitments and deferred pooled openings).
+
+## Refresh 2026-11-05 (LNC + Softmax 17-bit window)
+
+- LayerNormCentered is now covered by the LNC reverse reduction
+  (`docs/lnc-reverse.md`), landing directly on the pooled aux wire. GPT-2 and
+  TimesFM `public_execution` now accepts the op (the old exit-2 boundary is
+  gone), and both full graphs pass the LNC path.
+- The B1 Softmax remainder window was widened from 16 to 17 bits (output
+  scale unchanged at 2^16). GPT-2 `op 12 row 2` S=86,741, the original
+  failure, now passes aux preparation.
+- Both real graphs now stop at the **next** Softmax row-sum boundary and fail
+  closed as designed: GPT-2 `op 12 row 8` S=227,312 and TimesFM `op 29 row 4`
+  S=164,266, both above 2^17 = 131,072. Widening to B=18 (S <= 262,144) would
+  cover both and needs a separate decision.
+- B2 harness fixes needed to reach these boundaries: use the canonical
+  16-token input for `m <= 16` and the real 3-token prompt length.
+- Real-weight LNC-only bound proofs over every LayerNormCentered op in the
+  two models are run as separate evidence (`models/*/examples/lnc_real_check.rs`),
+  so LNC coverage does not depend on the remaining Softmax window.

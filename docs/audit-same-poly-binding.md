@@ -163,6 +163,12 @@ challenge; the `verify_same_poly` merged claim is consumed and opened at
 the merged point and at the virtual endpoint, so gamma separation forces
 every claim value to equal the committed out column's evaluation.
 
+The sixth B1 operator, LayerNormCentered (`ReverseReduction::Lnc`), is the
+first op designed directly on this pattern: its 69-column out witness
+(`out, rem_lo/hi, o_lo/hi, 64 bits`) is committed before the challenges and
+the merged claim is consumed by both the direct opening and the pooled aux
+recorder. Attack/tamper evidence in `docs/lnc-reverse.md`.
+
 RmsNorm F2 deviation from the literal `out_lo/out_hi` wording: RmsNorm's
 out is signed, so the witness pins `out + 2^31` to `[0, 2^32)` through two
 16-bit limbs (identity-table lookups) and the extra out-virtual equation

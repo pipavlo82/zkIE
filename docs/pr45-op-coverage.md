@@ -65,6 +65,34 @@ statement through the bound entry (B2/B3, not yet).
 | LayerNormCentered | layer_norm_centered.rs | **no** | GPT-2/TimesFM | out of the five-op scope; stays fail-closed and is listed as a remaining support gap |
 | SoftmaxIndex / Layernorm / BatchedMatMul | some | no | none of the four | out of scope; fail-closed |
 
+## 2b. Softmax row-sum window: S <= 2^17
+
+The reverse Softmax normalization is
+
+    out(i,j) = round(e(i,j) * 2^B / S(i)),     S(i) = sum_j e(i,j),
+
+and the proof commits `rem = e*2^B - out*S + 2^(B-1)` with a B-bit Boolean
+decomposition, enforcing `rem in [0, 2^B)` via
+
+    out*S - 2^B*e - rem + 2^(B-1) = 0.
+
+The true rounding error is `e*2^B - round(e*2^B/S)*S`, whose absolute value is
+at most `S/2`. The half-offset window `[-2^(B-1), 2^(B-1))` therefore contains
+the error exactly when `S <= 2^B`; above that, the honest remainder leaves the
+window and the aux preparation fails closed.
+
+`SOFTMAX_SCALE_BITS` was raised from 16 to **17** after the GPT-2 real graph
+produced an honest row sum of **86,741 (`op 12, row 2`) > 2^16 = 65,536**.
+The new bound is `S <= 2^17 = 131,072`; larger row sums still fail closed.
+Uniqueness is unchanged: the 17-bit decomposition plus Booleanity is
+canonical, and the window `[2^(B-1)-S/2, 2^(B-1)+S/2)` still admits at most
+two consecutive integers for `out`. The forward remains `i64`
+(`out = round_div(e*2^16, S)`); only the proof's remainder width and the
+rescaling virtual coefficients change. Budget: one extra remainder column per
+Softmax op, one extra opening claim, and three extra gamma terms for the added
+bit (one reconstruction, two Booleanity); the PCS opening count K is
+unchanged.
+
 ## 3. Implementation constraints for B1
 
 - New reductions must be EF (claim points/values/terminals), integrate with

@@ -336,7 +336,12 @@ pub fn build_gpt2(
     // wte is tied with the (transposed) lm_head weight, so we reuse lm_head
     // directly via a transposed gather index (emb_idx[i*D + d] = d*VOCAB + token).
     // pos_emb is the input-independent residual (precomputed) and is added after.
-    let tokens_raw = load_i32(&format!("{dir}/tokens_i32.bin"));
+    // The canonical 16-token input matches `gt_argmax_i32.bin`; the 512-token
+    // file is the long-sequence input. Only the first m token ids enter the
+    // graph (the embedding index), so the choice affects the public harness
+    // tensors and statement, not the op graph.
+    let tokens_file = if m <= 16 { "tokens_16_i32.bin" } else { "tokens_i32.bin" };
+    let tokens_raw = load_i32(&format!("{dir}/{tokens_file}"));
     let tokens = store.push_idx(tokens_raw.iter().map(|&v| to_i32(v) as u32).collect());
     let emb_idx: Vec<u32> = (0..m)
         .flat_map(|i| {
