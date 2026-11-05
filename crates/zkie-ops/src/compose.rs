@@ -2448,7 +2448,8 @@ fn verify_reverse_scale_vec_shifted(op: &Op, point: &[Ef], value: Ef,
 /// bits with the ties-up identity
 /// `x*gate_b - out*2^shift + 2^(shift-1) - Σ 2^b bit_b = 0`.
 fn prove_reverse_scale_gate(store: &Store, op: &Op, point: &[Ef], value: Ef,
-    aux: Option<PreparedAux>, out_aux: PreparedAux, transcript: &mut Transcript)
+    aux: Option<PreparedAux>, out_aux: PreparedAux, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseScaleGateProof, Vec<EfClaim>)>
 {
     let (x, gate, col, out, m, n, h, shift) = scale_gate_dims(op)?;
@@ -2517,6 +2518,9 @@ fn prove_reverse_scale_gate(store: &Store, op: &Op, point: &[Ef], value: Ef,
         let bits = vp.final_evals[4..4 + shift as usize].to_vec();
         let idxs: Vec<usize> = (0..shift as usize).collect();
         let points = vec![z.clone(); shift as usize];
+        if let Some(r) = rec.as_deref_mut() {
+            r.record(&aux.descriptor, &idxs, &points, &bits)?;
+        }
         let opening = open_aux(aux, &idxs, &points, &bits)?;
         (vp, bind, merged, z, bits, Some(opening))
     };
@@ -2524,6 +2528,10 @@ fn prove_reverse_scale_gate(store: &Store, op: &Op, point: &[Ef], value: Ef,
     r_pad.resize(out_aux_arity, Ef::ZERO);
     let mut z_pad = z.clone();
     z_pad.resize(out_aux_arity, Ef::ZERO);
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&out_aux.descriptor, &[0, 0],
+            &[r_pad.clone(), z_pad.clone()], &[merged, prod.final_evals[3]])?;
+    }
     let out_opening = open_aux(out_aux, &[0, 0],
         &[r_pad, z_pad], &[merged, prod.final_evals[3]])?;
     let x_eval = prod.final_evals[1];
@@ -2542,7 +2550,8 @@ fn prove_reverse_scale_gate(store: &Store, op: &Op, point: &[Ef], value: Ef,
 
 fn verify_reverse_scale_gate(op: &Op, point: &[Ef], value: Ef,
     aux: Option<&AuxDescriptor>, out_aux: &AuxDescriptor,
-    proof: &ReverseScaleGateProof, transcript: &mut Transcript)
+    proof: &ReverseScaleGateProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<Vec<EfClaim>>
 {
     let (x, gate, col, _out, m, n, h, shift) = scale_gate_dims(op)?;
@@ -2585,10 +2594,12 @@ fn verify_reverse_scale_gate(op: &Op, point: &[Ef], value: Ef,
         || fc != efo::virtual_eval(&terms, fe) { return None; }
     if shift > 0 {
         let d = aux?;
-        if !verify_aux_open(d, &(0..shift as usize).collect::<Vec<_>>(),
-            &vec![z.clone(); shift as usize], &proof.remainder_bits, proof.opening.as_ref()?) {
-            return None;
-        }
+        let ridx: Vec<usize> = (0..shift as usize).collect();
+        let rpoints = vec![z.clone(); shift as usize];
+        if let Some(r) = rec.as_deref_mut() {
+            r.record(d, &ridx, &rpoints, &proof.remainder_bits)?;
+        } else if !verify_aux_open(d, &ridx, &rpoints, &proof.remainder_bits,
+            proof.opening.as_ref()?) { return None; }
         for j in 0..shift as usize {
             if fe[4 + j] != proof.remainder_bits[j] { return None; }
         }
@@ -2600,7 +2611,9 @@ fn verify_reverse_scale_gate(op: &Op, point: &[Ef], value: Ef,
     r_pad.resize(out_aux.arity, Ef::ZERO);
     let mut z_pad = z.clone();
     z_pad.resize(out_aux.arity, Ef::ZERO);
-    if !verify_aux_open(out_aux, &[0, 0],
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(out_aux, &[0, 0], &[r_pad.clone(), z_pad.clone()], &[merged, fe3])?;
+    } else if !verify_aux_open(out_aux, &[0, 0],
         &[r_pad, z_pad], &[merged, fe3], &proof.out_opening) { return None; }
     let mut gp = Vec::with_capacity(n_log + lgl - h_log);
     for k in 0..n_log { gp.push(ef_u64(((col >> k) & 1) as u64)); }
@@ -2655,7 +2668,7 @@ fn softmax_dims(op: &Op) -> Option<(T, T, T, T, usize, usize)> {
 fn prove_reverse_softmax(store: &Store, op: &Op, point: &[Ef], value: Ef,
     pairs: PreparedAux, mult: PreparedAux, sum_aux: PreparedAux, rem_aux: PreparedAux,
     out_aux: PreparedAux, model: &TrustedModelManifest, dynamic_table: bool,
-    transcript: &mut Transcript)
+    transcript: &mut Transcript, mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseSoftmaxProof, Vec<EfClaim>)>
 {
     let (idx, e, out, table, m, n) = softmax_dims(op)?;
@@ -2743,20 +2756,33 @@ fn prove_reverse_softmax(store: &Store, op: &Op, point: &[Ef], value: Ef,
     r_pad.resize(out_aux_arity, Ef::ZERO);
     let mut z_resc_pad = z_resc.clone();
     z_resc_pad.resize(out_aux_arity, Ef::ZERO);
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&out_aux.descriptor, &[0, 0],
+            &[r_pad.clone(), z_resc_pad.clone()], &[merged, rescale.final_evals[1]])?;
+    }
     let out_opening = open_aux(out_aux, &[0, 0],
         &[r_pad, z_resc_pad], &[merged, rescale.final_evals[1]])?;
     let sum_points = vec![z_row.clone(), z_resc.clone()];
     let sum_values = vec![row_sum.final_evals[1], rescale.final_evals[2]];
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&sum_aux.descriptor, &[0, 0], &sum_points, &sum_values)?;
+    }
     let sum_opening = open_aux(sum_aux, &[0, 0], &sum_points, &sum_values)?;
     let e_values = vec![row_sum.final_evals[2], rescale.final_evals[3]];
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&pairs.descriptor, &[1, 1], &sum_points, &e_values)?;
+    }
     let e_opening = prove_batch_open_committed_ef(
         &pairs.whir, &pairs.descriptor.commitment, &pairs.protocol,
         pairs.descriptor.columns, pairs.prover_data.clone(),
         &[1, 1], vec![pairs.columns[1].clone()], &sum_points, &e_values).ok()?;
     let rem_values = rescale.final_evals[4..4 + SOFTMAX_SCALE_BITS].to_vec();
-    let rem_opening = open_aux(rem_aux,
-        &(0..SOFTMAX_SCALE_BITS).collect::<Vec<_>>(),
-        &vec![z_resc.clone(); SOFTMAX_SCALE_BITS], &rem_values)?;
+    let rem_idx: Vec<usize> = (0..SOFTMAX_SCALE_BITS).collect();
+    let rem_points = vec![z_resc.clone(); SOFTMAX_SCALE_BITS];
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&rem_aux.descriptor, &rem_idx, &rem_points, &rem_values)?;
+    }
+    let rem_opening = open_aux(rem_aux, &rem_idx, &rem_points, &rem_values)?;
     let lookup_value = ef_eval(&pairs.columns[1], &q);
     let fake = Op::Lookup { idx, out: e, table };
     let (lookup, claims, _) = prove_reverse_lookup(
@@ -2768,8 +2794,8 @@ fn prove_reverse_softmax(store: &Store, op: &Op, point: &[Ef], value: Ef,
 fn verify_reverse_softmax(op: &Op, point: &[Ef], value: Ef,
     pairs: &AuxDescriptor, mult: &AuxDescriptor, sum_aux: &AuxDescriptor,
     rem_aux: &AuxDescriptor, out_aux: &AuxDescriptor, model: &TrustedModelManifest,
-    dynamic_table: bool, proof: &ReverseSoftmaxProof, transcript: &mut Transcript)
-    -> Option<Vec<EfClaim>>
+    dynamic_table: bool, proof: &ReverseSoftmaxProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
 {
     let (idx, e, _out, table, m, n) = softmax_dims(op)?;
     let len = m.checked_mul(n)?;
@@ -2817,17 +2843,28 @@ fn verify_reverse_softmax(op: &Op, point: &[Ef], value: Ef,
     r_pad.resize(out_aux.arity, Ef::ZERO);
     let mut z_resc_pad = z_resc.clone();
     z_resc_pad.resize(out_aux.arity, Ef::ZERO);
-    if !verify_aux_open(out_aux, &[0, 0],
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(out_aux, &[0, 0], &[r_pad.clone(), z_resc_pad.clone()],
+            &[merged, fs1])?;
+    } else if !verify_aux_open(out_aux, &[0, 0],
         &[r_pad, z_resc_pad], &[merged, fs1], &proof.out_opening) { return None; }
     let sum_points = vec![z_row.clone(), z_resc.clone()];
-    if !verify_aux_open(sum_aux, &[0, 0], &sum_points,
-        &[fr[1], fs[2]], &proof.sum_opening) { return None; }
-    if !verify_aux_open(pairs, &[1, 1], &sum_points,
-        &[fr[2], fs[3]], &proof.e_opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(sum_aux, &[0, 0], &sum_points, &[fr[1], fs[2]])?;
+        r.record(pairs, &[1, 1], &sum_points, &[fr[2], fs[3]])?;
+    } else {
+        if !verify_aux_open(sum_aux, &[0, 0], &sum_points,
+            &[fr[1], fs[2]], &proof.sum_opening) { return None; }
+        if !verify_aux_open(pairs, &[1, 1], &sum_points,
+            &[fr[2], fs[3]], &proof.e_opening) { return None; }
+    }
     let rem_values = fs[4..4 + SOFTMAX_SCALE_BITS].to_vec();
-    if !verify_aux_open(rem_aux,
-        &(0..SOFTMAX_SCALE_BITS).collect::<Vec<_>>(),
-        &vec![z_resc; SOFTMAX_SCALE_BITS], &rem_values, &proof.rem_opening) { return None; }
+    let rem_idx: Vec<usize> = (0..SOFTMAX_SCALE_BITS).collect();
+    let rem_points = vec![z_resc; SOFTMAX_SCALE_BITS];
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(rem_aux, &rem_idx, &rem_points, &rem_values)?;
+    } else if !verify_aux_open(rem_aux, &rem_idx, &rem_points,
+        &rem_values, &proof.rem_opening) { return None; }
     let fake = Op::Lookup { idx, out: e, table };
     let lk = verify_reverse_lookup(&fake, &q, proof.lookup_value, pairs, mult, model, dynamic_table,
         None, &proof.lookup, transcript).map(|(claims, _)| claims);
@@ -2929,7 +2966,7 @@ fn ssi_range_terms(gamma: Ef, lg_l: usize) -> Vec<(Ef, Vec<usize>)> {
 /// selection and relu/clamp/range relations, binds the output idx claim to the
 /// committed idx_f column, and returns x/mask claims at the formula endpoint.
 fn prove_reverse_stable_softmax_index(store: &Store, op: &Op, point: &[Ef], value: Ef,
-    aux: PreparedAux, transcript: &mut Transcript)
+    aux: PreparedAux, transcript: &mut Transcript, mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseStableSoftmaxIndexProof, Vec<EfClaim>)>
 {
     let (x, mask, out, offset, table_len, m, n) = stable_softmax_index_dims(op)?;
@@ -3061,6 +3098,9 @@ fn prove_reverse_stable_softmax_index(store: &Store, op: &Op, point: &[Ef], valu
     let mut r_pad = bind.merged_point.clone();
     r_pad.resize(aux.descriptor.arity, Ef::ZERO);
     idxs_o.push(4); points_o.push(r_pad); values_o.push(merged);
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&aux.descriptor, &idxs_o, &points_o, &values_o)?;
+    }
     let opening = open_aux(aux, &idxs_o, &points_o, &values_o)?;
     Some((ReverseStableSoftmaxIndexProof { formula, row, range, bind, x_eval, mask_eval, opening },
         vec![
@@ -3070,8 +3110,8 @@ fn prove_reverse_stable_softmax_index(store: &Store, op: &Op, point: &[Ef], valu
 }
 
 fn verify_reverse_stable_softmax_index(op: &Op, point: &[Ef], value: Ef,
-    aux: &AuxDescriptor, proof: &ReverseStableSoftmaxIndexProof, transcript: &mut Transcript)
-    -> Option<Vec<EfClaim>>
+    aux: &AuxDescriptor, proof: &ReverseStableSoftmaxIndexProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
 {
     let (x, mask, _out, offset, table_len, m, n) = stable_softmax_index_dims(op)?;
     let len = m.checked_mul(n)?;
@@ -3142,7 +3182,9 @@ fn verify_reverse_stable_softmax_index(op: &Op, point: &[Ef], value: Ef,
         idxs.push(col); points.push(z_c.clone()); values.push(fc[col]);
     }
     idxs.push(4); points.push(r_pad); values.push(merged);
-    if !verify_aux_open(aux, &idxs, &points, &values, &proof.opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(aux, &idxs, &points, &values)?;
+    } else if !verify_aux_open(aux, &idxs, &points, &values, &proof.opening) { return None; }
     Some(vec![
         EfClaim { tensor_id: x, point: z_f.clone(), value: proof.x_eval },
         EfClaim { tensor_id: mask, point: z_f, value: proof.mask_eval },
@@ -4375,7 +4417,7 @@ struct ReverseRopeProof {
 
 fn prove_reverse_rope(store: &Store, op: &Op, point: &[Ef], value: Ef,
     aux: RopeAux, out_aux: PreparedAux, model: &TrustedModelManifest,
-    transcript: &mut Transcript)
+    transcript: &mut Transcript, mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseRopeProof, Vec<EfClaim>)>
 {
     let (x, cos, sin, out, range_table, m, d, shift) = rope_dims(op)?;
@@ -4480,6 +4522,12 @@ fn prove_reverse_rope(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let _ = r_k;
     let pad = |mut p: Vec<Ef>| { p.resize(out_aux_arity, Ef::ZERO); p };
     let r_pt = pad(bind.merged_point.clone());
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&out_aux.descriptor, &[0, 0, 0, 0, 0, 0],
+            &[r_pt.clone(), pad(point.to_vec()), pad(p0.clone()), pad(p1.clone()),
+              pad(q0.clone()), pad(q1.clone())],
+            &[merged, value, v0, v1, w_f, w_s])?;
+    }
     let out_opening = open_aux(out_aux, &[0, 0, 0, 0, 0, 0],
         &[r_pt, pad(point.to_vec()), pad(p0), pad(p1), pad(q0), pad(q1)],
         &[merged, value, v0, v1, w_f, w_s])?;
@@ -4488,11 +4536,11 @@ fn prove_reverse_rope(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let rf_xs: Vec<u32> = rem_f.columns[0].iter().map(|&v| to_i64(v) as u32).collect();
     let rf_ys: Vec<Goldilocks> = rem_f.columns[0].clone();
     let rem_f_proof = internal_lookup_prove(store, range_table, rem_f, mult_f, 0, 0,
-        &rf_xs, &rf_ys, &z_f, first.final_evals[6], model, transcript, None)?;
+        &rf_xs, &rf_ys, &z_f, first.final_evals[6], model, transcript, rec.as_deref_mut())?;
     let rs_xs: Vec<u32> = rem_s.columns[0].iter().map(|&v| to_i64(v) as u32).collect();
     let rs_ys: Vec<Goldilocks> = rem_s.columns[0].clone();
     let rem_s_proof = internal_lookup_prove(store, range_table, rem_s, mult_s, 0, 0,
-        &rs_xs, &rs_ys, &z_s, second.final_evals[6], model, transcript, None)?;
+        &rs_xs, &rs_ys, &z_s, second.final_evals[6], model, transcript, rec.as_deref_mut())?;
 
     let table_p_f = rope_table_point(&z_f, half_log, head_log)?;
     let table_p_s = rope_table_point(&z_s, half_log, head_log)?;
@@ -4513,7 +4561,8 @@ fn prove_reverse_rope(store: &Store, op: &Op, point: &[Ef], value: Ef,
 
 fn verify_reverse_rope(op: &Op, point: &[Ef], value: Ef,
     aux: RopeAuxRefs<'_>, out_aux: &AuxDescriptor, model: &TrustedModelManifest,
-    proof: &ReverseRopeProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
+    proof: &ReverseRopeProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
 {
     let (x, cos, sin, _out, range_table, m, d, shift) = rope_dims(op)?;
     // heads is not in the op; derive it from the trusted manifest shape.
@@ -4584,16 +4633,21 @@ fn verify_reverse_rope(op: &Op, point: &[Ef], value: Ef,
     ], transcript)?;
     let pad = |mut p: Vec<Ef>| { p.resize(out_aux.arity, Ef::ZERO); p };
     let r_pt = pad(merged_point);
-    if !verify_aux_open(out_aux, &[0, 0, 0, 0, 0, 0],
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(out_aux, &[0, 0, 0, 0, 0, 0],
+            &[r_pt.clone(), pad(point.to_vec()), pad(p0.clone()), pad(p1.clone()),
+              pad(q0.clone()), pad(q1.clone())],
+            &[merged, value, proof.v0, proof.v1, ff[5], fs[5]])?;
+    } else if !verify_aux_open(out_aux, &[0, 0, 0, 0, 0, 0],
         &[r_pt, pad(point.to_vec()), pad(p0), pad(p1), pad(q0), pad(q1)],
         &[merged, value, proof.v0, proof.v1, ff[5], fs[5]], &proof.out_opening) {
         return None;
     }
 
     internal_lookup_verify(range_table, aux.rem_f, aux.mult_f, 0, 0, &z_f,
-        ff[6], model, &proof.rem_f, transcript, None)?;
+        ff[6], model, &proof.rem_f, transcript, rec.as_deref_mut())?;
     internal_lookup_verify(range_table, aux.rem_s, aux.mult_s, 0, 0, &z_s,
-        fs[6], model, &proof.rem_s, transcript, None)?;
+        fs[6], model, &proof.rem_s, transcript, rec.as_deref_mut())?;
 
     let table_p_f = rope_table_point(&z_f, half_log, head_log)?;
     let table_p_s = rope_table_point(&z_s, half_log, head_log)?;
@@ -8977,7 +9031,8 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 };
                 let outp = aux.remove(&(op_index, AuxRole::ScaleGateOut))?;
                 let (proof, incoming) = prove_reverse_scale_gate(
-                    store, op, &point, value, auxp, outp, transcript)?;
+                    store, op, &point, value, auxp, outp, transcript,
+                    aux_rec.as_deref_mut())?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -8995,7 +9050,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                     aux.remove(&(op_index, AuxRole::SoftmaxSum))?,
                     aux.remove(&(op_index, AuxRole::SoftmaxRemainder))?,
                     aux.remove(&(op_index, AuxRole::SoftmaxOut))?,
-                    model, dynamic, transcript)?;
+                    model, dynamic, transcript, aux_rec.as_deref_mut())?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -9005,7 +9060,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
             Op::StableSoftmaxIndex { .. } => {
                 let auxp = aux.remove(&(op_index, AuxRole::StableSoftmaxIndexWitness))?;
                 let (proof, incoming) = prove_reverse_stable_softmax_index(
-                    store, op, &point, value, auxp, transcript)?;
+                    store, op, &point, value, auxp, transcript, aux_rec.as_deref_mut())?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -9047,7 +9102,8 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 };
                 let outp = take(AuxRole::RopeOut)?;
                 let (proof, incoming) = prove_reverse_rope(
-                    store, op, &point, value, auxp, outp, model?, transcript)?;
+                    store, op, &point, value, auxp, outp, model?, transcript,
+                    aux_rec.as_deref_mut())?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -9394,7 +9450,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 let out_descriptor = aux.iter().find(|a| a.op_index == op_index
                     && a.role == AuxRole::ScaleGateOut);
                 for c in verify_reverse_scale_gate(op, &point, value, descriptor,
-                    out_descriptor?, proof, transcript)? {
+                    out_descriptor?, proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -9410,7 +9466,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 let rem_aux = find(AuxRole::SoftmaxRemainder)?;
                 let out_aux = find(AuxRole::SoftmaxOut)?;
                 for c in verify_reverse_softmax(op, &point, value, pairs, mult, sum_aux, rem_aux,
-                    out_aux, model, dynamic, proof, transcript)? {
+                    out_aux, model, dynamic, proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -9419,7 +9475,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 let descriptor = aux.iter().find(|a| a.op_index == op_index
                     && a.role == AuxRole::StableSoftmaxIndexWitness)?;
                 for c in verify_reverse_stable_softmax_index(op, &point, value, descriptor,
-                    proof, transcript)? {
+                    proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -9456,7 +9512,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 };
                 let out_aux = find(AuxRole::RopeOut)?;
                 for c in verify_reverse_rope(op, &point, value, refs, out_aux,
-                    model?, proof, transcript)? {
+                    model?, proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -16582,9 +16638,11 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             ReverseReduction::ScaleGate { proof } => {
                 b.virtual_proof(&proof.prod, 3)?;
                 b.same_poly(&proof.bind)?;
-                b.opening(&proof.out_opening, 2)?;
-                if let Some(o) = &proof.opening {
-                    b.opening(o, proof.remainder_bits.len())?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.out_opening, 2)?;
+                    if let Some(o) = &proof.opening {
+                        b.opening(o, proof.remainder_bits.len())?;
+                    }
                 }
             }
             ReverseReduction::Softmax { proof } => {
@@ -16597,17 +16655,21 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.virtual_proof(&proof.row_sum, 3)?;
                 b.virtual_proof(&proof.rescale, 3)?;
                 b.same_poly(&proof.bind)?;
-                b.opening(&proof.out_opening, 2)?;
-                b.opening(&proof.sum_opening, 2)?;
-                b.opening(&proof.e_opening, 2)?;
-                b.opening(&proof.rem_opening, SOFTMAX_SCALE_BITS)?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.out_opening, 2)?;
+                    b.opening(&proof.sum_opening, 2)?;
+                    b.opening(&proof.e_opening, 2)?;
+                    b.opening(&proof.rem_opening, SOFTMAX_SCALE_BITS)?;
+                }
             }
             ReverseReduction::StableSoftmaxIndex { proof } => {
                 b.virtual_proof(&proof.formula, 3)?;
                 b.virtual_proof(&proof.row, 3)?;
                 b.virtual_proof(&proof.range, 3)?;
                 b.same_poly(&proof.bind)?;
-                b.opening(&proof.opening, ssi_open_claims)?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.opening, ssi_open_claims)?;
+                }
             }
             ReverseReduction::RmsNorm { proof } => {
                 b.virtual_proof(&proof.row, 3)?;
@@ -16635,13 +16697,17 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.virtual_proof(&proof.first, 3)?;
                 b.virtual_proof(&proof.second, 3)?;
                 b.same_poly(&proof.bind)?;
-                b.opening(&proof.out_opening, 6)?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.out_opening, 6)?;
+                }
                 for l in [&proof.rem_f, &proof.rem_s] {
                     b.fractional(&l.witness)?;
                     b.fractional(&l.table)?;
                     b.virtual_proof(&l.padding, 3)?;
-                    b.opening(&l.pairs_opening, 4)?;
-                    b.opening(&l.multiplicity_opening, 2)?;
+                    if proof_aux_layout < 2 {
+                        b.opening(&l.pairs_opening, 4)?;
+                        b.opening(&l.multiplicity_opening, 2)?;
+                    }
                     if l.table_opening.is_some() { b.base_opening()?; }
                 }
             }
@@ -26012,31 +26078,31 @@ mod tests {
         let mut tp = Transcript::new(b"b1-softmax");
         let (proof, claims) = prove_reverse_softmax(
             &store, &ops[0], &point, value, pairs, mult, sum_aux, rem_aux, out_aux,
-            &model, false, &mut tp).unwrap();
+            &model, false, &mut tp, None).unwrap();
         assert_eq!(claims.len(), 1, "static Softmax returns the idx claim");
         let mut tv = Transcript::new(b"b1-softmax");
         let got = verify_reverse_softmax(
             &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
-            &model, false, &proof, &mut tv);
+            &model, false, &proof, &mut tv, None);
         assert!(got.is_some(), "honest Softmax must verify");
         let mut tv = Transcript::new(b"b1-softmax");
         assert!(verify_reverse_softmax(
             &ops[0], &point, value + Ef::ONE, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
-            &model, false, &proof, &mut tv).is_none());
+            &model, false, &proof, &mut tv, None).is_none());
         let mut bad: ReverseSoftmaxProof =
             bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
         bad.row_sum.final_evals[1] += Ef::ONE;
         let mut tv = Transcript::new(b"b1-softmax");
         assert!(verify_reverse_softmax(
             &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
-            &model, false, &bad, &mut tv).is_none());
+            &model, false, &bad, &mut tv, None).is_none());
         let mut bad: ReverseSoftmaxProof =
             bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
         bad.rescale.final_evals[4] += Ef::ONE;
         let mut tv = Transcript::new(b"b1-softmax");
         assert!(verify_reverse_softmax(
             &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
-            &model, false, &bad, &mut tv).is_none());
+            &model, false, &bad, &mut tv, None).is_none());
 
         // Bound bytes entry: idx is the only execution input; out the output.
         let execution = TrustedExecution {
@@ -26096,7 +26162,7 @@ mod tests {
         let mut tp = Transcript::new(b"audit-softmax");
         let (proof, _claims) = prove_reverse_softmax(
             &store, &ops[0], &point, genuine, pairs, mult, sum_aux, rem_aux, out_aux,
-            &model, false, &mut tp).expect("honest proof");
+            &model, false, &mut tp, None).expect("honest proof");
         let mut tp = Transcript::new(b"audit-softmax");
         tp.absorb(&bincode::serialize(&out_commit).unwrap());
         tp.absorb(b"zkie-softmax-v1");
@@ -26142,7 +26208,7 @@ mod tests {
         let rd = take(&mut sa2, AuxRole::SoftmaxRemainder).descriptor;
         let mut tv = Transcript::new(b"audit-softmax");
         let got = verify_reverse_softmax(&ops[0], &point, forged, &pd, &md, &sd, &rd,
-            &outd, &model, false, &forged_proof, &mut tv);
+            &outd, &model, false, &forged_proof, &mut tv, None);
         assert!(got.is_none(),
             "AUDIT FAILURE: forged Softmax output claim was ACCEPTED");
     }
@@ -26177,50 +26243,50 @@ mod tests {
 
         let mut tp = Transcript::new(b"b1-ssi");
         let (proof, claims) = prove_reverse_stable_softmax_index(
-            &store, &ops[0], &point, value, aux, &mut tp).expect("SSI proof");
+            &store, &ops[0], &point, value, aux, &mut tp, None).expect("SSI proof");
         assert_eq!(claims.len(), 2, "SSI returns x and mask claims");
         assert_eq!(claims[0].tensor_id, x);
         assert_eq!(claims[1].tensor_id, mask);
         let mut tv = Transcript::new(b"b1-ssi");
         assert!(verify_reverse_stable_softmax_index(
-            &ops[0], &point, value, &desc, &proof, &mut tv).is_some(),
+            &ops[0], &point, value, &desc, &proof, &mut tv, None).is_some(),
             "honest SSI must verify");
 
         // Output / x-eval / formula-value / row-sel / range-bit tamper.
         let mut tv = Transcript::new(b"b1-ssi");
         assert!(verify_reverse_stable_softmax_index(
-            &ops[0], &point, value + Ef::ONE, &desc, &proof, &mut tv).is_none());
+            &ops[0], &point, value + Ef::ONE, &desc, &proof, &mut tv, None).is_none());
         let mut bad = proof.clone();
         bad.x_eval += Ef::ONE;
         let mut tv = Transcript::new(b"b1-ssi");
         assert!(verify_reverse_stable_softmax_index(
-            &ops[0], &point, value, &desc, &bad, &mut tv).is_none(),
+            &ops[0], &point, value, &desc, &bad, &mut tv, None).is_none(),
             "tampered x eval must break x+mask=masked");
         for pos in [1usize, 2, 3, 4, 5] {
             let mut bad = proof.clone();
             bad.formula.final_evals[pos] += Ef::ONE;
             let mut tv = Transcript::new(b"b1-ssi");
             assert!(verify_reverse_stable_softmax_index(
-                &ops[0], &point, value, &desc, &bad, &mut tv).is_none(),
+                &ops[0], &point, value, &desc, &bad, &mut tv, None).is_none(),
                 "tampered formula eval {pos} must be rejected");
         }
         let mut bad = proof.clone();
         bad.row.final_evals[1] += Ef::ONE;
         let mut tv = Transcript::new(b"b1-ssi");
         assert!(verify_reverse_stable_softmax_index(
-            &ops[0], &point, value, &desc, &bad, &mut tv).is_none(),
+            &ops[0], &point, value, &desc, &bad, &mut tv, None).is_none(),
             "tampered sel eval must be rejected");
         let mut bad = proof.clone();
         bad.range.final_evals[6] += Ef::ONE;
         let mut tv = Transcript::new(b"b1-ssi");
         assert!(verify_reverse_stable_softmax_index(
-            &ops[0], &point, value, &desc, &bad, &mut tv).is_none(),
+            &ops[0], &point, value, &desc, &bad, &mut tv, None).is_none(),
             "tampered range bit must be rejected");
         let mut wrong = desc.clone();
         wrong.columns += 1;
         let mut tv = Transcript::new(b"b1-ssi");
         assert!(verify_reverse_stable_softmax_index(
-            &ops[0], &point, value, &wrong, &proof, &mut tv).is_none());
+            &ops[0], &point, value, &wrong, &proof, &mut tv, None).is_none());
 
         // Prover-side witness authentication: any aux column that is not the
         // forward witness must fail closed before a proof is emitted.
@@ -26230,7 +26296,7 @@ mod tests {
         tampered.columns[0][0] += Goldilocks::ONE;
         assert!(prove_reverse_stable_softmax_index(
             &store, &ops[0], &point, value, tampered,
-            &mut Transcript::new(b"b1-ssi")).is_none(),
+            &mut Transcript::new(b"b1-ssi"), None).is_none(),
             "masked column not equal to x+mask must fail closed");
         let aux3 = prepare_stable_softmax_index_aux(&store, &ops, &model)
             .expect("SSI aux3").remove(0);
@@ -26238,7 +26304,7 @@ mod tests {
         tampered.columns[4][0] += Goldilocks::ONE;
         assert!(prove_reverse_stable_softmax_index(
             &store, &ops[0], &point, value, tampered,
-            &mut Transcript::new(b"b1-ssi")).is_none(),
+            &mut Transcript::new(b"b1-ssi"), None).is_none(),
             "idx_f not equal to the forward output must fail closed");
 
         // A forged clamped index (idx != min(trunc,L-1)) has no aux witness.
@@ -26315,7 +26381,7 @@ mod tests {
         let commit = aux_prove.descriptor.commitment.clone();
         let mut tp = Transcript::new(b"audit-ssi");
         let (proof, _claims) = prove_reverse_stable_softmax_index(
-            &store, &ops[0], &point, genuine, aux_prove, &mut tp).expect("honest proof");
+            &store, &ops[0], &point, genuine, aux_prove, &mut tp, None).expect("honest proof");
         let mut tp = Transcript::new(b"audit-ssi");
         tp.absorb(&bincode::serialize(&commit).unwrap());
         tp.absorb(b"zkie-stable-softmax-index-v1");
@@ -26365,7 +26431,7 @@ mod tests {
             .expect("aux2").remove(0).descriptor;
         let mut tv = Transcript::new(b"audit-ssi");
         let got = verify_reverse_stable_softmax_index(&ops[0], &point, forged,
-            &desc, &forged_proof, &mut tv);
+            &desc, &forged_proof, &mut tv, None);
         assert!(got.is_none(),
             "AUDIT FAILURE: forged StableSoftmaxIndex output claim was ACCEPTED");
     }
@@ -26807,7 +26873,7 @@ mod tests {
         let forged = genuine + Ef::ONE;
         let mut tp = Transcript::new(b"audit-rope");
         let (proof, _claims) = prove_reverse_rope(
-            &store, &ops[0], &point, genuine, auxp, out_aux, &model, &mut tp)
+            &store, &ops[0], &point, genuine, auxp, out_aux, &model, &mut tp, None)
             .expect("honest proof");
         // Replay to the bind state.
         let mut tp = Transcript::new(b"audit-rope");
@@ -26856,7 +26922,7 @@ mod tests {
         let outd = prepare_rope_out_aux(&store, &ops).unwrap().remove(0).descriptor;
         let mut tv = Transcript::new(b"audit-rope");
         let got = verify_reverse_rope(&ops[0], &point, forged, refs, &outd, &model,
-            &forged_proof, &mut tv);
+            &forged_proof, &mut tv, None);
         assert!(got.is_none(), "AUDIT FAILURE: forged RoPE output claim was ACCEPTED");
     }
 
@@ -27056,17 +27122,17 @@ mod tests {
         let out_desc = out_aux.descriptor.clone();
         let mut tp = Transcript::new(b"b1-rope");
         let (proof, claims) = prove_reverse_rope(
-            &store, &ops[0], &point, value, auxp, out_aux, &model, &mut tp).expect("rope proof");
+            &store, &ops[0], &point, value, auxp, out_aux, &model, &mut tp, None).expect("rope proof");
         assert_eq!(claims.len(), 8);
         let refs = RopeAuxRefs { rem_f: &descs[0], rem_s: &descs[1],
             mult_f: &descs[2], mult_s: &descs[3] };
         let mut tv = Transcript::new(b"b1-rope");
         assert!(verify_reverse_rope(&ops[0], &point, value, refs, &out_desc, &model,
-            &proof, &mut tv).is_some(), "honest RoPE must verify");
+            &proof, &mut tv, None).is_some(), "honest RoPE must verify");
 
         let mut tv = Transcript::new(b"b1-rope");
         assert!(verify_reverse_rope(&ops[0], &point, value + Ef::ONE, refs, &out_desc, &model,
-            &proof, &mut tv).is_none());
+            &proof, &mut tv, None).is_none());
         for which in 0..3usize {
             let mut bad: ReverseRopeProof =
                 bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
@@ -27079,7 +27145,7 @@ mod tests {
                 mult_f: &descs[2], mult_s: &descs[3] };
             let mut tv = Transcript::new(b"b1-rope");
             assert!(verify_reverse_rope(&ops[0], &point, value, refs, &out_desc, &model,
-                &bad, &mut tv).is_none(), "tampered RoPE field {which}");
+                &bad, &mut tv, None).is_none(), "tampered RoPE field {which}");
         }
         let mut wrong = descs[0].clone();
         wrong.columns += 1;
@@ -27087,7 +27153,7 @@ mod tests {
             mult_f: &descs[2], mult_s: &descs[3] };
         let mut tv = Transcript::new(b"b1-rope");
         assert!(verify_reverse_rope(&ops[0], &point, value, refs, &out_desc, &model,
-            &proof, &mut tv).is_none());
+            &proof, &mut tv, None).is_none());
 
         // Bound bytes entry: x/cos/sin are execution inputs, out the output.
         let execution = TrustedExecution {
@@ -27666,36 +27732,36 @@ mod tests {
             let out_desc = out_aux.descriptor.clone();
             let mut tp = Transcript::new(b"b1-scalegate");
             let (proof, claims) = prove_reverse_scale_gate(
-                &store, &ops[0], &point, value, aux, out_aux, &mut tp).unwrap();
+                &store, &ops[0], &point, value, aux, out_aux, &mut tp, None).unwrap();
             assert_eq!(claims.len(), 2);
             assert_eq!(claims[0].tensor_id, x);
             assert_eq!(claims[1].tensor_id, gate);
             let mut tv = Transcript::new(b"b1-scalegate");
             let got = verify_reverse_scale_gate(
-                &ops[0], &point, value, auxd.as_ref(), &out_desc, &proof, &mut tv);
+                &ops[0], &point, value, auxd.as_ref(), &out_desc, &proof, &mut tv, None);
             assert!(got.is_some(), "shift={shift} honest ScaleGate must verify");
             // Tampered output claim.
             let mut tv = Transcript::new(b"b1-scalegate");
             assert!(verify_reverse_scale_gate(
-                &ops[0], &point, value + Ef::ONE, auxd.as_ref(), &out_desc, &proof, &mut tv).is_none());
+                &ops[0], &point, value + Ef::ONE, auxd.as_ref(), &out_desc, &proof, &mut tv, None).is_none());
             // Tampered x eval inside the product virtual.
             let mut bad = proof.clone();
             bad.prod.final_evals[1] += Ef::ONE;
             let mut tv = Transcript::new(b"b1-scalegate");
             assert!(verify_reverse_scale_gate(
-                &ops[0], &point, value, auxd.as_ref(), &out_desc, &bad, &mut tv).is_none());
+                &ops[0], &point, value, auxd.as_ref(), &out_desc, &bad, &mut tv, None).is_none());
             if shift > 0 {
                 let mut bad = proof.clone();
                 bad.remainder_bits[0] += Ef::ONE;
                 let mut tv = Transcript::new(b"b1-scalegate");
                 assert!(verify_reverse_scale_gate(
-                    &ops[0], &point, value, auxd.as_ref(), &out_desc, &bad, &mut tv).is_none());
+                    &ops[0], &point, value, auxd.as_ref(), &out_desc, &bad, &mut tv, None).is_none());
                 // Descriptor with the wrong column count is rejected.
                 let mut wrong = auxd.clone().unwrap();
                 wrong.columns += 1;
                 let mut tv = Transcript::new(b"b1-scalegate");
                 assert!(verify_reverse_scale_gate(
-                    &ops[0], &point, value, Some(&wrong), &out_desc, &proof, &mut tv).is_none());
+                    &ops[0], &point, value, Some(&wrong), &out_desc, &proof, &mut tv, None).is_none());
             }
         }
     }
@@ -27723,7 +27789,7 @@ mod tests {
         let out_commit = out_aux.descriptor.commitment.clone();
         let mut tp = Transcript::new(b"audit-scalegate");
         let (proof, _claims) = prove_reverse_scale_gate(
-            &store, &ops[0], &point, genuine, Some(aux), out_aux, &mut tp)
+            &store, &ops[0], &point, genuine, Some(aux), out_aux, &mut tp, None)
             .expect("honest proof");
         let mut tp = Transcript::new(b"audit-scalegate");
         tp.absorb(&bincode::serialize(&out_commit).unwrap());
@@ -27760,7 +27826,7 @@ mod tests {
             .expect("out aux2").remove(0).descriptor;
         let mut tv = Transcript::new(b"audit-scalegate");
         let got = verify_reverse_scale_gate(&ops[0], &point, forged,
-            Some(&auxd), &outd, &forged_proof, &mut tv);
+            Some(&auxd), &outd, &forged_proof, &mut tv, None);
         assert!(got.is_none(),
             "AUDIT FAILURE: forged ScaleGate output claim was ACCEPTED");
     }
