@@ -153,6 +153,10 @@ the per-op out witness committed before the challenge:
 | 9852c59 | RoPE |
 | b555a89 | RmsNorm (F1 + F2 + LOW items) |
 
+Follow-up `abb1751`: multi-consumer DAG attack test, CI lint
+(`scripts/check_same_poly_binding.py` + `same_poly_discard_lint`), and this
+status section. Ops suite: 201 passed, 0 ignored.
+
 The fix pattern is uniform: the out column (or its limbs) is part of a
 committed aux batch absorbed into the transcript **before** the virtual
 challenge; the `verify_same_poly` merged claim is consumed and opened at

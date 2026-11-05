@@ -12,8 +12,8 @@ was needed. GPT-2/TimesFM weight sets are present as well.
 Both examples fail closed exactly at the previously declared out-of-scope
 `LayerNormCentered` op, before any proof:
 
-- `docs/b2-evidence/gpt2-exit2.txt`: exit 2, 13.57 s, peak RSS 5,982,908 KiB.
-- `docs/b2-evidence/timesfm-exit2.txt`: exit 2 (see log).
+- `docs/b2-evidence/gpt2-exit2.log`: exit 2, 13.57 s, peak RSS 5,982,908 KiB.
+- `docs/b2-evidence/timesfm-exit2.log`: exit 2 (see log).
 
 No graph change was made.
 
@@ -59,3 +59,25 @@ Decisions needed from TL/boss:
 Until one is chosen, the honest status is: B2 bundle/independent-verifier
 infrastructure accepted; GPT-2/TimesFM boundary documented; Gemma3/DeepSeek
 real-weight monolithic runs blocked by the openings cap and not launched.
+
+## Refresh 2026-11-05 (same_poly output-binding fix program)
+
+Rerun on `fix/soundness-repair` after the eight per-op out-witness fixes
+(commits 6b4a4a0..abb1751):
+
+- GPT-2 and TimesFM still fail closed at the out-of-scope
+  `LayerNormCentered` op before any proof (logs refreshed:
+  `gpt2-exit2.txt`, `timesfm-exit2.txt`). No graph change.
+- Gemma3 / DeepSeek monolithic B2 proofs remain blocked by the A1
+  `MAX_EFFECTIVE_OPENINGS = 64` policy. The fixes add one out-witness
+  opening per affected op and extend RmsNorm's out witness to include the
+  signed out limbs + two out-limb lookups: RmsNorm now performs about
+  12 PCS openings per op before table openings (row, out, rsqrt pairs/mult,
+  rem limb lo/hi pairs/mult, out limb lo/hi pairs/mult), and
+  BroadcastScale/ScaleVec/ScaleGate/Softmax/StableSoftmaxIndex/RoPE each
+  add one. The cap is therefore reached earlier than the pre-fix 9/op
+  RmsNorm count. No full-model prover was launched (it would be rejected
+  by policy after hours of proving).
+- B2 bundle/independent-verifier infrastructure remains accepted. The
+  path to a monolithic real-model bundle is O7-deep M1 (AuxPlan with
+  aggregated out-witness commitments and deferred pooled openings).

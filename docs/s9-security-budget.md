@@ -658,3 +658,30 @@ verifier checks and the size/round caps, measure prove/verify/size costs on
 the real A/B/D/C chain, and then submit the end-to-end argument for review.
 
 No protocol, transcript, or proof-byte behavior was changed by this step.
+
+## Post-fix full64 segmented rerun (2026-11-05, same_poly out-binding fixes)
+
+Baseline invalidated by the eight per-op out-witness fixes
+(`fix/soundness-repair` 6b4a4a0..abb1751): aux layouts, transcript inputs and
+wire bytes changed. Rerun: DeepSeek-V2-Lite layer 10, seq=1, K=6/64 experts,
+four-statement segmented shape A/B/D/C, real weights and inputs, on the test
+machine, twice with different proof-dump prefixes.
+
+Double-run result: A/B/D/C proof bytes are **identical**; all real-data
+negative cases in the harness are rejected; `S7-CHAIN-OK layer=10`.
+Command: `ZKIE_S9_BUDGET_LOG=1 ZKIE_S7_DUMP_PREFIX=... cargo run --release -p
+zkie-models-deepseek-v2-lite --example prove_core_chain_full64`.
+
+| Statement | prove/commit | verify | proof bytes | K (openings) | W (weighted) | merge | outer (W+merge) | S (required) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| A | 129.1 ms | — | 291,042 | 7 | 7,122 | 592 | 7,714 | 93 |
+| B | 596.8 s | 198.1 ms | 2,993,256 | 23 | 21,102 | 1,232 | 22,334 | 95 |
+| D | 1282.4 s | 401.5 ms | 6,712,889 | 49 | 16,806,966 | 2,554 | 16,809,520 | 96 |
+| C | 287.9 ms (prove) | 20.0 ms | 470,760 | 12 | 8,642 | 690 | 9,332 | 94 |
+
+Peak RSS: B 4,808,732 kB; D 10,957,896 kB (run 1) / 10,958,044 kB (run 2).
+
+Notes: D is at K=49 of the 64 effective-opening cap; the added out-witness
+commitments consumed headroom but the segmented statements still verify.
+Monolithic Gemma3/DeepSeek B2 remains blocked by the cap (see
+docs/b2-evidence/b2-real-model-status.md); O7-deep M1 is the aggregation path.
