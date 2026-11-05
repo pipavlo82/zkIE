@@ -2654,7 +2654,8 @@ fn softmax_dims(op: &Op) -> Option<(T, T, T, T, usize, usize)> {
 /// B1: reverse Softmax. See `ReverseSoftmaxProof` for the relation layout.
 fn prove_reverse_softmax(store: &Store, op: &Op, point: &[Ef], value: Ef,
     pairs: PreparedAux, mult: PreparedAux, sum_aux: PreparedAux, rem_aux: PreparedAux,
-    model: &TrustedModelManifest, dynamic_table: bool, transcript: &mut Transcript)
+    out_aux: PreparedAux, model: &TrustedModelManifest, dynamic_table: bool,
+    transcript: &mut Transcript)
     -> Option<(ReverseSoftmaxProof, Vec<EfClaim>)>
 {
     let (idx, e, out, table, m, n) = softmax_dims(op)?;
@@ -2705,6 +2706,13 @@ fn prove_reverse_softmax(store: &Store, op: &Op, point: &[Ef], value: Ef,
             if ident != 0 { return None; }
         }
     }
+    let out_aux_arity = out_aux.descriptor.arity;
+    let out_aux_len = 1usize.checked_shl(out_aux_arity as u32)?;
+    if out_aux.descriptor.role != AuxRole::SoftmaxOut || out_aux.descriptor.len != len
+        || out_aux_arity < lgl || out_aux_arity < 5 || out_aux.descriptor.columns != 1
+        || out_aux.columns.len() != 1 || out_aux.columns[0].len() != out_aux_len
+        || out_aux.columns[0][..len] != out_store[..] { return None; }
+    transcript.absorb(&bincode::serialize(&out_aux.descriptor.commitment).ok()?);
     transcript.absorb(b"zkie-softmax-v1");
     transcript.absorb_u64(m as u64);
     transcript.absorb_u64(n as u64);
@@ -2729,8 +2737,14 @@ fn prove_reverse_softmax(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let rescale_terms = softmax_rescale_terms(gamma);
     let (rescale, z_resc) = efo::prove_virtual(&mles, &rescale_terms, Ef::ZERO, transcript);
     if rescale.final_evals.len() != 4 + SOFTMAX_SCALE_BITS { return None; }
-    let (bind, _) = efo::prove_same_poly_ef(
+    let (bind, merged) = efo::prove_same_poly_ef(
         &out_ef, &[(point.to_vec(), value), (z_resc.clone(), rescale.final_evals[1])], transcript);
+    let mut r_pad = bind.merged_point.clone();
+    r_pad.resize(out_aux_arity, Ef::ZERO);
+    let mut z_resc_pad = z_resc.clone();
+    z_resc_pad.resize(out_aux_arity, Ef::ZERO);
+    let out_opening = open_aux(out_aux, &[0, 0],
+        &[r_pad, z_resc_pad], &[merged, rescale.final_evals[1]])?;
     let sum_points = vec![z_row.clone(), z_resc.clone()];
     let sum_values = vec![row_sum.final_evals[1], rescale.final_evals[2]];
     let sum_opening = open_aux(sum_aux, &[0, 0], &sum_points, &sum_values)?;
@@ -2748,13 +2762,14 @@ fn prove_reverse_softmax(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let (lookup, claims, _) = prove_reverse_lookup(
         store, &fake, &q, lookup_value, pairs, mult, model, dynamic_table, None, transcript)?;
     Some((ReverseSoftmaxProof { lookup, lookup_value, row_sum, rescale, bind,
-        sum_opening, e_opening, rem_opening }, claims))
+        out_opening, sum_opening, e_opening, rem_opening }, claims))
 }
 
 fn verify_reverse_softmax(op: &Op, point: &[Ef], value: Ef,
     pairs: &AuxDescriptor, mult: &AuxDescriptor, sum_aux: &AuxDescriptor,
-    rem_aux: &AuxDescriptor, model: &TrustedModelManifest, dynamic_table: bool,
-    proof: &ReverseSoftmaxProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
+    rem_aux: &AuxDescriptor, out_aux: &AuxDescriptor, model: &TrustedModelManifest,
+    dynamic_table: bool, proof: &ReverseSoftmaxProof, transcript: &mut Transcript)
+    -> Option<Vec<EfClaim>>
 {
     let (idx, e, _out, table, m, n) = softmax_dims(op)?;
     let len = m.checked_mul(n)?;
@@ -2769,7 +2784,10 @@ fn verify_reverse_softmax(op: &Op, point: &[Ef], value: Ef,
         || sum_aux.arity != arity || sum_aux.columns != 1
         || rem_aux.role != AuxRole::SoftmaxRemainder || rem_aux.len != len
         || rem_aux.arity != arity || rem_aux.columns != SOFTMAX_SCALE_BITS
+        || out_aux.role != AuxRole::SoftmaxOut || out_aux.len != len
+        || out_aux.arity < lgl || out_aux.arity < 5 || out_aux.columns != 1
     { return None; }
+    transcript.absorb(&bincode::serialize(&out_aux.commitment).ok()?);
     transcript.absorb(b"zkie-softmax-v1");
     transcript.absorb_u64(m as u64);
     transcript.absorb_u64(n as u64);
@@ -2792,8 +2810,15 @@ fn verify_reverse_softmax(op: &Op, point: &[Ef], value: Ef,
     let fs = &proof.rescale.final_evals;
     if fs.len() != 4 + SOFTMAX_SCALE_BITS || fs[0] != ef_eq_poly(&q2, &z_resc)
         || fc_s != efo::virtual_eval(&rterms, fs) { return None; }
-    if efo::verify_same_poly(&proof.bind,
-        &[(point.to_vec(), value), (z_resc.clone(), fs[1])], transcript).is_none() { return None; }
+    let fs1 = fs[1];
+    let (merged_point, merged) = efo::verify_same_poly(&proof.bind,
+        &[(point.to_vec(), value), (z_resc.clone(), fs1)], transcript)?;
+    let mut r_pad = merged_point;
+    r_pad.resize(out_aux.arity, Ef::ZERO);
+    let mut z_resc_pad = z_resc.clone();
+    z_resc_pad.resize(out_aux.arity, Ef::ZERO);
+    if !verify_aux_open(out_aux, &[0, 0],
+        &[r_pad, z_resc_pad], &[merged, fs1], &proof.out_opening) { return None; }
     let sum_points = vec![z_row.clone(), z_resc.clone()];
     if !verify_aux_open(sum_aux, &[0, 0], &sum_points,
         &[fr[1], fs[2]], &proof.sum_opening) { return None; }
@@ -6036,7 +6061,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecOut, BroadcastScaleOut, ScaleGateOut, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecOut, BroadcastScaleOut, ScaleGateOut, ScaleVecRemainder, ScaleGateRemainder, SoftmaxOut, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -6087,6 +6112,7 @@ struct ReverseSoftmaxProof {
     row_sum: EfVirtualProof,
     rescale: EfVirtualProof,
     bind: EfSamePolyProof,
+    out_opening: EfBatchOpeningProof,
     sum_opening: EfBatchOpeningProof,
     e_opening: EfBatchOpeningProof,
     rem_opening: EfBatchOpeningProof,
@@ -6841,6 +6867,52 @@ fn prepare_rope_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
     Some(prepared)
 }
 
+/// Softmax output-witness aux. Committed so the same_poly merged claim is
+/// authenticated at the merged point.
+fn softmax_out_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, usize, usize, usize)>>
+{
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::Softmax { idx, m, n, .. } = op {
+            if !m.is_power_of_two() || !n.is_power_of_two() { return None; }
+            let len = m.checked_mul(*n)?;
+            if len < 32 || !len.is_power_of_two() { return None; }
+            let key = TensorKey::Index(*idx).encoded()?;
+            if *model.tensor_lengths.get(&key)? != len { return None; }
+            specs.push((i, len, len.trailing_zeros().max(5) as usize, 1));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_softmax_out_aux(store: &Store, ops: &[Op])
+    -> Option<Vec<PreparedAux>>
+{
+    let mut prepared = Vec::new();
+    for (op_index, op) in ops.iter().enumerate() {
+        if let Op::Softmax { out, m, n, .. } = op {
+            let ov = store.get(*out);
+            let len = m.checked_mul(*n)?;
+            if ov.len() != len || !len.is_power_of_two() { return None; }
+            let arity = len.trailing_zeros().max(5) as usize;
+            let padded = 1usize.checked_shl(arity as u32)?;
+            let mut col = vec![Goldilocks::ZERO; padded];
+            col[..len].copy_from_slice(ov);
+            let columns = vec![col];
+            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+            let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+            let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+            let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+            let descriptor = AuxDescriptor {
+                op_index, role: AuxRole::SoftmaxOut, len, arity, columns: 1, commitment,
+            };
+            prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+        }
+    }
+    Some(prepared)
+}
+
 fn softmax_aux_specs(ops: &[Op], model: &TrustedModelManifest)
     -> Option<(Vec<(usize, usize, usize, usize)>, Vec<(usize, usize, usize, usize)>)>
 {
@@ -7350,6 +7422,10 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         Some(v) => all.extend(v),
         None => return false,
     };
+    match softmax_out_aux_specs(ops, model) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::SoftmaxOut, len, arity, cols))),
+        None => return false,
+    };
     match softmax_aux_specs(ops, model) {
         Some((sums, rems)) => {
             all.extend(sums.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::SoftmaxSum, len, arity, cols)));
@@ -7374,7 +7450,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::BroadcastScaleOut => 34, AuxRole::ScaleGateOut => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::BroadcastScaleOut => 34, AuxRole::ScaleGateOut => 15, AuxRole::SoftmaxOut => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -8429,6 +8505,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                     aux.remove(&(op_index, AuxRole::LookupMultiplicity))?,
                     aux.remove(&(op_index, AuxRole::SoftmaxSum))?,
                     aux.remove(&(op_index, AuxRole::SoftmaxRemainder))?,
+                    aux.remove(&(op_index, AuxRole::SoftmaxOut))?,
                     model, dynamic, transcript)?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
@@ -8836,8 +8913,9 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 let mult = find(AuxRole::LookupMultiplicity)?;
                 let sum_aux = find(AuxRole::SoftmaxSum)?;
                 let rem_aux = find(AuxRole::SoftmaxRemainder)?;
+                let out_aux = find(AuxRole::SoftmaxOut)?;
                 for c in verify_reverse_softmax(op, &point, value, pairs, mult, sum_aux, rem_aux,
-                    model, dynamic, proof, transcript)? {
+                    out_aux, model, dynamic, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -15558,6 +15636,7 @@ pub fn prove_committed_shard_dag_bound(
     prepared.extend(prepare_scale_gate_out_aux(store, ops)?);
     prepared.extend(prepare_scale_vec_remainder_aux(store, ops, model)?);
     prepared.extend(prepare_scale_gate_aux(store, ops, model)?);
+    prepared.extend(prepare_softmax_out_aux(store, ops)?);
     prepared.extend(prepare_softmax_aux(store, ops, model)?);
     prepared.extend(prepare_stable_softmax_index_aux(store, ops, model)?);
     prepared.extend(prepare_rms_norm_aux(store, ops, model)?);
@@ -15989,6 +16068,7 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.virtual_proof(&proof.row_sum, 3)?;
                 b.virtual_proof(&proof.rescale, 3)?;
                 b.same_poly(&proof.bind)?;
+                b.opening(&proof.out_opening, 2)?;
                 b.opening(&proof.sum_opening, 2)?;
                 b.opening(&proof.e_opening, 2)?;
                 b.opening(&proof.rem_opening, SOFTMAX_SCALE_BITS)?;
@@ -25370,35 +25450,37 @@ mod tests {
         let mult = take(&mut lookup_aux, AuxRole::LookupMultiplicity);
         let sum_aux = take(&mut rest, AuxRole::SoftmaxSum);
         let rem_aux = take(&mut rest, AuxRole::SoftmaxRemainder);
+        let out_aux = prepare_softmax_out_aux(&store, &ops).unwrap().remove(0);
         let descs = [pairs.descriptor.clone(), mult.descriptor.clone(),
-            sum_aux.descriptor.clone(), rem_aux.descriptor.clone()];
+            sum_aux.descriptor.clone(), rem_aux.descriptor.clone(),
+            out_aux.descriptor.clone()];
         let mut tp = Transcript::new(b"b1-softmax");
         let (proof, claims) = prove_reverse_softmax(
-            &store, &ops[0], &point, value, pairs, mult, sum_aux, rem_aux,
+            &store, &ops[0], &point, value, pairs, mult, sum_aux, rem_aux, out_aux,
             &model, false, &mut tp).unwrap();
         assert_eq!(claims.len(), 1, "static Softmax returns the idx claim");
         let mut tv = Transcript::new(b"b1-softmax");
         let got = verify_reverse_softmax(
-            &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3],
+            &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
             &model, false, &proof, &mut tv);
         assert!(got.is_some(), "honest Softmax must verify");
         let mut tv = Transcript::new(b"b1-softmax");
         assert!(verify_reverse_softmax(
-            &ops[0], &point, value + Ef::ONE, &descs[0], &descs[1], &descs[2], &descs[3],
+            &ops[0], &point, value + Ef::ONE, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
             &model, false, &proof, &mut tv).is_none());
         let mut bad: ReverseSoftmaxProof =
             bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
         bad.row_sum.final_evals[1] += Ef::ONE;
         let mut tv = Transcript::new(b"b1-softmax");
         assert!(verify_reverse_softmax(
-            &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3],
+            &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
             &model, false, &bad, &mut tv).is_none());
         let mut bad: ReverseSoftmaxProof =
             bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
         bad.rescale.final_evals[4] += Ef::ONE;
         let mut tv = Transcript::new(b"b1-softmax");
         assert!(verify_reverse_softmax(
-            &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3],
+            &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
             &model, false, &bad, &mut tv).is_none());
 
         // Bound bytes entry: idx is the only execution input; out the output.
@@ -25423,6 +25505,91 @@ mod tests {
         bad.outputs.get_mut(&out).unwrap()[0] += Goldilocks::ONE;
         assert!(!verify_committed_shard_dag_bound_bytes(
             &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &bad));
+    }
+
+    /// AUDIT RED→GREEN (Softmax): forged caller out claim with an
+    /// interpolating same_poly fake; the committed out column at the merged
+    /// point rejects it.
+    #[test]
+    fn audit_softmax_forged_output_claim_must_reject() {
+        let mut store = Store::new();
+        let (m, n) = (4usize, 8usize);
+        let table = store.push((0..32).map(|i| from_i64((i as i64 % 9) - 4)).collect());
+        let idx = store.push_idx((0..32).map(|i| ((i * 7 + 3) % 32) as u32).collect());
+        let e = store.push(vec![Goldilocks::ZERO; 32]);
+        let out = store.push(vec![Goldilocks::ZERO; 32]);
+        let ops = vec![Op::Softmax { idx, e, out, table, m, n }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops).with_index_shapes(&[(idx, 32usize)].into());
+        let lgl = 5usize;
+        let point: Vec<Ef> = (0..lgl).map(|b| ef_u64(11 + b as u64)).collect();
+        let genuine = ef_eval(store.get(out), &point);
+        let forged = genuine + Ef::ONE;
+        let take = |v: &mut Vec<PreparedAux>, role: AuxRole| {
+            let pos = v.iter().position(|p| p.descriptor.role == role).unwrap();
+            v.remove(pos)
+        };
+        let mut la = prepare_lookup_aux(&store, &ops, &model).unwrap();
+        let mut sa = prepare_softmax_aux(&store, &ops, &model).unwrap();
+        let out_aux = prepare_softmax_out_aux(&store, &ops).unwrap().remove(0);
+        let out_commit = out_aux.descriptor.commitment.clone();
+        let pairs = take(&mut la, AuxRole::LookupPairs);
+        let mult = take(&mut la, AuxRole::LookupMultiplicity);
+        let sum_aux = take(&mut sa, AuxRole::SoftmaxSum);
+        let rem_aux = take(&mut sa, AuxRole::SoftmaxRemainder);
+        let mut tp = Transcript::new(b"audit-softmax");
+        let (proof, _claims) = prove_reverse_softmax(
+            &store, &ops[0], &point, genuine, pairs, mult, sum_aux, rem_aux, out_aux,
+            &model, false, &mut tp).expect("honest proof");
+        let mut tp = Transcript::new(b"audit-softmax");
+        tp.absorb(&bincode::serialize(&out_commit).unwrap());
+        tp.absorb(b"zkie-softmax-v1");
+        tp.absorb_u64(m as u64); tp.absorb_u64(n as u64);
+        let _q: Vec<Ef> = tp.ef_field_vec(lgl);
+        let u_pt: Vec<Ef> = tp.ef_field_vec(2);
+        let _q2: Vec<Ef> = tp.ef_field_vec(lgl);
+        let gamma = tp.ef_field();
+        let n_inv = ef_u64(n as u64).inverse();
+        let row_terms = softmax_row_terms(n_inv);
+        let (okr, _zr, _fcr) = efo::verify_virtual(&proof.row_sum, &row_terms,
+            Ef::ZERO, lgl, &mut tp);
+        assert!(okr);
+        let rterms = softmax_rescale_terms(gamma);
+        let (oks, z_resc, _fcs) = efo::verify_virtual(&proof.rescale, &rterms,
+            Ef::ZERO, lgl, &mut tp);
+        assert!(oks);
+        let fs1 = proof.rescale.final_evals[1];
+        let out_ef = ef_lift(store.get(out));
+        let d = forged - ef_eval(store.get(out), &point);
+        let u0 = vec![Ef::ZERO; lgl];
+        let u1 = vec![Ef::ONE; lgl];
+        let v00 = efo::eq_poly(&u0, &point).unwrap();
+        let v01 = efo::eq_poly(&u1, &point).unwrap();
+        let v10 = efo::eq_poly(&u0, &z_resc).unwrap();
+        let v11 = efo::eq_poly(&u1, &z_resc).unwrap();
+        let det = v00 * v11 - v01 * v10;
+        let a = d * v11 * det.inverse();
+        let b = -d * v10 * det.inverse();
+        let chi0 = efo::eq_evals(&u0);
+        let chi1 = efo::eq_evals(&u1);
+        let f_fake: Vec<Ef> = (0..32).map(|i| out_ef[i] + a * chi0[i] + b * chi1[i]).collect();
+        let fake_bind = efo::prove_same_poly_ef(&f_fake,
+            &[(point.clone(), forged), (z_resc.clone(), fs1)], &mut tp).0;
+        let mut forged_proof = proof;
+        forged_proof.bind = fake_bind;
+        let mut la2 = prepare_lookup_aux(&store, &ops, &model).unwrap();
+        let mut sa2 = prepare_softmax_aux(&store, &ops, &model).unwrap();
+        let outd = prepare_softmax_out_aux(&store, &ops).unwrap().remove(0).descriptor;
+        let pd = take(&mut la2, AuxRole::LookupPairs).descriptor;
+        let md = take(&mut la2, AuxRole::LookupMultiplicity).descriptor;
+        let sd = take(&mut sa2, AuxRole::SoftmaxSum).descriptor;
+        let rd = take(&mut sa2, AuxRole::SoftmaxRemainder).descriptor;
+        let mut tv = Transcript::new(b"audit-softmax");
+        let got = verify_reverse_softmax(&ops[0], &point, forged, &pd, &md, &sd, &rd,
+            &outd, &model, false, &forged_proof, &mut tv);
+        assert!(got.is_none(),
+            "AUDIT FAILURE: forged Softmax output claim was ACCEPTED");
     }
 
     /// PR#45 B1: StableSoftmaxIndex reverse roundtrip and tamper rejection
