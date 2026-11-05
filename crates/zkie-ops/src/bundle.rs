@@ -18,7 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const BUNDLE_VERSION: u32 = 1;
+/// O7-deep M1 wire version: the proof carries per-arity aux group
+/// descriptors (`AUX_LAYOUT_VERSION = 1` in compose.rs). Old bundles
+/// (version 1) are rejected; there is no silent reinterpretation.
+pub const BUNDLE_VERSION: u32 = 2;
 /// Hard cap on each serialized bundle file before decoding.
 pub const MAX_BUNDLE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 

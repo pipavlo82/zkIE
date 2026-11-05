@@ -1,6 +1,7 @@
 # O7-deep: pooled aux/table openings for monolithic B2 proofs
 
-Status: design for TL review (no wire change in this commit). Chosen by TL
+Status: M1 implemented (see `docs/o7-deep-m1.md`); M2 next. Original design
+note below. Chosen by TL
 after the B2 real-model blocker: `security_policy_ok` rejects
 `ProofBudget.openings > MAX_EFFECTIVE_OPENINGS = 64`, and a monolithic
 Gemma3/DeepSeek proof has hundreds of per-op PCS openings (RmsNorm alone: 9

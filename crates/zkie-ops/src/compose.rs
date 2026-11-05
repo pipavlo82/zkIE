@@ -7574,91 +7574,232 @@ fn prepare_gelu_range_aux(store: &Store, ops: &[Op], model: &TrustedModelManifes
     Some(prepared)
 }
 
-fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[AuxDescriptor]) -> bool {
-    let specs = match projection_aux_specs(ops) { Some(v) => v, None => return false };
+fn aux_role_rank(role: AuxRole) -> u32 {
+    match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::BroadcastScaleOut => 34, AuxRole::ScaleGateOut => 15, AuxRole::SoftmaxOut => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::RopeOut => 28, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RmsNormOutLimbLoPairs => 36, AuxRole::RmsNormOutLimbHiPairs => 37, AuxRole::RmsNormOutLimbLoMultiplicity => 38, AuxRole::RmsNormOutLimbHiMultiplicity => 39, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }
+}
+
+/// Deterministic aux descriptor list derived from the trusted graph and
+/// manifest. This is the single source of truth for the O7-deep AuxPlan.
+fn aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, AuxRole, usize, usize, usize)>>
+{
+    let specs = match projection_aux_specs(ops) { Some(v) => v, None => return None };
     let mut all: Vec<_> = specs.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ProjectionBits, len, arity, cols)).collect();
     match scale_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleRemainder, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
-    match lookup_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
+    match lookup_aux_specs(ops, model) { Some(v) => all.extend(v), None => return None };
     match lookup_group_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::LookupMultiplicityAgg, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match gelu_range_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::GeluIndexXRange, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match scale_vec_remainder_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleVecRemainder, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match scale_vec_out_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleVecOut, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match broadcast_scale_out_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::BroadcastScaleOut, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match scale_gate_out_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleGateOut, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match scale_gate_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleGateRemainder, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match stable_softmax_index_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::StableSoftmaxIndexWitness, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match rms_norm_aux_specs(ops, model) {
         Some(v) => all.extend(v),
-        None => return false,
+        None => return None,
     };
     match rope_out_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::RopeOut, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match rope_aux_specs(ops, model) {
         Some(v) => all.extend(v),
-        None => return false,
+        None => return None,
     };
     match softmax_out_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::SoftmaxOut, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match softmax_aux_specs(ops, model) {
         Some((sums, rems)) => {
             all.extend(sums.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::SoftmaxSum, len, arity, cols)));
             all.extend(rems.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::SoftmaxRemainder, len, arity, cols)));
         }
-        None => return false,
+        None => return None,
     }
     match argmax_aux_specs(ops) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ArgmaxWitness, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match expert_routing_aux_specs(ops) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ExpertRouting, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
     match gather_routing_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::GatherRouting, len, arity, cols))),
-        None => return false,
+        None => return None,
     };
-    match topk_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
-    match topk_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
-    match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
-    match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
-    match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::BroadcastScaleOut => 34, AuxRole::ScaleGateOut => 15, AuxRole::SoftmaxOut => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::RopeOut => 28, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RmsNormOutLimbLoPairs => 36, AuxRole::RmsNormOutLimbHiPairs => 37, AuxRole::RmsNormOutLimbLoMultiplicity => 38, AuxRole::RmsNormOutLimbHiMultiplicity => 39, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }));
+    match topk_aux_specs(ops) { Some(v) => all.extend(v), None => return None };
+    match topk_range_aux_specs(ops) { Some(v) => all.extend(v), None => return None };
+    match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return None };
+    match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return None };
+    match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return None };
+    all.sort_by_key(|(i, role, ..)| (*i, aux_role_rank(*role)));
+    Some(all)
+}
+
+/// O7-deep M1: aux layout version. Bumped on any change to the plan
+/// construction or group encoding; the verifier rejects other layouts.
+pub const AUX_LAYOUT_VERSION: u32 = 1;
+
+/// One per-arity global aux commitment. `columns` is the total number of
+/// padded columns in the group; the deterministic AuxPlan maps every
+/// (op_index, role, column) to a group and an offset.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AuxGroupDescriptor {
+    pub arity: usize,
+    pub columns: usize,
+    pub commitment: zkie_core::pcs::whir::Commitment,
+    pub layout_version: u32,
+}
+
+/// Deterministic aux layout derived only from the trusted graph and manifest.
+#[derive(Clone, Default)]
+pub struct AuxPlan {
+    /// (arity, total padded columns) per group, ascending arity.
+    pub groups: Vec<(usize, usize)>,
+    /// (op_index, role, column) -> (group index, column offset in group).
+    pub slots: std::collections::BTreeMap<(usize, AuxRole, usize), (usize, usize)>,
+}
+
+fn build_aux_plan(ops: &[Op], model: &TrustedModelManifest) -> Option<AuxPlan> {
+    let specs = aux_specs(ops, model)?;
+    let mut by_arity: std::collections::BTreeMap<
+        usize, Vec<(usize, AuxRole, usize, usize, usize)>> = Default::default();
+    for spec in specs {
+        by_arity.entry(spec.3).or_default().push(spec);
+    }
+    let mut plan = AuxPlan::default();
+    for (arity, mut specs) in by_arity {
+        specs.sort_by_key(|(i, role, ..)| (*i, aux_role_rank(*role)));
+        let group = plan.groups.len();
+        let mut offset = 0usize;
+        for (i, role, _len, _arity, cols) in specs {
+            for c in 0..cols {
+                if plan.slots.insert((i, role, c), (group, offset)).is_some() {
+                    return None;
+                }
+                offset = offset.checked_add(1)?;
+            }
+        }
+        plan.groups.push((arity, offset));
+    }
+    Some(plan)
+}
+
+fn validate_aux_plan(ops: &[Op], model: &TrustedModelManifest,
+    groups: &[AuxGroupDescriptor]) -> Option<AuxPlan>
+{
+    let plan = build_aux_plan(ops, model)?;
+    if groups.len() != plan.groups.len() { return None; }
+    for (g, (arity, cols)) in groups.iter().zip(&plan.groups) {
+        if g.arity != *arity || g.columns != *cols
+            || g.layout_version != AUX_LAYOUT_VERSION { return None; }
+    }
+    Some(plan)
+}
+
+/// O7-deep M1: per-group prepared commitment (prover-side/test-side).
+struct PreparedAuxGroup {
+    descriptor: AuxGroupDescriptor,
+    columns: Vec<Vec<Goldilocks>>,
+    prover_data: zkie_core::pcs::whir::ProverData,
+    protocol: zkie_core::pcs::whir::OpeningProtocol,
+    whir: zkie_core::pcs::whir::Whir,
+}
+
+/// Build the per-arity global aux commitments from the same prepared columns
+/// the per-op path uses. Group columns are the concatenation of the per-op
+/// aux columns in AuxPlan order, each padded to 2^arity.
+fn commit_aux_groups(store: &Store, ops: &[Op], model: &TrustedModelManifest)
+    -> Option<(AuxPlan, Vec<AuxGroupDescriptor>, Vec<PreparedAuxGroup>)>
+{
+    let prepared = prepare_all_aux(store, ops, model)?;
+    commit_aux_groups_from(&prepared, ops, model)
+}
+
+fn commit_aux_groups_from(prepared: &[PreparedAux], ops: &[Op], model: &TrustedModelManifest)
+    -> Option<(AuxPlan, Vec<AuxGroupDescriptor>, Vec<PreparedAuxGroup>)>
+{
+    let specs = aux_specs(ops, model)?;
+    let plan = build_aux_plan(ops, model)?;
+    if prepared.len() != specs.len() { return None; }
+    let by_role: std::collections::BTreeMap<(usize, AuxRole), &PreparedAux> =
+        prepared.iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
+    if by_role.len() != prepared.len() { return None; }
+    let mut group_cols: Vec<Vec<Vec<Goldilocks>>> = plan.groups.iter()
+        .map(|(_, cols)| vec![Vec::new(); *cols]).collect();
+    let mut filled: Vec<Vec<bool>> = plan.groups.iter()
+        .map(|(_, cols)| vec![false; *cols]).collect();
+    for (i, role, len, arity, cols) in specs {
+        let p = by_role.get(&(i, role))?;
+        if p.descriptor.len != len || p.descriptor.arity != arity
+            || p.descriptor.columns != cols || p.columns.len() != cols { return None; }
+        let padded = 1usize.checked_shl(arity as u32)?;
+        for c in 0..cols {
+            let (g, off) = *plan.slots.get(&(i, role, c))?;
+            if filled[g][off] { return None; }
+            if p.columns[c].len() != padded { return None; }
+            group_cols[g][off] = p.columns[c].clone();
+            filled[g][off] = true;
+        }
+    }
+    if filled.iter().any(|v| v.iter().any(|&x| !x)) { return None; }
+    let mut groups = Vec::with_capacity(plan.groups.len());
+    let mut prepared_groups = Vec::with_capacity(plan.groups.len());
+    for (arity, cols) in &plan.groups {
+        let columns = &group_cols[groups.len()];
+        if columns.len() != *cols { return None; }
+        let padded = 1usize.checked_shl(*arity as u32)?;
+        let vars = cols.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(*arity, VERIFIER_SECURITY, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        let descriptor = AuxGroupDescriptor {
+            arity: *arity, columns: *cols, commitment, layout_version: AUX_LAYOUT_VERSION,
+        };
+        groups.push(descriptor.clone());
+        prepared_groups.push(PreparedAuxGroup {
+            descriptor, columns: columns.clone(), prover_data, protocol, whir,
+        });
+    }
+    Some((plan, groups, prepared_groups))
+}
+
+fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[AuxDescriptor]) -> bool {
+    let all = match aux_specs(ops, model) { Some(v) => v, None => return false };
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
-
 /// Bit commitments are auxiliary witnesses, not committed activation tensors.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseReluProof {
@@ -15005,6 +15146,10 @@ pub struct TrustedExecution {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct BoundExecutionProof {
     aux: Vec<AuxDescriptor>,
+    /// O7-deep M1 layout: one commitment per arity group, validated against
+    /// the deterministic AuxPlan derived from ops/model.
+    aux_groups: Vec<AuxGroupDescriptor>,
+    aux_layout: u32,
     reverse: ReverseDagProof,
     weight_openings: Vec<WeightBatchOpening>,
     sel_openings: Vec<BoundSelOpening>,
@@ -15623,7 +15768,8 @@ fn group_reverse_weights(model: &TrustedModelManifest, ops: &[Op], leaves: &[EfC
     Some(WeightGrouping { groups, checks })
 }
 
-fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &TrustedExecution, aux: &[AuxDescriptor])
+fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &TrustedExecution,
+    aux: &[AuxDescriptor], aux_groups: &[AuxGroupDescriptor])
     -> Option<(Transcript, Vec<EfClaim>)>
 {
     let mut writes = std::collections::BTreeSet::new();
@@ -15650,6 +15796,9 @@ fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &Trusted
     transcript.absorb(&bincode::serialize(model).ok()?);
     transcript.absorb(&bincode::serialize(execution).ok()?);
     transcript.absorb(&bincode::serialize(aux).ok()?);
+    if validate_aux_plan(ops, model, aux_groups).is_none() { return None; }
+    transcript.absorb_u64(AUX_LAYOUT_VERSION as u64);
+    transcript.absorb(&bincode::serialize(aux_groups).ok()?);
     absorb_statement(&mut transcript, ops, ops.len());
     let mut seeds = Vec::new();
     for (&tensor_id, tensor) in &execution.outputs {
@@ -15801,6 +15950,40 @@ fn peak_rss_kb() -> u64 {
     0
 }
 
+/// O7-deep M1: build the complete prepared-aux list for a graph. This is the
+/// same list the bound prover used to build per-op commitments; the AuxPlan
+/// groups these columns per arity.
+fn prepare_all_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<PreparedAux>>
+{
+    let mut prepared = prepare_projection_aux(store, ops)?;
+    prepared.extend(prepare_scale_aux(store, ops, model)?);
+    prepared.extend(prepare_scale_vec_out_aux(store, ops)?);
+    prepared.extend(prepare_broadcast_scale_out_aux(store, ops)?);
+    prepared.extend(prepare_scale_gate_out_aux(store, ops)?);
+    prepared.extend(prepare_scale_vec_remainder_aux(store, ops, model)?);
+    prepared.extend(prepare_scale_gate_aux(store, ops, model)?);
+    prepared.extend(prepare_softmax_out_aux(store, ops)?);
+    prepared.extend(prepare_softmax_aux(store, ops, model)?);
+    prepared.extend(prepare_stable_softmax_index_aux(store, ops, model)?);
+    prepared.extend(prepare_rms_norm_aux(store, ops, model)?);
+    prepared.extend(prepare_rope_out_aux(store, ops)?);
+    prepared.extend(prepare_rope_aux(store, ops, model)?);
+    prepared.extend(prepare_argmax_aux(store, ops)?);
+    prepared.extend(prepare_expert_routing_aux(store, ops)?);
+    prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
+    prepared.extend(prepare_lookup_aux(store, ops, model)?);
+    prepared.extend(prepare_lookup_group_aux(store, ops, model)?);
+    prepared.extend(prepare_gelu_range_aux(store, ops, model)?);
+    prepared.extend(prepare_topk_aux(store, ops)?);
+    prepared.extend(prepare_topk_range_aux(store, ops)?);
+    prepared.extend(prepare_topk_thr_range_aux(store, ops)?);
+    prepared.extend(prepare_topk_tie_aux(store, ops)?);
+    prepared.extend(prepare_scatter_aux(store, ops, model)?);
+    prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
+    Some(prepared)
+}
+
 pub fn prove_committed_shard_dag_bound(
     store: &mut Store, ops: &[Op], ops_per_shard: usize,
     whir: &zkie_core::pcs::whir::Whir, cached: &[CachedWeightBatch],
@@ -15845,36 +16028,13 @@ pub fn prove_committed_shard_dag_bound(
             if idx.len() != expected.len() || idx.iter().zip(expected).any(|(&a, &b)| Goldilocks::from_u64(a as u64) != b) { return None; }
         }
     }
-    let mut prepared = prepare_projection_aux(store, ops)?;
-    prepared.extend(prepare_scale_aux(store, ops, model)?);
-    prepared.extend(prepare_scale_vec_out_aux(store, ops)?);
-    prepared.extend(prepare_broadcast_scale_out_aux(store, ops)?);
-    prepared.extend(prepare_scale_gate_out_aux(store, ops)?);
-    prepared.extend(prepare_scale_vec_remainder_aux(store, ops, model)?);
-    prepared.extend(prepare_scale_gate_aux(store, ops, model)?);
-    prepared.extend(prepare_softmax_out_aux(store, ops)?);
-    prepared.extend(prepare_softmax_aux(store, ops, model)?);
-    prepared.extend(prepare_stable_softmax_index_aux(store, ops, model)?);
-    prepared.extend(prepare_rms_norm_aux(store, ops, model)?);
-    prepared.extend(prepare_rope_out_aux(store, ops)?);
-    prepared.extend(prepare_rope_aux(store, ops, model)?);
-    prepared.extend(prepare_argmax_aux(store, ops)?);
-    prepared.extend(prepare_expert_routing_aux(store, ops)?);
-    prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
-    prepared.extend(prepare_lookup_aux(store, ops, model)?);
-    prepared.extend(prepare_lookup_group_aux(store, ops, model)?);
-    prepared.extend(prepare_gelu_range_aux(store, ops, model)?);
-    prepared.extend(prepare_topk_aux(store, ops)?);
-    prepared.extend(prepare_topk_range_aux(store, ops)?);
-    prepared.extend(prepare_topk_thr_range_aux(store, ops)?);
-    prepared.extend(prepare_topk_tie_aux(store, ops)?);
-    prepared.extend(prepare_scatter_aux(store, ops, model)?);
-    prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
+    let prepared = prepare_all_aux(store, ops, model)?;
+    let (_aux_plan, aux_groups, _aux_prepared_groups) = commit_aux_groups_from(&prepared, ops, model)?;
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
     // S6 (bound): selector openings + embedding token binding, built against
     // the same aux commitments the reverse reduction uses.
     let (sel_openings, token_binding) = prove_bound_lm_bindings(&prepared, store, ops, ops_per_shard, statement, model, execution, &aux)?;
-    let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux)?;
+    let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux, &aux_groups)?;
     let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
     let certified = certified_index_tensors(ops, execution);
     // O7: commit each static lookup table once per proof (per trusted id).
@@ -15891,7 +16051,7 @@ pub fn prove_committed_shard_dag_bound(
     // replay is optional, for separately-accounted self-verify measurements
     // and a leaf consistency check. Default off: no prover self-verification.
     let leaves = if std::env::var("ZKIE_O2_SELFVERIFY").ok().as_deref() == Some("1") {
-        let (mut replay, replay_seeds) = execution_seeds(ops, model, execution, &aux)?;
+        let (mut replay, replay_seeds) = execution_seeds(ops, model, execution, &aux, &aux_groups)?;
         let replay_groups = derive_lookup_group_ab(&mut replay, ops, model)?;
         let t_sv = std::time::Instant::now();
         let verified = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model), Some(&certified), Some(execution), &replay_groups)?;
@@ -15980,7 +16140,8 @@ pub fn prove_committed_shard_dag_bound(
             mat_ms, res_ms, open_ms, rss_mat, rss_res, rss_clone, rss_open, peak_rss_kb());
         weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: Some(opening) });
     }
-    Some(BoundExecutionProof { aux, reverse, weight_openings, sel_openings, token_binding })
+    Some(BoundExecutionProof { aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION,
+        reverse, weight_openings, sel_openings, token_binding })
 }
 
 /// S9 2c verifier budget over the proof's randomized checks. Degrees are
@@ -16408,7 +16569,9 @@ pub fn verify_committed_shard_dag_bound(
             return false;
         }
     }
-    let (mut transcript, seeds) = match execution_seeds(ops, model, execution, &proof.aux) { Some(v) => v, None => return false };
+    if proof.aux_layout != AUX_LAYOUT_VERSION
+        || validate_aux_plan(ops, model, &proof.aux_groups).is_none() { return false; }
+    let (mut transcript, seeds) = match execution_seeds(ops, model, execution, &proof.aux, &proof.aux_groups) { Some(v) => v, None => return false };
     let certified = certified_index_tensors(ops, execution);
     let lookup_groups = match derive_lookup_group_ab(&mut transcript, ops, model) {
         Some(v) => v, None => return false,
@@ -21999,12 +22162,12 @@ mod tests {
         // output claim points (seeds) depend on them. Replacing the witness
         // root changes every seed point; the old pre-fix path committed the
         // witness only INSIDE the reduction, after these points were fixed.
-        let (_, seeds1) = execution_seeds(&ops, &model, &execution, &proof.aux).unwrap();
+        let (_, seeds1) = execution_seeds(&ops, &model, &execution, &proof.aux, &proof.aux_groups).unwrap();
         let mut swapped = proof.aux.clone();
         let wpos = swapped.iter().position(|a| a.role == AuxRole::TopKSelectWitness).unwrap();
         let tpos = swapped.iter().position(|a| a.role == AuxRole::TopKSelectThr).unwrap();
         swapped[wpos].commitment = swapped[tpos].commitment.clone();
-        let (_, seeds2) = execution_seeds(&ops, &model, &execution, &swapped).unwrap();
+        let (_, seeds2) = execution_seeds(&ops, &model, &execution, &swapped, &proof.aux_groups).unwrap();
         assert_ne!(seeds1, seeds2, "aux roots must be bound before output claim points");
 
         // Bound-entry replay: a proof made under the honest witness root must
@@ -22926,18 +23089,17 @@ mod tests {
             range.descriptor.clone(), thr_range.descriptor.clone(),
             tie_aux.descriptor.clone(),
         ];
-        let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = std::collections::BTreeMap::new();
-        prepared.insert((0, AuxRole::TopKSelectWitness), witness);
-        prepared.insert((0, AuxRole::TopKSelectThr), thr_aux);
-        prepared.insert((0, AuxRole::TopKSelectXRange), range);
-        prepared.insert((0, AuxRole::TopKSelectThrRange), thr_range);
-        prepared.insert((0, AuxRole::TopKSelectTie), tie_aux);
-        let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux).unwrap();
+        let prepared_vec = vec![witness, thr_aux, range, thr_range, tie_aux];
+        let (_plan, aux_groups, _) = commit_aux_groups_from(&prepared_vec, &ops, &model).unwrap();
+        let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> =
+            prepared_vec.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
+        let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux, &aux_groups).unwrap();
         let certified = certified_index_tensors(&ops, &execution);
         let (reverse, _leaves) = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
             Some(&model), Some(&certified), Some(&execution), &std::collections::BTreeMap::new()).expect("forged bound proof is producible");
         let proof = BoundExecutionProof {
-            aux, reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None,
+            aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION,
+            reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None,
         };
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
             &PublicStatement::Generic, &model, &execution),
@@ -23225,13 +23387,14 @@ mod tests {
         let auxp = topk_test_commit(0, AuxRole::ScatterRouting, s, arity, cols);
         let orderp = scatter_order_test_commit(&sw_tok, &sw_exp, m, n, arity, 0);
         let aux = vec![auxp.descriptor.clone(), orderp.descriptor.clone()];
-        let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = std::collections::BTreeMap::new();
-        prepared.insert((0, AuxRole::ScatterRouting), auxp);
-        prepared.insert((0, AuxRole::ScatterOrder), orderp);
+        let prepared_vec = vec![auxp, orderp];
         let whir = zkie_core::pcs::whir::Whir::new_testing(5);
         let cached = commit_model_weights(&store, &ops, "/tmp/zkie-diag-scatter-order");
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
             .with_index_shapes(&[(token_id, s), (expert_of, s)].into());
+        let (_plan, aux_groups, _) = commit_aux_groups_from(&prepared_vec, &ops, &model).unwrap();
+        let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> =
+            prepared_vec.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
         let tk = TensorKey::Index(token_id).encoded().unwrap();
         let ek = TensorKey::Index(expert_of).encoded().unwrap();
         let to_g = |v: &[u32]| v.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect::<Vec<_>>();
@@ -23240,11 +23403,12 @@ mod tests {
             inputs: [(sel_t, sel_v)].into(),
             outputs: [(tk, to_g(&sw_tok)), (ek, to_g(&sw_exp))].into(),
         };
-        let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux).unwrap();
+        let (mut transcript, seeds) = execution_seeds(&ops, &model, &execution, &aux, &aux_groups).unwrap();
         let certified = certified_index_tensors(&ops, &execution);
         let (reverse, _leaves) = prove_reverse_dag_inner(&store, &ops, &seeds, &mut transcript, &mut prepared,
             Some(&model), Some(&certified), Some(&execution), &std::collections::BTreeMap::new()).expect("forged proof producible");
-        let proof = BoundExecutionProof { aux, reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None };
+        let proof = BoundExecutionProof { aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION,
+            reverse, weight_openings: vec![], sel_openings: vec![], token_binding: None };
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
             &PublicStatement::Generic, &model, &execution),
             "the signed order proof must reject the swapped expert-major enumeration");
@@ -26173,6 +26337,98 @@ mod tests {
         let negp = build_aux(&mut auxneg);
         assert!(prove_reverse_rms_norm(&st3, &ops3[0], &p3, v3, negp, &model3,
             &mut Transcript::new(b"rms-low-negms")).is_none());
+    }
+
+    /// O7-deep M1 gate: the AuxPlan is deterministic and covers every aux
+    /// column; per-arity group commitments open/verify; a synthetic multi-op
+    /// graph still crosses the 64-opening cap on the per-op wire and the plan
+    /// reports the aggregated group count.
+    #[test]
+    fn o7_m1_aux_plan_and_group_opening() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let (m, d, n_real) = (4usize, 8usize, 5usize);
+        let len = m * d;
+        let x = store.push((0..len).map(|i| from_i64(((i as i64 * 7) % 17) - 8)).collect());
+        let w = store.push((0..len).map(|i| from_i64(((i as i64 * 5) % 9) + 1)).collect());
+        let rsqrt_t = store.push((0..32).map(|i| from_i64(1000 + i as i64)).collect());
+        let limb_t = store.push((0..65536).map(|i| from_i64(i as i64)).collect());
+        let mut cur = x;
+        let mut outs = Vec::new();
+        let mut ops = Vec::new();
+        for _ in 0..6 {
+            let out = store.push(vec![Goldilocks::ZERO; len]);
+            outs.push(out);
+            ops.push(Op::RmsNorm { x: cur, w, out, rsqrt_table: rsqrt_t,
+                limb_table: limb_t, m, d, n_real });
+            cur = out;
+        }
+        forward_ops(&mut store, &ops);
+        let cache = std::env::temp_dir().join(format!("zkie-o7m1-{}", std::process::id()));
+        let cached = commit_model_weights(&store, &ops, cache.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(
+            &cached, &store.owned_slices(), &ops);
+
+        let plan = build_aux_plan(&ops, &model).expect("plan");
+        let specs = aux_specs(&ops, &model).expect("specs");
+        let total_cols: usize = specs.iter().map(|s| s.4).sum();
+        assert_eq!(plan.slots.len(), total_cols, "plan must cover every aux column");
+        assert_eq!(build_aux_plan(&ops, &model).unwrap().groups, plan.groups,
+            "plan must be deterministic");
+        let (_p2, groups, prepared_groups) = commit_aux_groups(&store, &ops, &model)
+            .expect("group commitments");
+        assert_eq!(groups.len(), plan.groups.len());
+        assert!(validate_aux_plan(&ops, &model, &groups).is_some());
+        let mut bad = groups.clone();
+        bad[0].columns += 1;
+        assert!(validate_aux_plan(&ops, &model, &bad).is_none(),
+            "tampered group layout must be rejected");
+        let mut bad = groups.clone();
+        bad[0].layout_version += 1;
+        assert!(validate_aux_plan(&ops, &model, &bad).is_none());
+
+        // Pooled group opening: open one plan column at a point and verify
+        // against the per-arity group commitment.
+        let pg = &prepared_groups[0];
+        let point: Vec<Ef> = (0..pg.descriptor.arity).map(|b| ef_u64(3 + b as u64)).collect();
+        let col = 0usize;
+        let value = ef_eval(&pg.columns[col], &point);
+        let opening = prove_batch_open_committed_ef(
+            &pg.whir, &pg.descriptor.commitment, &pg.protocol, pg.descriptor.columns,
+            pg.prover_data.clone(), &[col], vec![pg.columns[col].clone()],
+            &[point.clone()], &[value]).expect("pooled group opening");
+        assert!(verify_batch_open_committed_ef(
+            &pg.whir, &pg.descriptor.commitment, &pg.protocol, pg.descriptor.columns,
+            &[col], &[point], &[value], &opening));
+
+        // Synthetic 6-op graph: per-op wire still exceeds MAX_EFFECTIVE_OPENINGS.
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec())].into(),
+            outputs: [(outs[5], store.get(outs[5]).to_vec())].into(),
+        };
+        let whir = Whir::new_testing(5);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("synthetic proof");
+        let budget = proof_budget(&proof, &proof.aux, &ops, &model).expect("budget");
+        assert!(budget.openings > MAX_EFFECTIVE_OPENINGS,
+            "synthetic graph must cross the per-op cap (K={})", budget.openings);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution),
+            "per-op wire must still be rejected by the 64-opening cap");
+        // Wire version and layout tampering are rejected.
+        let mut bad: BoundExecutionProof =
+            bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
+        bad.aux_layout += 1;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad,
+            &PublicStatement::Generic, &model, &execution));
+        let mut bad: BoundExecutionProof =
+            bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
+        bad.aux_groups[0].columns += 1;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad,
+            &PublicStatement::Generic, &model, &execution));
+        eprintln!("O7-M1 synthetic: old_K={} aux_groups={} group_cols={} (M2 pooling target)",
+            budget.openings, plan.groups.len(),
+            plan.groups.iter().map(|g| g.1).sum::<usize>());
     }
 
     /// CI lint: no production `verify_same_poly(...).is_none()` discard
