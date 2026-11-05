@@ -446,8 +446,8 @@ zkie-core --release` 88 passed / 1 ignored, plus the `same_poly` suite
 90→96, all proof bytes change; the new baseline and EF cost measurements
 are step 2d.
 
-## 9g. Step 2d — large-weight sub-table split, final A/B/D/C baseline, and
-end-to-end budget
+## 9g. Step 2d — large-weight sub-table split and 96-bit A/B/D/C baseline
+(historical; superseded by WAVE-1 A1's 97-bit allocation in §9h)
 
 **Why the split.** The first 96-bit full64 attempt showed that the cost is
 the WHIR **opening** grind, not commit/cache: B's 7,195.5 s proof time was
@@ -535,6 +535,104 @@ S1–S8 negatives, S8 fuzz, the 2c budget test, and the new split-math test);
 `cargo test -p zkie-core --release` 88 passed / 1 ignored; `cargo check
 --workspace --release` clean. S9 is not accepted pending the TL's final
 review; this document does not declare acceptance.
+
+## 9h. WAVE-1 A1/A2 — whole-protocol error allocation and γ-merge accounting
+
+PR#45 A1/A2. This section supersedes the 96-bit totals in §9g; §9g remains
+as the historical 2d measurement. No reduction or transcript semantics
+changed — only the security constant, the verifier budget/policy checks, and
+the γ-merge charge.
+
+### A1 — exact allocation
+
+- `|EF| = (2^64 − 2^32 + 1)^2`
+  `= 2^128 − 2^97 + 2^65 + 2^64 − 2^33 + 1`
+  `= 340282366762482138490186164457219031041` (exact, fits u128; the code
+  never approximates it by 2^128).
+- `VERIFIER_SECURITY = 97`. Effective opening cap `K ≤ 64`; the existing
+  `MAX_PROOF_OPENINGS = 2^12` remains only a wire/resource prefilter.
+- Two explicit halves plus the exact combined bound:
+  - PCS: `ε_PCS ≤ K·2^-97 ≤ 64·2^-97 = 2^-91`.
+  - Outer + γ-merge: `S = weighted + merge ≤ 2^26`, hence
+    `ε_outer+merge ≤ S/|EF| ≤ 2^26/|EF| < 2^-101`. The verifier also checks
+    the half explicitly as `S·2^91 ≤ |EF|`.
+  - Combined, computed in exact integer arithmetic:
+    `K·2^-97 + S/|EF| ≤ 2^-90` ⇔ `K + S·2^97/|EF| ≤ 128`. The code checks
+    `K + ceil(S·2^97/|EF|) ≤ 128` (ceiling is stricter); checked u128
+    arithmetic, overflow → reject. This does not rely on the halves being
+    independently acceptable.
+- Propagation: all aux/weight/table/selector/token WHIR constructions use
+  `VERIFIER_SECURITY`; the weight-cache filename includes `s97`; O7 static
+  lookup commits are rebuilt in memory at 97 bits; `trusted_batch_whir`
+  rejects manifests below 97, and a wire-level test mutates a manifest batch
+  to 96 and requires rejection. Legacy 96-bit caches/manifests cannot be
+  reused.
+- Tests: exact field constant; K=1/63/64 pass; K=65 rejected by the
+  effective cap; K=127/128 exercise the exact combined bound; W cap and
+  outer half boundaries; 96-bit manifest rejected; honest fixture inside all
+  caps. `ops` 180/0 after the additions.
+
+97-bit real full64 rerun (r3, final budget code; same harness/inputs; EF
+outer, split sub-tables):
+
+| phase | bytes | commit+prove | verify | K | weighted | merge | S | required | peak RSS |
+|---|---|---|---|---|---|---|---|---|---|
+| A | 291,042 | 0.137 s prove | — | 7 | 7,104 | 592 | 7,696 | 93 | — |
+| B | 2,937,745 | 605.5 s | 179.2 ms | 22 | 21,074 | 1,231 | 22,305 | 95 | 4.81 GB |
+| D | 6,645,146 | 1,258.6 s | 404.7 ms | 48 | 16,806,938 | 2,551 | 16,809,489 | 96 | 10.92 GB |
+| C | 410,385 | 290.1 ms | 17.6 ms | 11 | 8,596 | 689 | 9,285 | 94 | — |
+
+D's `weighted` is dominated by the A2 LogUp α/β term for the real 2^24 silu
+table (`N = 2^24`); `S ≤ 2^26` still holds. For D:
+`ε_PCS ≤ 48·2^-97 = 2^-91.42`, `ε_outer+merge ≤ 16,809,489/|EF| < 2^-103.9`,
+so the exact total is below `2^-90` with margin; A/B/C are smaller
+(`K = 7/22/11`).
+
+All real-data negatives remain rejected and the harness ends with
+`S7-CHAIN-OK`. Raising the per-opening security 96→97 changes proof bytes
+(A/B/D/C ≈ +424/+8,672/+4,128/+2,088 bytes) and adds ~7–8% prove time on the
+large phases (B 560→605 s, D 1,170→1,259 s); the split keeps the total run in
+the tens of minutes. Three 97-bit runs (r1, r2, r3 with the final budget
+code) produce byte-identical dumps:
+
+| proof | SHA-256 (all three 97-bit runs) |
+|---|---|
+| A | `f857facf7d3001ff86e508c9a98b617dad88f59531f140149b250087b4983a9e` |
+| B | `cb5ea97d6c95a95e2e15cdaef038ce33a96d3ead44e9b32fddb4888650e3cbd1` |
+| D | `5e99fa7690b3cd756a1a2ee1d47f1a48449e8c523b087d934a6e91383e7cdd3f` |
+| C | `9c3194577fa1f180772df4e118b3b02af7f772ec75cdcb5bef14975c7ce0d5b7` |
+
+### A2 — batch-opening γ merge and budget audit
+
+`ProofBudget::opening` now charges, per batch opening, the γ-power merge
+polynomial degree `n−1` in addition to the sum-of-products sumcheck and the
+one PCS opening, where `n` is the number of claims in that opening (points =
+claimed values). Examples: A/B/D/C carry `merge = 592/1,231/2,551/689`
+weighted units. Zero/one-claim openings add zero. Counts saturate/reject on
+overflow, and the verifier's existing length/index/point checks reject
+malformed claim sets before the opening is accepted.
+
+Verifier call ↔ budget item audit:
+
+| verifier work | budget charge | coverage |
+|---|---|---|
+| EF virtual/sumcheck rounds | `3·rounds + 4·|final_evals|` (degree ≤3; the extra is the γ-separated term-batching bound; every production term constructor has ≤4·|final_evals| terms) | `weighted` |
+| MatMul / batch sum-of-products | `2·rounds` | `weighted` |
+| same_poly merge | virtual charge + `final_evals.len()` | `weighted`; its `final_evals` length is constrained by downstream consumers, so no separate mechanical charge is added |
+| LogUp fractional tree | per layer: virtual charge, both same_poly merges, `s.len()` batching, +8 | `weighted` |
+| LogUp α/β collision | `N = max(index len, table len)` per Lookup op (manifest/offline lengths) | `weighted` (A2 audit; N ≤ 2^26 by the W cap) |
+| tie / range / rank γ-separated terms | covered by the virtual γ-term charge | `weighted` |
+| permutation | both fractional sides + `|a|+|b|` | `weighted` |
+| batch-opening γ merge (`W_t`, aux/weight/sel/token) | `n−1` per opening | `merge` (A2) |
+| WHIR opening | `2^-97` each, K ≤ 64 | `ε_PCS` |
+| leaf/public execution evaluation | 0: the public execution tensors are deterministic; the sampled point/value becomes a claim that is reduced/authenticated, not a standalone probabilistic check | — |
+| Fiat–Shamir / hash | assumed | stated assumption |
+
+Tests: budget grows with claims at fixed rounds/openings (1/2/64 → merge
+0/1/63); same tensor multi-point and duplicate requests are covered by the
+weight/sel grouping tests; malformed lengths/points/indices are rejected by
+the existing S8 structure-mutation tests; exact total-bound boundaries
+(K=127/128) are tested.
 
 ## 10. Acceptance status
 

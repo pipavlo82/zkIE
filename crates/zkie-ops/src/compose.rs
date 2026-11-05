@@ -104,20 +104,30 @@ const MAX_REVERSE_STEP_OUTPUTS: usize = 64;
 /// Verifier policy: every WHIR instance reconstructed while checking a proof
 /// uses at least this security level, independent of any proof-supplied value.
 ///
-/// S9 2c: the union bound over `K` openings requires per-opening security
-/// `90 + ceil(log2 K)`. The protocol provisions 96 bits, i.e. K ≤ 64 under
-/// the 90-bit whole-protocol target; `MAX_PROOF_OPENINGS` is the hard wire
-/// cap and the verifier additionally rejects any proof whose actual opening
-/// count exceeds what the provisioned security covers.
-const VERIFIER_SECURITY: usize = 96;
-/// S9 2c: hard cap on WHIR openings verified per proof.
+/// S9 WAVE-1 A1: 97-bit per-opening PCS is required so the PCS half of the
+/// total error is at most `64 · 2^-97 = 2^-91` (the K cap is 64 below). The
+/// outer half is `W/|EF| ≤ 2^26/|EF| ≈ 2^-102`. The verifier does not rely on
+/// the two halves being independently acceptable: it also evaluates the
+/// exact integer total `K·2^-97 + (W+merge)/|EF| ≤ 2^-90` (see
+/// `security_budget_ok`).
+const VERIFIER_SECURITY: usize = 97;
+/// S9 WAVE-1 A1: effective opening cap (the PCS half-budget at 97 bits:
+/// 64·2^-97 = 2^-91). `MAX_PROOF_OPENINGS` remains a cheap wire prefilter;
+/// this smaller limit is the security-policy cap.
+const MAX_EFFECTIVE_OPENINGS: usize = 64;
+/// S9 2c: hard wire/decoder cap on WHIR openings per proof (resource bound,
+/// not the security cap).
 const MAX_PROOF_OPENINGS: usize = 1 << 12;
-/// S9 2c: aggregate outer-reduction budget `W = Σ(r·d + c) ≤ 2^26`; with EF
-/// challenges (|EF| ≈ 2^128) this bounds the outer error by 2^-102.
+/// S9 2c/A2: aggregate outer-reduction budget `W = Σ(r·d + c) + Σ(n−1)` over
+/// the EF outer checks and batch-opening γ merges, capped at 2^26.
 const MAX_WEIGHTED_ROUNDS: u128 = 1u128 << 26;
+/// Exact size of the quadratic extension field:
+/// `(2^64 − 2^32 + 1)^2 = 2^128 − 2^97 + 2^65 + 2^64 − 2^33 + 1`.
+/// It fits in u128 (strictly below 2^128); do not approximate it by 2^128.
+const EF_ORDER: u128 = 340_282_366_762_482_138_490_186_164_457_219_031_041;
 /// S9 2d: weight tensors longer than 2^24 are committed as independent
 /// sub-tables of 2^24 elements (separate roots/openings). This bounds the
-/// per-opening PoW at 96-bit security; the verifier reassembles each full
+/// per-opening PoW at 97-bit security; the verifier reassembles each full
 /// claim with the public high-bit eq weights:
 /// `f(r) = Σ_h eq(r_high, bits(h)) · f_h(r_low)`.
 const WEIGHT_SUBTABLE_BITS: usize = 24;
@@ -10334,7 +10344,7 @@ pub fn commit_model_weights(
             // S9 2d: split every oversized tensor into independent 2^24
             // sub-tables, each with its own root/opening. This keeps
             // `required_pow_bits` at the chunk arity (24) instead of the
-            // original arity, so the 96-bit opening grind stays minutes.
+            // original arity, so the 97-bit opening grind stays minutes.
             let chunk_bits = (len / chunk_len).trailing_zeros() as usize;
             for (t, padded, original_len) in group {
                 for chunk_index in 0..(1usize << chunk_bits) {
@@ -12760,7 +12770,43 @@ pub fn prove_committed_shard_dag_bound(
 #[derive(Default)]
 struct ProofBudget {
     weighted: u128,
+    /// A2: γ-power merge degrees over batch-opening claims, Σ(n−1). This is
+    /// charged at the same |EF| denominator as the outer reductions.
+    merge: u128,
     openings: usize,
+}
+
+/// S9 WAVE-1 A1: exact integer form of
+/// `K·2^-97 + (weighted + merge)/|EF| ≤ 2^-90`.
+/// Multiplying by 2^97 gives `K + (weighted+merge)·2^97/|EF| ≤ 128`; the
+/// division is rounded up, which is stricter than the rational inequality.
+/// `weighted` already charges each round's degree (d/Q), so the task's
+/// `W·d/|EF|` term is `weighted/|EF|` here — d is not multiplied twice.
+fn security_budget_ok(k: usize, weighted: u128, merge: u128) -> bool {
+    let s = match weighted.checked_add(merge) { Some(v) => v, None => return false };
+    // The W cap keeps s ≤ 2^26, so this shift is safe; checked anyway.
+    let scaled = match s.checked_shl(97) { Some(v) => v, None => return false };
+    let extra = scaled / EF_ORDER + u128::from(scaled % EF_ORDER != 0);
+    let k = k as u128;
+    match k.checked_add(extra) {
+        Some(total) => total <= (1u128 << 7),
+        None => false,
+    }
+}
+
+/// Full A1 policy: resource/wire prefilter, effective K cap, the explicit
+/// outer half (`outer_units/|EF| ≤ 2^-91`, checked as
+/// `outer_units·2^91 ≤ |EF|`) and the exact combined bound.
+fn security_policy_ok(k: usize, weighted: u128, merge: u128) -> bool {
+    let outer = match weighted.checked_add(merge) { Some(v) => v, None => return false };
+    if outer > MAX_WEIGHTED_ROUNDS || k > MAX_PROOF_OPENINGS || k > MAX_EFFECTIVE_OPENINGS {
+        return false;
+    }
+    match outer.checked_shl(91) {
+        Some(scaled) if scaled <= EF_ORDER => {}
+        _ => return false,
+    }
+    security_budget_ok(k, weighted, merge)
 }
 
 impl ProofBudget {
@@ -12770,7 +12816,12 @@ impl ProofBudget {
     }
 
     fn virtual_proof(&mut self, p: &EfVirtualProof) -> Option<()> {
-        self.add(3u128.checked_mul(p.rounds.len() as u128)?)
+        self.add(3u128.checked_mul(p.rounds.len() as u128)?)?;
+        // A2 audit: the γ-separated batching inside a virtual relation is a
+        // separate random polynomial in γ. Every production term constructor
+        // has at most 4·|final_evals| terms (checked during the audit), so
+        // its γ-degree is below 4·|final_evals|; charge that as well.
+        self.add(4u128.checked_mul(p.final_evals.len() as u128)?)
     }
 
     fn sumcheck(&mut self, p: &efo::EfSumcheckProof) -> Option<()> {
@@ -12805,8 +12856,18 @@ impl ProofBudget {
         self.add((p.a.len() as u128).checked_add(p.b.len() as u128)?)
     }
 
-    fn opening(&mut self, p: &EfBatchOpeningProof) -> Option<()> {
+    /// A2: one batch opening over `claims` requests. Besides the
+    /// sum-of-products sumcheck and the WHIR opening, the γ-power merge
+    /// polynomial has degree `claims − 1`; charge it as `n−1` weighted units.
+    fn charge_merge(&mut self, claims: usize) -> Option<()> {
+        let merge = u128::try_from(claims.saturating_sub(1)).ok()?;
+        self.merge = self.merge.checked_add(merge)?;
+        Some(())
+    }
+
+    fn opening(&mut self, p: &EfBatchOpeningProof, claims: usize) -> Option<()> {
         self.batch_sumcheck(&p.sumcheck)?;
+        self.charge_merge(claims)?;
         self.openings = self.openings.checked_add(1)?;
         Some(())
     }
@@ -12817,8 +12878,51 @@ impl ProofBudget {
     }
 }
 
-fn proof_budget(proof: &BoundExecutionProof) -> Option<ProofBudget> {
+/// A2 audit: LogUp samples α/β after the table/witness commitments. The
+/// standard fractional-argument error is `N/|EF|` for N distinct lookup
+/// entries (the numerator of the rational-function difference has degree
+/// ≤ N). Charge N = max(index length, table length) per Lookup op, using the
+/// trusted manifest lengths; grouped tables are charged once per member
+/// (conservative). The W cap keeps the sum within 2^26.
+fn lookup_collision_units(ops: &[Op], model: &TrustedModelManifest, aux: &[AuxDescriptor]) -> Option<u128> {
+    let pairs_len = aux.iter()
+        .filter(|a| a.role == AuxRole::LookupPairs)
+        .map(|a| a.len as u128)
+        .max()
+        .unwrap_or(2);
+    let mut total = 0u128;
+    for op in ops {
+        if let Op::Lookup { idx, table, .. } = op {
+            let ki = TensorKey::Index(*idx).encoded()?;
+            let kt = TensorKey::Field(*table).encoded()?;
+            // Index length: trusted manifest shape, else the precommitted
+            // pairs descriptor length (validated later).
+            let li = model.tensor_lengths.get(&ki).copied()
+                .map(|v| v as u128)
+                .unwrap_or(pairs_len);
+            // Table length: field shape or the offline static-table length;
+            // fall back to the index length if the dynamic table shape is not
+            // materialized in the manifest (conservative for the usual
+            // index-length table; the op graph still pins dynamic shapes).
+            let lt = model.tensor_lengths.get(&kt).copied()
+                .or_else(|| model.lookup_lengths.get(&kt).copied())
+                .map(|v| v as u128)
+                .unwrap_or(li);
+            total = total.checked_add(li.max(lt).max(2))?;
+        }
+    }
+    Some(total)
+}
+
+fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
+    ops: &[Op], model: &TrustedModelManifest) -> Option<ProofBudget> {
     let mut b = ProofBudget::default();
+    b.weighted = b.weighted.checked_add(lookup_collision_units(ops, model, aux)?)?;
+    // A2: per-Lookup pair openings have one claim per aux column. The budget
+    // traversal cannot map a reverse step back to its descriptor, so it
+    // charges the maximum descriptor column count (a safe upper bound; the
+    // verifier later checks each opening against its exact descriptor).
+    let max_aux_columns = aux.iter().map(|a| a.columns).max().unwrap_or(1);
     for step in &proof.reverse.steps {
         for out in &step.outputs {
             if let Some(m) = &out.merge { b.same_poly(m)?; }
@@ -12828,33 +12932,36 @@ fn proof_budget(proof: &BoundExecutionProof) -> Option<ProofBudget> {
             ReverseReduction::Relu { proof } => {
                 b.virtual_proof(&proof.output)?;
                 b.virtual_proof(&proof.range)?;
-                b.opening(&proof.bit_opening)?;
+                b.opening(&proof.bit_opening, RELU_BITS + 1)?;
             }
             ReverseReduction::Projection { proof } => {
                 b.sumcheck(&proof.matmul.sumcheck)?;
                 b.virtual_proof(&proof.booleanity)?;
-                b.opening(&proof.opening)?;
+                // The opening covers each remainder column at two points.
+                b.opening(&proof.opening, 2 * proof.remainder_bits.len())?;
             }
             ReverseReduction::Lookup { proof } => {
                 b.fractional(&proof.witness)?;
                 b.fractional(&proof.table)?;
                 b.virtual_proof(&proof.padding)?;
-                b.opening(&proof.pairs_opening)?;
-                b.opening(&proof.multiplicity_opening)?;
+                b.opening(&proof.pairs_opening, max_aux_columns)?;
+                b.opening(&proof.multiplicity_opening, 2)?;
                 if proof.table_opening.is_some() { b.base_opening()?; }
             }
             ReverseReduction::GeluIndex { proof } => {
                 for r in [&proof.upper, &proof.lower] {
                     b.virtual_proof(&r.output)?;
                     b.virtual_proof(&r.range)?;
-                    b.opening(&r.bit_opening)?;
+                    b.opening(&r.bit_opening, GELU_BITS + 1)?;
                 }
                 b.virtual_proof(&proof.x_range)?;
-                b.opening(&proof.range_opening)?;
+                b.opening(&proof.range_opening, proof.range_aux_values.len())?;
             }
             ReverseReduction::Scale { proof } => {
                 if let Some(v) = &proof.booleanity { b.virtual_proof(v)?; }
-                if let Some(o) = &proof.opening { b.opening(o)?; }
+                if let Some(o) = &proof.opening {
+                    b.opening(o, 2 * proof.remainder_bits.len())?;
+                }
             }
             ReverseReduction::Argmax { proof } => {
                 for v in [&proof.sel_bool, &proof.bit_bool, &proof.row_sum, &proof.before_sum,
@@ -12862,17 +12969,17 @@ fn proof_budget(proof: &BoundExecutionProof) -> Option<ProofBudget> {
                           &proof.d2_rel] {
                     b.virtual_proof(v)?;
                 }
-                b.opening(&proof.opening)?;
+                b.opening(&proof.opening, proof.aux_values.len())?;
             }
             ReverseReduction::GatherMatMul { proof } => {
                 b.virtual_proof(&proof.matmul.sumcheck)?;
                 b.virtual_proof(&proof.routing)?;
-                b.opening(&proof.opening)?;
+                b.opening(&proof.opening, proof.aux_values.len())?;
             }
             ReverseReduction::Gather { proof } => {
                 b.virtual_proof(&proof.routing)?;
                 b.virtual_proof(&proof.sum)?;
-                b.opening(&proof.opening)?;
+                b.opening(&proof.opening, proof.aux_values.len())?;
             }
             ReverseReduction::TopKSelect { proof } => {
                 for v in [&proof.bools, &proof.row_sums, &proof.gate, &proof.d1, &proof.d2s,
@@ -12882,11 +12989,11 @@ fn proof_budget(proof: &BoundExecutionProof) -> Option<ProofBudget> {
                     b.virtual_proof(v)?;
                 }
                 for p in [&proof.perm_p, &proof.perm_t, &proof.perm_b] { b.permutation(p)?; }
-                b.opening(&proof.opening)?;
-                b.opening(&proof.thr_opening)?;
-                b.opening(&proof.range_opening)?;
-                b.opening(&proof.thr_range_opening)?;
-                b.opening(&proof.tie_opening)?;
+                b.opening(&proof.opening, proof.aux_values.len())?;
+                b.opening(&proof.thr_opening, proof.thr_values.len())?;
+                b.opening(&proof.range_opening, proof.range_aux_values.len())?;
+                b.opening(&proof.thr_range_opening, proof.thr_range_values.len())?;
+                b.opening(&proof.tie_opening, proof.tie_aux_values.len())?;
             }
             ReverseReduction::Scatter { proof } => {
                 for v in [&proof.bools, &proof.mask_tok, &proof.mask_exp, &proof.counts,
@@ -12895,8 +13002,8 @@ fn proof_budget(proof: &BoundExecutionProof) -> Option<ProofBudget> {
                     b.virtual_proof(v)?;
                 }
                 b.permutation(&proof.perm)?;
-                b.opening(&proof.opening)?;
-                b.opening(&proof.order_opening)?;
+                b.opening(&proof.opening, proof.aux_values.len())?;
+                b.opening(&proof.order_opening, proof.order_aux_values.len())?;
             }
             ReverseReduction::BroadcastScale { proof } => {
                 b.virtual_proof(&proof.prod)?;
@@ -12909,12 +13016,13 @@ fn proof_budget(proof: &BoundExecutionProof) -> Option<ProofBudget> {
             ReverseReduction::ScaleVecShifted { proof } => {
                 b.virtual_proof(&proof.prod)?;
                 b.same_poly(&proof.bind)?;
-                b.opening(&proof.opening)?;
+                b.opening(&proof.opening, proof.remainder_bits.len())?;
             }
             ReverseReduction::LookupGroups { groups } => {
                 for g in groups {
                     b.virtual_proof(&g.identity)?;
-                    b.opening(&g.aggregate_opening)?;
+                    // Aggregate column at [identity, table leaf]: two claims.
+                    b.opening(&g.aggregate_opening, 2)?;
                     b.fractional(&g.table)?;
                     b.base_opening()?;
                 }
@@ -12927,10 +13035,10 @@ fn proof_budget(proof: &BoundExecutionProof) -> Option<ProofBudget> {
         }
     }
     for w in &proof.weight_openings {
-        if let Some(p) = &w.proof { b.opening(p)?; }
+        if let Some(p) = &w.proof { b.opening(p, w.points.len())?; }
     }
-    for s in &proof.sel_openings { b.opening(&s.opening)?; }
-    if let Some(t) = &proof.token_binding { b.opening(&t.opening)?; }
+    for s in &proof.sel_openings { b.opening(&s.opening, s.points.len())?; }
+    if let Some(t) = &proof.token_binding { b.opening(&t.opening, 1)?; }
     Some(b)
 }
 
@@ -12955,22 +13063,24 @@ pub fn verify_committed_shard_dag_bound(
         return false;
     }
     if trusted_weight_locations(model, ops).is_none() { return false; }
-    // S9 2c: verifier-enforced opening/budget caps. Both are derived from the
+    // S9 WAVE-1 A1/A2: verifier-enforced error budget. `weighted` charges the
+    // EF outer rounds (each round's degree already included, so it is the
+    // numerator of W/|EF|), `merge` charges batch-opening γ-power merges
+    // (Σ(n−1)), and `openings` counts PCS openings. All are derived from the
     // verified proof structure, never from a proof-declared parameter.
-    let budget = match proof_budget(proof) { Some(b) => b, None => return false };
+    let budget = match proof_budget(proof, &proof.aux, ops, model) { Some(b) => b, None => return false };
+    let outer_units = match budget.weighted.checked_add(budget.merge) {
+        Some(v) => v, None => return false,
+    };
     if std::env::var("ZKIE_S9_BUDGET_LOG").ok().as_deref() == Some("1") {
-        eprintln!("S9-budget openings={} weighted={} security={} required={}",
-            budget.openings, budget.weighted, VERIFIER_SECURITY,
+        eprintln!("S9-budget openings={} weighted={} merge={} outer_units={} security={} required={}",
+            budget.openings, budget.weighted, budget.merge, outer_units, VERIFIER_SECURITY,
             90 + ceil_log2(budget.openings.max(1)));
     }
-    if budget.weighted > MAX_WEIGHTED_ROUNDS || budget.openings > MAX_PROOF_OPENINGS {
-        return false;
-    }
-    // Union bound over K openings: each opening must carry at least
-    // 90 + ceil(log2 K) bits. The provisioned PCS security is fixed by the
-    // verifier policy, so a proof with more openings than it covers is
-    // rejected rather than silently degrading below the 90-bit target.
-    if VERIFIER_SECURITY < 90 + ceil_log2(budget.openings.max(1)) { return false; }
+    // Resource/wire prefilter (2^12), effective K cap (64), explicit outer
+    // half (outer_units·2^91 ≤ |EF|) and the exact combined check
+    // K·2^-97 + (weighted+merge)/|EF| ≤ 2^-90.
+    if !security_policy_ok(budget.openings, budget.weighted, budget.merge) { return false; }
     // Dead-field canonicalization: a Generic statement never consults the
     // token binding, so a Generic proof must not carry one (S8 malleability).
     if !matches!(statement, PublicStatement::LanguageModel { .. }) && proof.token_binding.is_some() {
@@ -22100,16 +22210,70 @@ mod tests {
         assert_eq!(ceil_log2(65), 7);
         let (ops, whir, model, execution, bytes) = s8_bound_fixture(0x5903);
         let proof: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
-        let b = proof_budget(&proof).expect("budget traversal");
-        assert!(b.weighted <= MAX_WEIGHTED_ROUNDS, "W={}", b.weighted);
+        let b = proof_budget(&proof, &proof.aux, &ops, &model).expect("budget traversal");
+        let outer = b.weighted.checked_add(b.merge).expect("outer units");
+        assert!(outer <= MAX_WEIGHTED_ROUNDS, "outer={outer}");
         assert!(b.openings > 0, "honest proof must perform openings");
-        assert!(
-            b.openings <= 1usize << (VERIFIER_SECURITY - 90),
-            "K={} exceeds the provisioned per-opening security",
-            b.openings
-        );
+        assert!(b.openings <= MAX_EFFECTIVE_OPENINGS, "K={} exceeds the effective cap", b.openings);
+        assert!(security_policy_ok(b.openings, b.weighted, b.merge));
         assert!(verify_committed_shard_dag_bound_bytes(
             &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// S9 WAVE-1 A1: exact field size, half-budget boundaries, effective cap
+    /// (K=65 rejects), and the exact combined total check. K=127/128 checks
+    /// the combined bound independently of the effective cap.
+    #[test]
+    fn s9_a1_security_budget_boundaries() {
+        // (2^64 − 2^32 + 1)^2 = 2^128 − 2^97 + 2^65 + 2^64 − 2^33 + 1;
+        // computed as a product because 2^128 itself does not fit in u128.
+        let p = 0xFFFF_FFFF_0000_0001u128;
+        assert_eq!(EF_ORDER, p * p);
+        for k in [1usize, 63, 64] {
+            assert!(security_policy_ok(k, 0, 0), "K={k} must pass");
+            assert!(security_policy_ok(k, MAX_WEIGHTED_ROUNDS, 0), "K={k} at W cap");
+        }
+        assert!(!security_policy_ok(65, 0, 0), "K=65 must be rejected by the effective cap");
+        assert!(!security_policy_ok(64, MAX_WEIGHTED_ROUNDS + 1, 0), "W over cap");
+        assert!(security_budget_ok(127, 1, 0));
+        assert!(!security_budget_ok(128, 1, 0));
+        // Verifier policy rejects a legacy 96-bit manifest batch.
+        assert!(trusted_batch_whir(5, 96, 0).is_none());
+        assert!(trusted_batch_whir(5, 97, 0).is_some());
+    }
+
+    /// S9 WAVE-1 A1: a manifest committed at the legacy 96-bit level (below
+    /// the 97-bit policy) is rejected at the formal bytes entry.
+    #[test]
+    fn s9_a1_rejects_legacy_96_manifest_at_wire() {
+        let (ops, whir, mut model, execution, bytes) = s8_bound_fixture(0x5904);
+        model.batches[0].security = 96;
+        assert!(!verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// S9 WAVE-1 A2: the γ-merge charge is n−1 and grows with the number of
+    /// claims at the same round/opening count; no charge for 0/1 claims.
+    #[test]
+    fn s9_a2_gamma_merge_charge_monotone() {
+        let mut one = ProofBudget::default();
+        one.charge_merge(1).unwrap();
+        assert_eq!(one.merge, 0);
+        let mut two = ProofBudget::default();
+        two.charge_merge(2).unwrap();
+        assert_eq!(two.merge, 1);
+        let mut many = ProofBudget::default();
+        many.charge_merge(64).unwrap();
+        assert_eq!(many.merge, 63);
+        assert!(many.merge > two.merge && two.merge > one.merge);
+        let mut zero = ProofBudget::default();
+        zero.charge_merge(0).unwrap();
+        assert_eq!(zero.merge, 0);
+        // Merge units participate in the exact total check; the W cap is
+        // enforced by the full policy helper.
+        assert!(security_budget_ok(64, 0, 63));
+        assert!(security_policy_ok(64, 0, 63));
+        assert!(!security_policy_ok(64, MAX_WEIGHTED_ROUNDS + 1, 0));
     }
 
     /// S9 2d: the sub-table split math must reassemble the original MLE:
