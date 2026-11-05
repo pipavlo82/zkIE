@@ -440,6 +440,7 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
         )),
         Op::BroadcastScale { x, scale, out, .. } => Some((vec![f(*x)?, f(*scale)?], vec![f(*out)?])),
         Op::ScaleVec { x, scale, out, .. } => Some((vec![f(*x)?, f(*scale)?], vec![f(*out)?])),
+        Op::ScaleGate { x, gate, out, .. } => Some((vec![f(*x)?, f(*gate)?], vec![f(*out)?])),
         _ => None,
     }
 }
@@ -2046,6 +2047,18 @@ struct ReverseScaleVecProof {
 /// the out endpoint bound by S4 same_poly. The remainder is in [0,2^shift),
 /// i.e. ties-up rounding. `remainder_bits` are the bit evals at the virtual
 /// point; `opening` authenticates them against the precommitted aux.
+/// B1: reverse ScaleGate — out[pos] = round_div(x[pos] * gate[(pos/h)*n+col], 2^shift),
+/// gate_b = broadcast of the gate column. shift=0 uses an exact product
+/// virtual; shift>0 adds the precommitted ScaleGateRemainder bit witness
+/// (rem = x*gate_b - out*2^shift + 2^(shift-1) in [0,2^shift)).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ReverseScaleGateProof {
+    prod: EfVirtualProof,
+    bind: EfSamePolyProof,
+    remainder_bits: Vec<Ef>,
+    opening: Option<EfBatchOpeningProof>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReverseScaleVecShiftedProof {
     prod: EfVirtualProof,
@@ -2080,6 +2093,16 @@ fn scale_vec_shift_terms(shift: usize, gamma: Ef)
 
 fn broadcast_scale_dims(op: &Op) -> Option<(T, T, T, usize)> {
     match op { Op::BroadcastScale { x, scale, out, h } => Some((*x, *scale, *out, *h)), _ => None }
+}
+fn scale_gate_dims(op: &Op) -> Option<(T, T, usize, T, usize, usize, usize, u32)> {
+    match op {
+        Op::ScaleGate { x, gate, col, out, m, n, h, shift } => {
+            if !m.is_power_of_two() || !n.is_power_of_two() || !h.is_power_of_two()
+                || *col >= *n || *shift > 31 { return None; }
+            Some((*x, *gate, *col, *out, *m, *n, *h, *shift))
+        }
+        _ => None,
+    }
 }
 fn scale_vec_dims(op: &Op) -> Option<(T, T, T, u32)> {
     match op { Op::ScaleVec { x, scale, out, shift } => Some((*x, *scale, *out, *shift)), _ => None }
@@ -2310,6 +2333,154 @@ fn verify_reverse_scale_vec_shifted(op: &Op, point: &[Ef], value: Ef,
     Some(vec![
         EfClaim { tensor_id: xk, point: x_point, value: x_eval },
         EfClaim { tensor_id: sk, point: z[..proof.scale_arity].to_vec(), value: fe[2] },
+    ])
+}
+
+/// B1: reverse ScaleGate. Position point z (length log(m*h)); the gate column
+/// is opened through the gate tensor claim at [col bits][z row bits]. shift=0
+/// is the exact product identity; shift>0 uses the precommitted remainder
+/// bits with the ties-up identity
+/// `x*gate_b - out*2^shift + 2^(shift-1) - Σ 2^b bit_b = 0`.
+fn prove_reverse_scale_gate(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    aux: Option<PreparedAux>, transcript: &mut Transcript)
+    -> Option<(ReverseScaleGateProof, Vec<EfClaim>)>
+{
+    let (x, gate, col, out, m, n, h, shift) = scale_gate_dims(op)?;
+    let lgl = point.len();
+    if lgl < 5 || lgl > 30 { return None; }
+    let l = 1usize << lgl;
+    if m.checked_mul(h)? != l { return None; }
+    let xv = store.get(x);
+    let gv = store.get(gate);
+    let ov = store.get(out);
+    if xv.len() != l || ov.len() != l || gv.len() != m.checked_mul(n)? { return None; }
+    let h_log = h.trailing_zeros() as usize;
+    let n_log = n.trailing_zeros() as usize;
+    let gate_b: Vec<Ef> = (0..l).map(|i| Ef::from(gv[(i / h) * n + col])).collect();
+    let xv_ef = ef_lift(xv);
+    let ov_ef = ef_lift(ov);
+    transcript.absorb(b"zkie-scalegate-v1");
+    transcript.absorb_u64(shift as u64);
+
+    let (prod, bind, z, remainder_bits, opening) = if shift == 0 {
+        let q = transcript.ef_field_vec(lgl);
+        let eq = efo::eq_evals(&q);
+        let terms = exact_product_terms();
+        let mles: [&[Ef]; 4] = [&eq, &xv_ef, &gate_b, &ov_ef];
+        let (vp, z) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
+        if z.len() != lgl || vp.final_evals.len() != 4 { return None; }
+        let (bind, _) = efo::prove_same_poly_ef(
+            &ov_ef, &[(point.to_vec(), value), (z.clone(), vp.final_evals[3])], transcript);
+        (vp, bind, z, Vec::new(), None)
+    } else {
+        let aux = aux?;
+        if aux.descriptor.role != AuxRole::ScaleGateRemainder || aux.descriptor.len != l
+            || aux.descriptor.arity != lgl || aux.descriptor.columns != shift as usize
+            || aux.columns.len() != shift as usize
+            || aux.columns.iter().any(|c| c.len() != l) { return None; }
+        let two_shift = 1i64.checked_shl(shift)?;
+        let half = two_shift / 2;
+        for i in 0..l {
+            let g = to_i64(gv[(i / h) * n + col]);
+            let rem = to_i64(xv[i]).checked_mul(g)?
+                .checked_sub(to_i64(ov[i]).checked_mul(two_shift)?)?
+                .checked_add(half)?;
+            if rem < 0 || rem as u64 >= two_shift as u64 { return None; }
+            for j in 0..shift as usize {
+                if aux.columns[j][i] != Goldilocks::from_u64(((rem as u64) >> j) & 1) { return None; }
+            }
+        }
+        let q = transcript.ef_field_vec(lgl);
+        let gamma = transcript.ef_field();
+        let eq = efo::eq_evals(&q);
+        let aux_ef = lift_columns(&aux.columns);
+        let mut mles: Vec<&[Ef]> = vec![&eq, &xv_ef, &gate_b, &ov_ef];
+        mles.extend(aux_ef.iter().map(Vec::as_slice));
+        let terms = scale_vec_shift_terms(shift as usize, gamma);
+        let (vp, z) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
+        if z.len() != lgl || vp.final_evals.len() != 4 + shift as usize { return None; }
+        let (bind, _) = efo::prove_same_poly_ef(
+            &ov_ef, &[(point.to_vec(), value), (z.clone(), vp.final_evals[3])], transcript);
+        let bits = vp.final_evals[4..4 + shift as usize].to_vec();
+        let idxs: Vec<usize> = (0..shift as usize).collect();
+        let points = vec![z.clone(); shift as usize];
+        let opening = open_aux(aux, &idxs, &points, &bits)?;
+        (vp, bind, z, bits, Some(opening))
+    };
+    let x_eval = prod.final_evals[1];
+    let gate_eval = prod.final_evals[2];
+    let mut gp = Vec::with_capacity(n_log + lgl - h_log);
+    for k in 0..n_log { gp.push(ef_u64(((col >> k) & 1) as u64)); }
+    gp.extend_from_slice(&z[h_log..]);
+    let xk = TensorKey::Field(x).encoded()?;
+    let gk = TensorKey::Field(gate).encoded()?;
+    Some((ReverseScaleGateProof { prod, bind, remainder_bits, opening },
+        vec![
+            EfClaim { tensor_id: xk, point: z, value: x_eval },
+            EfClaim { tensor_id: gk, point: gp, value: gate_eval },
+        ]))
+}
+
+fn verify_reverse_scale_gate(op: &Op, point: &[Ef], value: Ef,
+    aux: Option<&AuxDescriptor>, proof: &ReverseScaleGateProof, transcript: &mut Transcript)
+    -> Option<Vec<EfClaim>>
+{
+    let (x, gate, col, _out, m, n, h, shift) = scale_gate_dims(op)?;
+    let lgl = point.len();
+    if lgl < 5 || lgl > 30 { return None; }
+    let l = 1usize << lgl;
+    if m.checked_mul(h)? != l { return None; }
+    let h_log = h.trailing_zeros() as usize;
+    let n_log = n.trailing_zeros() as usize;
+    if shift > 0 {
+        let d = aux?;
+        if d.role != AuxRole::ScaleGateRemainder || d.len != l || d.arity != lgl
+            || d.columns != shift as usize { return None; }
+    } else if aux.is_some() || proof.opening.is_some() || !proof.remainder_bits.is_empty() {
+        return None;
+    }
+    let expected_fe = 4 + shift as usize;
+    if proof.prod.final_evals.len() != expected_fe { return None; }
+    if shift == 0 {
+        if !proof.remainder_bits.is_empty() || proof.opening.is_some() { return None; }
+    } else if proof.remainder_bits.len() != shift as usize || proof.opening.is_none() {
+        return None;
+    }
+    transcript.absorb(b"zkie-scalegate-v1");
+    transcript.absorb_u64(shift as u64);
+    let q = transcript.ef_field_vec(lgl);
+    let (terms, mles_len) = if shift == 0 {
+        (exact_product_terms(), 4)
+    } else {
+        let gamma = transcript.ef_field();
+        (scale_vec_shift_terms(shift as usize, gamma), 4 + shift as usize)
+    };
+    let (ok, z, fc) = efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, transcript);
+    if !ok || z.len() != lgl { return None; }
+    let fe = &proof.prod.final_evals;
+    if fe.len() != mles_len || fe[0] != ef_eq_poly(&q, &z)
+        || fc != efo::virtual_eval(&terms, fe) { return None; }
+    if shift > 0 {
+        let d = aux?;
+        if !verify_aux_open(d, &(0..shift as usize).collect::<Vec<_>>(),
+            &vec![z.clone(); shift as usize], &proof.remainder_bits, proof.opening.as_ref()?) {
+            return None;
+        }
+        for j in 0..shift as usize {
+            if fe[4 + j] != proof.remainder_bits[j] { return None; }
+        }
+    }
+    if efo::verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
+        return None;
+    }
+    let mut gp = Vec::with_capacity(n_log + lgl - h_log);
+    for k in 0..n_log { gp.push(ef_u64(((col >> k) & 1) as u64)); }
+    gp.extend_from_slice(&z[h_log..]);
+    let xk = TensorKey::Field(x).encoded()?;
+    let gk = TensorKey::Field(gate).encoded()?;
+    Some(vec![
+        EfClaim { tensor_id: xk, point: z, value: fe[1] },
+        EfClaim { tensor_id: gk, point: gp, value: fe[2] },
     ])
 }
 
@@ -2936,6 +3107,8 @@ enum ReverseReduction {
     LookupGroups { groups: Vec<LookupGroupProof> },
     /// Project ② step 2b: ScaleVec with rounding (shift > 0).
     ScaleVecShifted { proof: ReverseScaleVecShiftedProof },
+    /// PR#45 B1: out = round_div(x * broadcast(gate column), 2^shift).
+    ScaleGate { proof: ReverseScaleGateProof },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3929,7 +4102,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecRemainder }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecRemainder, ScaleGateRemainder }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -4200,6 +4373,70 @@ fn prepare_scale_vec_remainder_aux(store: &Store, ops: &[Op], model: &TrustedMod
         let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
         let descriptor = AuxDescriptor {
             op_index, role: AuxRole::ScaleVecRemainder, len, arity, columns: count, commitment,
+        };
+        prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+    }
+    Some(prepared)
+}
+
+/// B1: ScaleGate shift>0 rounding remainder witness. `out = round_div(x*gate_b, 2^shift)`
+/// with gate_b = gate[(pos/h)*n + col]; rem = x*gate_b - out*2^shift + half
+/// must lie in [0, 2^shift), matching `round_div` (ties up).
+fn scale_gate_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, usize, usize, usize)>>
+{
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::ScaleGate { x, shift, .. } = op {
+            if *shift == 0 { continue; }
+            if *shift > 31 { return None; }
+            let key = TensorKey::Field(*x).encoded()?;
+            let len = *model.tensor_lengths.get(&key)?;
+            if len < 32 || !len.is_power_of_two() { return None; }
+            specs.push((i, len, len.trailing_zeros() as usize, *shift as usize));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_scale_gate_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<PreparedAux>>
+{
+    let mut prepared = Vec::new();
+    for (op_index, len, arity, count) in scale_gate_aux_specs(ops, model)? {
+        let (x, gate, col, out, m, n, h, shift) = match &ops[op_index] {
+            Op::ScaleGate { x, gate, col, out, m, n, h, shift } => (*x, *gate, *col, *out, *m, *n, *h, *shift),
+            _ => return None,
+        };
+        if shift as usize != count { return None; }
+        if !m.is_power_of_two() || !n.is_power_of_two() || !h.is_power_of_two()
+            || m.checked_mul(h)? != len || m.checked_mul(n)? != model.tensor_lengths.get(&TensorKey::Field(gate).encoded()?).copied()?
+            || col >= n { return None; }
+        let xv = store.get(x);
+        let gv = store.get(gate);
+        let ov = store.get(out);
+        if xv.len() != len || ov.len() != len { return None; }
+        let two_shift = 1i64.checked_shl(shift)?;
+        let half = two_shift / 2;
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
+        for i in 0..len {
+            let g = to_i64(gv[(i / h) * n + col]);
+            let rem = to_i64(xv[i]).checked_mul(g)?
+                .checked_sub(to_i64(ov[i]).checked_mul(two_shift)?)?
+                .checked_add(half)?;
+            if rem < 0 || rem as u64 >= two_shift as u64 { return None; }
+            for j in 0..count {
+                columns[j][i] = Goldilocks::from_u64(((rem as u64) >> j) & 1);
+            }
+        }
+        let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        let descriptor = AuxDescriptor {
+            op_index, role: AuxRole::ScaleGateRemainder, len, arity, columns: count, commitment,
         };
         prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
     }
@@ -4590,6 +4827,10 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleVecRemainder, len, arity, cols))),
         None => return false,
     };
+    match scale_gate_aux_specs(ops, model) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleGateRemainder, len, arity, cols))),
+        None => return false,
+    };
     match argmax_aux_specs(ops) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ArgmaxWitness, len, arity, cols))),
         None => return false,
@@ -4607,7 +4848,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecRemainder => 16 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -5634,6 +5875,21 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                     ReverseReduction::ScaleVecShifted { proof }
                 }
             }
+            Op::ScaleGate { .. } => {
+                let (_, _, _, _, _, _, _, shift) = scale_gate_dims(op)?;
+                let auxp = if shift == 0 {
+                    None
+                } else {
+                    Some(aux.remove(&(op_index, AuxRole::ScaleGateRemainder))?)
+                };
+                let (proof, incoming) = prove_reverse_scale_gate(
+                    store, op, &point, value, auxp, transcript)?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::ScaleGate { proof }
+            }
             Op::CombineIdx { a, b, scale, out: out_t, .. } => {
                 // S5 (reverse): out = scale*a + b at the claim point. When the
                 // verifier can replay the output (and inputs) from public
@@ -5960,6 +6216,14 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 let descriptor = aux.iter().find(|a| a.op_index == op_index
                     && a.role == AuxRole::ScaleVecRemainder);
                 for c in verify_reverse_scale_vec_shifted(op, &point, value, descriptor, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+            }
+            (Op::ScaleGate { .. }, ReverseReduction::ScaleGate { proof }) => {
+                let descriptor = aux.iter().find(|a| a.op_index == op_index
+                    && a.role == AuxRole::ScaleGateRemainder);
+                for c in verify_reverse_scale_gate(op, &point, value, descriptor, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -12637,6 +12901,7 @@ pub fn prove_committed_shard_dag_bound(
     let mut prepared = prepare_projection_aux(store, ops)?;
     prepared.extend(prepare_scale_aux(store, ops, model)?);
     prepared.extend(prepare_scale_vec_remainder_aux(store, ops, model)?);
+    prepared.extend(prepare_scale_gate_aux(store, ops, model)?);
     prepared.extend(prepare_argmax_aux(store, ops)?);
     prepared.extend(prepare_expert_routing_aux(store, ops)?);
     prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
@@ -13029,6 +13294,13 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.same_poly(&proof.bind)?;
                 b.opening(&proof.opening, proof.remainder_bits.len())?;
             }
+            ReverseReduction::ScaleGate { proof } => {
+                b.virtual_proof(&proof.prod, 3)?;
+                b.same_poly(&proof.bind)?;
+                if let Some(o) = &proof.opening {
+                    b.opening(o, proof.remainder_bits.len())?;
+                }
+            }
             ReverseReduction::LookupGroups { groups } => {
                 for g in groups {
                     b.virtual_proof(&g.identity, 3)?;
@@ -13358,13 +13630,12 @@ fn op_lookup_pushes(op: &Op, resolve_identity: &dyn Fn(usize) -> Option<T>) -> O
             resolve_identity(1usize << 22)?,
         ]),
         Op::Relu { .. } => Some(vec![resolve_identity(1usize << 22)?]),
-        Op::Scale { shift, .. }
-        | Op::ScaleVec { shift, .. }
-        | Op::ScaleGate { shift, .. }
-            if *shift > 0 =>
-        {
+        Op::Scale { shift, .. } | Op::ScaleVec { shift, .. } if *shift > 0 => {
             Some(vec![resolve_identity(1usize << shift)?])
         }
+        // B1: ScaleGate proves rounding via its precommitted remainder bits,
+        // so it does not require the public identity range table.
+        Op::ScaleGate { .. } => Some(vec![]),
         _ => Some(vec![]),
     }
 }
@@ -22285,6 +22556,99 @@ mod tests {
         assert!(security_budget_ok(64, 0, 63));
         assert!(security_policy_ok(64, 0, 63));
         assert!(!security_policy_ok(64, MAX_WEIGHTED_ROUNDS + 1, 0));
+    }
+
+    /// PR#45 B1: ScaleGate through the bound bytes entry, including the
+    /// precommitted remainder aux and tampered execution values.
+    #[test]
+    fn b1_scale_gate_bound_roundtrip_and_tamper() {
+        let mut store = Store::new();
+        let (m, h, n, col, shift) = (4usize, 8usize, 8usize, 3usize, 4u32);
+        let x = store.push((0..m * h).map(|i| from_i64(i as i64 - 12)).collect());
+        let gate = store.push((0..m * n).map(|i| from_i64((i as i64 % 7) - 3)).collect());
+        let out = store.push(vec![Goldilocks::ZERO; m * h]);
+        let ops = vec![Op::ScaleGate { x, gate, col, out, m, n, h, shift }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops);
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec()), (gate, store.get(gate).to_vec())].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 0);
+        let proof = prove_committed_shard_dag_bound(
+            &mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("ScaleGate bound proof");
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        for bad in 0..3 {
+            let mut e = execution.clone();
+            match bad {
+                0 => e.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE,
+                1 => e.inputs.get_mut(&gate).unwrap()[col] += Goldilocks::ONE,
+                _ => e.outputs.get_mut(&out).unwrap()[1] += Goldilocks::ONE,
+            }
+            assert!(!verify_committed_shard_dag_bound_bytes(
+                &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &e),
+                "tampered ScaleGate execution {bad} must be rejected");
+        }
+    }
+
+    /// PR#45 B1: ScaleGate reverse roundtrip (exact and rounded), plus
+    /// output/aux tamper rejection.
+    #[test]
+    fn b1_scale_gate_reverse_roundtrip_and_tamper() {
+        for shift in [0u32, 4] {
+            let mut store = Store::new();
+            let (m, h, n, col) = (4usize, 8usize, 8usize, 3usize);
+            let x = store.push((0..m * h).map(|i| from_i64(i as i64 - 12)).collect());
+            let gate = store.push((0..m * n).map(|i| from_i64((i as i64 % 7) - 3)).collect());
+            let out = store.push(vec![Goldilocks::ZERO; m * h]);
+            let ops = vec![Op::ScaleGate { x, gate, col, out, m, n, h, shift }];
+            forward_ops(&mut store, &ops);
+            let model = TrustedModelManifest::from_offline_commitment(
+                &[], &store.owned_slices(), &ops);
+            let point: Vec<Ef> = (0..(m * h).trailing_zeros()).map(|b| ef_u64(3 + b as u64)).collect();
+            let value = ef_eval(store.get(out), &point);
+            let aux = if shift == 0 { None } else {
+                Some(prepare_scale_gate_aux(&store, &ops, &model).unwrap().remove(0))
+            };
+            let auxd = aux.as_ref().map(|a| a.descriptor.clone());
+            let mut tp = Transcript::new(b"b1-scalegate");
+            let (proof, claims) = prove_reverse_scale_gate(
+                &store, &ops[0], &point, value, aux, &mut tp).unwrap();
+            assert_eq!(claims.len(), 2);
+            assert_eq!(claims[0].tensor_id, x);
+            assert_eq!(claims[1].tensor_id, gate);
+            let mut tv = Transcript::new(b"b1-scalegate");
+            let got = verify_reverse_scale_gate(
+                &ops[0], &point, value, auxd.as_ref(), &proof, &mut tv);
+            assert!(got.is_some(), "shift={shift} honest ScaleGate must verify");
+            // Tampered output claim.
+            let mut tv = Transcript::new(b"b1-scalegate");
+            assert!(verify_reverse_scale_gate(
+                &ops[0], &point, value + Ef::ONE, auxd.as_ref(), &proof, &mut tv).is_none());
+            // Tampered x eval inside the product virtual.
+            let mut bad = proof.clone();
+            bad.prod.final_evals[1] += Ef::ONE;
+            let mut tv = Transcript::new(b"b1-scalegate");
+            assert!(verify_reverse_scale_gate(
+                &ops[0], &point, value, auxd.as_ref(), &bad, &mut tv).is_none());
+            if shift > 0 {
+                let mut bad = proof.clone();
+                bad.remainder_bits[0] += Ef::ONE;
+                let mut tv = Transcript::new(b"b1-scalegate");
+                assert!(verify_reverse_scale_gate(
+                    &ops[0], &point, value, auxd.as_ref(), &bad, &mut tv).is_none());
+                // Descriptor with the wrong column count is rejected.
+                let mut wrong = auxd.clone().unwrap();
+                wrong.columns += 1;
+                let mut tv = Transcript::new(b"b1-scalegate");
+                assert!(verify_reverse_scale_gate(
+                    &ops[0], &point, value, Some(&wrong), &proof, &mut tv).is_none());
+            }
+        }
     }
 
     /// S9 WAVE-1 A2: tie_zero/tie_less are charged their real per-round
