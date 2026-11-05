@@ -2083,6 +2083,7 @@ struct ReverseScaleVecProof {
 struct ReverseScaleGateProof {
     prod: EfVirtualProof,
     bind: EfSamePolyProof,
+    out_opening: EfBatchOpeningProof,
     remainder_bits: Vec<Ef>,
     opening: Option<EfBatchOpeningProof>,
 }
@@ -2447,7 +2448,7 @@ fn verify_reverse_scale_vec_shifted(op: &Op, point: &[Ef], value: Ef,
 /// bits with the ties-up identity
 /// `x*gate_b - out*2^shift + 2^(shift-1) - Σ 2^b bit_b = 0`.
 fn prove_reverse_scale_gate(store: &Store, op: &Op, point: &[Ef], value: Ef,
-    aux: Option<PreparedAux>, transcript: &mut Transcript)
+    aux: Option<PreparedAux>, out_aux: PreparedAux, transcript: &mut Transcript)
     -> Option<(ReverseScaleGateProof, Vec<EfClaim>)>
 {
     let (x, gate, col, out, m, n, h, shift) = scale_gate_dims(op)?;
@@ -2464,19 +2465,26 @@ fn prove_reverse_scale_gate(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let gate_b: Vec<Ef> = (0..l).map(|i| Ef::from(gv[(i / h) * n + col])).collect();
     let xv_ef = ef_lift(xv);
     let ov_ef = ef_lift(ov);
+    let out_aux_arity = out_aux.descriptor.arity;
+    let out_aux_len = 1usize.checked_shl(out_aux_arity as u32)?;
+    if out_aux.descriptor.role != AuxRole::ScaleGateOut || out_aux.descriptor.len != l
+        || out_aux_arity < lgl || out_aux_arity < 5 || out_aux.descriptor.columns != 1
+        || out_aux.columns.len() != 1 || out_aux.columns[0].len() != out_aux_len
+        || out_aux.columns[0][..l] != ov[..] { return None; }
+    transcript.absorb(&bincode::serialize(&out_aux.descriptor.commitment).ok()?);
     transcript.absorb(b"zkie-scalegate-v1");
     transcript.absorb_u64(shift as u64);
 
-    let (prod, bind, z, remainder_bits, opening) = if shift == 0 {
+    let (prod, bind, merged, z, remainder_bits, opening) = if shift == 0 {
         let q = transcript.ef_field_vec(lgl);
         let eq = efo::eq_evals(&q);
         let terms = exact_product_terms();
         let mles: [&[Ef]; 4] = [&eq, &xv_ef, &gate_b, &ov_ef];
         let (vp, z) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
         if z.len() != lgl || vp.final_evals.len() != 4 { return None; }
-        let (bind, _) = efo::prove_same_poly_ef(
+        let (bind, merged) = efo::prove_same_poly_ef(
             &ov_ef, &[(point.to_vec(), value), (z.clone(), vp.final_evals[3])], transcript);
-        (vp, bind, z, Vec::new(), None)
+        (vp, bind, merged, z, Vec::new(), None)
     } else {
         let aux = aux?;
         if aux.descriptor.role != AuxRole::ScaleGateRemainder || aux.descriptor.len != l
@@ -2504,14 +2512,20 @@ fn prove_reverse_scale_gate(store: &Store, op: &Op, point: &[Ef], value: Ef,
         let terms = scale_vec_shift_terms(shift as usize, gamma);
         let (vp, z) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
         if z.len() != lgl || vp.final_evals.len() != 4 + shift as usize { return None; }
-        let (bind, _) = efo::prove_same_poly_ef(
+        let (bind, merged) = efo::prove_same_poly_ef(
             &ov_ef, &[(point.to_vec(), value), (z.clone(), vp.final_evals[3])], transcript);
         let bits = vp.final_evals[4..4 + shift as usize].to_vec();
         let idxs: Vec<usize> = (0..shift as usize).collect();
         let points = vec![z.clone(); shift as usize];
         let opening = open_aux(aux, &idxs, &points, &bits)?;
-        (vp, bind, z, bits, Some(opening))
+        (vp, bind, merged, z, bits, Some(opening))
     };
+    let mut r_pad = bind.merged_point.clone();
+    r_pad.resize(out_aux_arity, Ef::ZERO);
+    let mut z_pad = z.clone();
+    z_pad.resize(out_aux_arity, Ef::ZERO);
+    let out_opening = open_aux(out_aux, &[0, 0],
+        &[r_pad, z_pad], &[merged, prod.final_evals[3]])?;
     let x_eval = prod.final_evals[1];
     let gate_eval = prod.final_evals[2];
     let mut gp = Vec::with_capacity(n_log + lgl - h_log);
@@ -2519,7 +2533,7 @@ fn prove_reverse_scale_gate(store: &Store, op: &Op, point: &[Ef], value: Ef,
     gp.extend_from_slice(&z[h_log..]);
     let xk = TensorKey::Field(x).encoded()?;
     let gk = TensorKey::Field(gate).encoded()?;
-    Some((ReverseScaleGateProof { prod, bind, remainder_bits, opening },
+    Some((ReverseScaleGateProof { prod, bind, out_opening, remainder_bits, opening },
         vec![
             EfClaim { tensor_id: xk, point: z, value: x_eval },
             EfClaim { tensor_id: gk, point: gp, value: gate_eval },
@@ -2527,7 +2541,8 @@ fn prove_reverse_scale_gate(store: &Store, op: &Op, point: &[Ef], value: Ef,
 }
 
 fn verify_reverse_scale_gate(op: &Op, point: &[Ef], value: Ef,
-    aux: Option<&AuxDescriptor>, proof: &ReverseScaleGateProof, transcript: &mut Transcript)
+    aux: Option<&AuxDescriptor>, out_aux: &AuxDescriptor,
+    proof: &ReverseScaleGateProof, transcript: &mut Transcript)
     -> Option<Vec<EfClaim>>
 {
     let (x, gate, col, _out, m, n, h, shift) = scale_gate_dims(op)?;
@@ -2544,6 +2559,9 @@ fn verify_reverse_scale_gate(op: &Op, point: &[Ef], value: Ef,
     } else if aux.is_some() || proof.opening.is_some() || !proof.remainder_bits.is_empty() {
         return None;
     }
+    if out_aux.role != AuxRole::ScaleGateOut || out_aux.len != l || out_aux.arity < lgl
+        || out_aux.arity < 5 || out_aux.columns != 1 { return None; }
+    transcript.absorb(&bincode::serialize(&out_aux.commitment).ok()?);
     let expected_fe = 4 + shift as usize;
     if proof.prod.final_evals.len() != expected_fe { return None; }
     if shift == 0 {
@@ -2575,9 +2593,15 @@ fn verify_reverse_scale_gate(op: &Op, point: &[Ef], value: Ef,
             if fe[4 + j] != proof.remainder_bits[j] { return None; }
         }
     }
-    if efo::verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
-        return None;
-    }
+    let fe3 = fe[3];
+    let (merged_point, merged) = efo::verify_same_poly(&proof.bind,
+        &[(point.to_vec(), value), (z.clone(), fe3)], transcript)?;
+    let mut r_pad = merged_point;
+    r_pad.resize(out_aux.arity, Ef::ZERO);
+    let mut z_pad = z.clone();
+    z_pad.resize(out_aux.arity, Ef::ZERO);
+    if !verify_aux_open(out_aux, &[0, 0],
+        &[r_pad, z_pad], &[merged, fe3], &proof.out_opening) { return None; }
     let mut gp = Vec::with_capacity(n_log + lgl - h_log);
     for k in 0..n_log { gp.push(ef_u64(((col >> k) & 1) as u64)); }
     gp.extend_from_slice(&z[h_log..]);
@@ -6012,7 +6036,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecOut, BroadcastScaleOut, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecOut, BroadcastScaleOut, ScaleGateOut, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -6402,6 +6426,51 @@ fn prepare_broadcast_scale_out_aux(store: &Store, ops: &[Op])
             let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
             let descriptor = AuxDescriptor {
                 op_index, role: AuxRole::BroadcastScaleOut, len, arity, columns: 1, commitment,
+            };
+            prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+        }
+    }
+    Some(prepared)
+}
+
+/// ScaleGate output-witness aux (all shifts). Committed so the same_poly
+/// merged claim is authenticated at the merged point.
+fn scale_gate_out_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, usize, usize, usize)>>
+{
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::ScaleGate { x, .. } = op {
+            let key = TensorKey::Field(*x).encoded()?;
+            let len = *model.tensor_lengths.get(&key)?;
+            if len == 0 || !len.is_power_of_two() { return None; }
+            specs.push((i, len, len.trailing_zeros().max(5) as usize, 1));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_scale_gate_out_aux(store: &Store, ops: &[Op])
+    -> Option<Vec<PreparedAux>>
+{
+    let mut prepared = Vec::new();
+    for (op_index, op) in ops.iter().enumerate() {
+        if let Op::ScaleGate { x, out, .. } = op {
+            let xv = store.get(*x);
+            let ov = store.get(*out);
+            let len = xv.len();
+            if len == 0 || ov.len() != len || !len.is_power_of_two() { return None; }
+            let arity = len.trailing_zeros().max(5) as usize;
+            let padded = 1usize.checked_shl(arity as u32)?;
+            let mut col = vec![Goldilocks::ZERO; padded];
+            col[..len].copy_from_slice(ov);
+            let columns = vec![col];
+            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+            let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+            let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+            let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+            let descriptor = AuxDescriptor {
+                op_index, role: AuxRole::ScaleGateOut, len, arity, columns: 1, commitment,
             };
             prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
         }
@@ -7261,6 +7330,10 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::BroadcastScaleOut, len, arity, cols))),
         None => return false,
     };
+    match scale_gate_out_aux_specs(ops, model) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleGateOut, len, arity, cols))),
+        None => return false,
+    };
     match scale_gate_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleGateRemainder, len, arity, cols))),
         None => return false,
@@ -7301,7 +7374,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::BroadcastScaleOut => 34, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::BroadcastScaleOut => 34, AuxRole::ScaleGateOut => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -8337,8 +8410,9 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 } else {
                     Some(aux.remove(&(op_index, AuxRole::ScaleGateRemainder))?)
                 };
+                let outp = aux.remove(&(op_index, AuxRole::ScaleGateOut))?;
                 let (proof, incoming) = prove_reverse_scale_gate(
-                    store, op, &point, value, auxp, transcript)?;
+                    store, op, &point, value, auxp, outp, transcript)?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -8745,7 +8819,10 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
             (Op::ScaleGate { .. }, ReverseReduction::ScaleGate { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index
                     && a.role == AuxRole::ScaleGateRemainder);
-                for c in verify_reverse_scale_gate(op, &point, value, descriptor, proof, transcript)? {
+                let out_descriptor = aux.iter().find(|a| a.op_index == op_index
+                    && a.role == AuxRole::ScaleGateOut);
+                for c in verify_reverse_scale_gate(op, &point, value, descriptor,
+                    out_descriptor?, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -15478,6 +15555,7 @@ pub fn prove_committed_shard_dag_bound(
     prepared.extend(prepare_scale_aux(store, ops, model)?);
     prepared.extend(prepare_scale_vec_out_aux(store, ops)?);
     prepared.extend(prepare_broadcast_scale_out_aux(store, ops)?);
+    prepared.extend(prepare_scale_gate_out_aux(store, ops)?);
     prepared.extend(prepare_scale_vec_remainder_aux(store, ops, model)?);
     prepared.extend(prepare_scale_gate_aux(store, ops, model)?);
     prepared.extend(prepare_softmax_aux(store, ops, model)?);
@@ -15896,6 +15974,7 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             ReverseReduction::ScaleGate { proof } => {
                 b.virtual_proof(&proof.prod, 3)?;
                 b.same_poly(&proof.bind)?;
+                b.opening(&proof.out_opening, 2)?;
                 if let Some(o) = &proof.opening {
                     b.opening(o, proof.remainder_bits.len())?;
                 }
@@ -26294,40 +26373,107 @@ mod tests {
                 Some(prepare_scale_gate_aux(&store, &ops, &model).unwrap().remove(0))
             };
             let auxd = aux.as_ref().map(|a| a.descriptor.clone());
+            let out_aux = prepare_scale_gate_out_aux(&store, &ops).unwrap().remove(0);
+            let out_desc = out_aux.descriptor.clone();
             let mut tp = Transcript::new(b"b1-scalegate");
             let (proof, claims) = prove_reverse_scale_gate(
-                &store, &ops[0], &point, value, aux, &mut tp).unwrap();
+                &store, &ops[0], &point, value, aux, out_aux, &mut tp).unwrap();
             assert_eq!(claims.len(), 2);
             assert_eq!(claims[0].tensor_id, x);
             assert_eq!(claims[1].tensor_id, gate);
             let mut tv = Transcript::new(b"b1-scalegate");
             let got = verify_reverse_scale_gate(
-                &ops[0], &point, value, auxd.as_ref(), &proof, &mut tv);
+                &ops[0], &point, value, auxd.as_ref(), &out_desc, &proof, &mut tv);
             assert!(got.is_some(), "shift={shift} honest ScaleGate must verify");
             // Tampered output claim.
             let mut tv = Transcript::new(b"b1-scalegate");
             assert!(verify_reverse_scale_gate(
-                &ops[0], &point, value + Ef::ONE, auxd.as_ref(), &proof, &mut tv).is_none());
+                &ops[0], &point, value + Ef::ONE, auxd.as_ref(), &out_desc, &proof, &mut tv).is_none());
             // Tampered x eval inside the product virtual.
             let mut bad = proof.clone();
             bad.prod.final_evals[1] += Ef::ONE;
             let mut tv = Transcript::new(b"b1-scalegate");
             assert!(verify_reverse_scale_gate(
-                &ops[0], &point, value, auxd.as_ref(), &bad, &mut tv).is_none());
+                &ops[0], &point, value, auxd.as_ref(), &out_desc, &bad, &mut tv).is_none());
             if shift > 0 {
                 let mut bad = proof.clone();
                 bad.remainder_bits[0] += Ef::ONE;
                 let mut tv = Transcript::new(b"b1-scalegate");
                 assert!(verify_reverse_scale_gate(
-                    &ops[0], &point, value, auxd.as_ref(), &bad, &mut tv).is_none());
+                    &ops[0], &point, value, auxd.as_ref(), &out_desc, &bad, &mut tv).is_none());
                 // Descriptor with the wrong column count is rejected.
                 let mut wrong = auxd.clone().unwrap();
                 wrong.columns += 1;
                 let mut tv = Transcript::new(b"b1-scalegate");
                 assert!(verify_reverse_scale_gate(
-                    &ops[0], &point, value, Some(&wrong), &proof, &mut tv).is_none());
+                    &ops[0], &point, value, Some(&wrong), &out_desc, &proof, &mut tv).is_none());
             }
         }
+    }
+
+    /// AUDIT RED→GREEN (ScaleGate): forged caller out claim with an
+    /// interpolating same_poly fake; the committed out column at the merged
+    /// point rejects it (shift>0 path; shift0 shares the same binding).
+    #[test]
+    fn audit_scale_gate_forged_output_claim_must_reject() {
+        let mut store = Store::new();
+        let (m, h, n, col, shift) = (4usize, 8usize, 8usize, 3usize, 4u32);
+        let x = store.push((0..m * h).map(|i| from_i64(i as i64 - 12)).collect());
+        let gate = store.push((0..m * n).map(|i| from_i64((i as i64 % 7) - 3)).collect());
+        let out = store.push(vec![Goldilocks::ZERO; m * h]);
+        let ops = vec![Op::ScaleGate { x, gate, col, out, m, n, h, shift }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops);
+        let lgl = (m * h).trailing_zeros() as usize;
+        let point: Vec<Ef> = (0..lgl).map(|b| ef_u64(9 + b as u64)).collect();
+        let genuine = ef_eval(store.get(out), &point);
+        let forged = genuine + Ef::ONE;
+        let aux = prepare_scale_gate_aux(&store, &ops, &model).expect("aux").remove(0);
+        let out_aux = prepare_scale_gate_out_aux(&store, &ops).expect("out aux").remove(0);
+        let out_commit = out_aux.descriptor.commitment.clone();
+        let mut tp = Transcript::new(b"audit-scalegate");
+        let (proof, _claims) = prove_reverse_scale_gate(
+            &store, &ops[0], &point, genuine, Some(aux), out_aux, &mut tp)
+            .expect("honest proof");
+        let mut tp = Transcript::new(b"audit-scalegate");
+        tp.absorb(&bincode::serialize(&out_commit).unwrap());
+        tp.absorb(b"zkie-scalegate-v1");
+        tp.absorb_u64(shift as u64);
+        let _q: Vec<Ef> = tp.ef_field_vec(lgl);
+        let gamma = tp.ef_field();
+        let terms = scale_vec_shift_terms(shift as usize, gamma);
+        let (ok, z, _fc) = efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, &mut tp);
+        assert!(ok);
+        let fe3 = proof.prod.final_evals[3];
+        let out_ef = ef_lift(store.get(out));
+        let d = forged - ef_eval(store.get(out), &point);
+        let u0 = vec![Ef::ZERO; lgl];
+        let u1 = vec![Ef::ONE; lgl];
+        let v00 = efo::eq_poly(&u0, &point).unwrap();
+        let v01 = efo::eq_poly(&u1, &point).unwrap();
+        let v10 = efo::eq_poly(&u0, &z).unwrap();
+        let v11 = efo::eq_poly(&u1, &z).unwrap();
+        let det = v00 * v11 - v01 * v10;
+        let a = d * v11 * det.inverse();
+        let b = -d * v10 * det.inverse();
+        let chi0 = efo::eq_evals(&u0);
+        let chi1 = efo::eq_evals(&u1);
+        let f_fake: Vec<Ef> = (0..m * h)
+            .map(|i| out_ef[i] + a * chi0[i] + b * chi1[i]).collect();
+        let fake_bind = efo::prove_same_poly_ef(&f_fake,
+            &[(point.clone(), forged), (z.clone(), fe3)], &mut tp).0;
+        let mut forged_proof = proof;
+        forged_proof.bind = fake_bind;
+        let auxd = prepare_scale_gate_aux(&store, &ops, &model)
+            .expect("aux2").remove(0).descriptor;
+        let outd = prepare_scale_gate_out_aux(&store, &ops)
+            .expect("out aux2").remove(0).descriptor;
+        let mut tv = Transcript::new(b"audit-scalegate");
+        let got = verify_reverse_scale_gate(&ops[0], &point, forged,
+            Some(&auxd), &outd, &forged_proof, &mut tv);
+        assert!(got.is_none(),
+            "AUDIT FAILURE: forged ScaleGate output claim was ACCEPTED");
     }
 
     /// S9 WAVE-1 A2: tie_zero/tie_less are charged their real per-round
