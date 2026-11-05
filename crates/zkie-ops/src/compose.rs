@@ -2331,9 +2331,10 @@ fn prove_reverse_scale_vec_shifted(store: &Store, op: &Op, point: &[Ef],
     if xv.len() != l || ov.len() != l || sv.is_empty() || !sv.len().is_power_of_two()
         || l % sv.len() != 0 { return None; }
     if aux.descriptor.role != AuxRole::ScaleVecRemainder || aux.descriptor.len != l
-        || aux.descriptor.arity != lgl || aux.descriptor.columns != shift as usize
-        || aux.columns.len() != shift as usize
-        || aux.columns.iter().any(|c| c.len() != l) { return None; }
+        || aux.descriptor.arity != lgl || aux.descriptor.columns != shift as usize + 1
+        || aux.columns.len() != shift as usize + 1
+        || aux.columns.iter().any(|c| c.len() != l)
+        || aux.columns[shift as usize][..l] != ov[..] { return None; }
     let two_shift = 1i64.checked_shl(shift)?;
     let half = two_shift / 2;
     for i in 0..l {
@@ -2346,23 +2347,35 @@ fn prove_reverse_scale_vec_shifted(store: &Store, op: &Op, point: &[Ef],
         }
     }
     let scale_b: Vec<Ef> = (0..l).map(|i| Ef::from(sv[i % sv.len()])).collect();
+    transcript.absorb(&bincode::serialize(&aux.descriptor.commitment).ok()?);
     transcript.absorb(b"zkie-scalevec-shift-v1");
     let q = transcript.ef_field_vec(lgl);
     let gamma = transcript.ef_field();
     let eq = efo::eq_evals(&q);
     let xv_ef = ef_lift(xv);
     let ov_ef = ef_lift(ov);
-    let aux_ef = lift_columns(&aux.columns);
+    let aux_ef = lift_columns(&aux.columns[..shift as usize]);
     let mut mles: Vec<&[Ef]> = vec![&eq, &xv_ef, &scale_b, &ov_ef];
     mles.extend(aux_ef.iter().map(Vec::as_slice));
     let terms = scale_vec_shift_terms(shift as usize, gamma);
     let (prod, z) = efo::prove_virtual(&mles, &terms, Ef::ZERO, transcript);
     if z.len() != lgl || prod.final_evals.len() != 4 + shift as usize { return None; }
-    let (bind, _) = efo::prove_same_poly_ef(&ov_ef, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
+    let (bind, merged) = efo::prove_same_poly_ef(&ov_ef, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
     let bits = prod.final_evals[4..4 + shift as usize].to_vec();
-    let idxs: Vec<usize> = (0..shift as usize).collect();
-    let points = vec![z.clone(); shift as usize];
-    let opening = open_aux(aux, &idxs, &points, &bits)?;
+    let mut r_pad = bind.merged_point.clone();
+    r_pad.resize(aux.descriptor.arity, Ef::ZERO);
+    let mut z_pad = z.clone();
+    z_pad.resize(aux.descriptor.arity, Ef::ZERO);
+    let mut idxs: Vec<usize> = (0..shift as usize).collect();
+    idxs.push(shift as usize);
+    idxs.push(shift as usize);
+    let mut points = vec![z_pad.clone(); shift as usize];
+    points.push(r_pad);
+    points.push(z_pad);
+    let mut values = bits.clone();
+    values.push(merged);
+    values.push(prod.final_evals[3]);
+    let opening = open_aux(aux, &idxs, &points, &values)?;
     let (x_point, x_eval) = unpad_relu_claim(&z, prod.final_evals[1], lgl)?;
     let scale_eval = prod.final_evals[2];
     let lgs = sv.len().trailing_zeros() as usize;
@@ -2386,10 +2399,11 @@ fn verify_reverse_scale_vec_shifted(op: &Op, point: &[Ef], value: Ef,
     let l = 1usize << lgl;
     let descriptor = aux?;
     if descriptor.role != AuxRole::ScaleVecRemainder || descriptor.len != l
-        || descriptor.arity != lgl || descriptor.columns != shift as usize { return None; }
+        || descriptor.arity < lgl || descriptor.columns != shift as usize + 1 { return None; }
     if proof.remainder_bits.len() != shift as usize
         || proof.scale_arity > lgl
         || proof.prod.final_evals.len() != 4 + shift as usize { return None; }
+    transcript.absorb(&bincode::serialize(&descriptor.commitment).ok()?);
     transcript.absorb(b"zkie-scalevec-shift-v1");
     let q = transcript.ef_field_vec(lgl);
     let gamma = transcript.ef_field();
@@ -2398,13 +2412,25 @@ fn verify_reverse_scale_vec_shifted(op: &Op, point: &[Ef], value: Ef,
     if !ok || z.len() != lgl { return None; }
     let fe = &proof.prod.final_evals;
     if fe[0] != ef_eq_poly(&q, &z) || fc != efo::virtual_eval(&terms, fe) { return None; }
-    if !verify_aux_open(descriptor, &(0..shift as usize).collect::<Vec<_>>(),
-        &vec![z.clone(); shift as usize], &proof.remainder_bits, &proof.opening) { return None; }
+    let fe3 = fe[3];
+    let (merged_point, merged) = efo::verify_same_poly(&proof.bind,
+        &[(point.to_vec(), value), (z.clone(), fe3)], transcript)?;
+    let mut r_pad = merged_point;
+    r_pad.resize(descriptor.arity, Ef::ZERO);
+    let mut z_pad = z.clone();
+    z_pad.resize(descriptor.arity, Ef::ZERO);
+    let mut idxs: Vec<usize> = (0..shift as usize).collect();
+    idxs.push(shift as usize);
+    idxs.push(shift as usize);
+    let mut points = vec![z_pad.clone(); shift as usize];
+    points.push(r_pad);
+    points.push(z_pad);
+    let mut values = proof.remainder_bits.clone();
+    values.push(merged);
+    values.push(fe3);
+    if !verify_aux_open(descriptor, &idxs, &points, &values, &proof.opening) { return None; }
     for j in 0..shift as usize {
         if fe[4 + j] != proof.remainder_bits[j] { return None; }
-    }
-    if efo::verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
-        return None;
     }
     let (x_point, x_eval) = unpad_relu_claim(&z, fe[1], lgl)?;
     let xk = TensorKey::Field(x).encoded()?;
@@ -6280,7 +6306,7 @@ fn scale_vec_remainder_aux_specs(ops: &[Op], model: &TrustedModelManifest)
             // the position length L.
             if len == 0 || len < 32 || !len.is_power_of_two() || slen == 0 || !slen.is_power_of_two()
                 || len % slen != 0 { return None; }
-            specs.push((i, len, len.trailing_zeros().max(5) as usize, *shift as usize));
+            specs.push((i, len, len.trailing_zeros().max(5) as usize, *shift as usize + 1));
         }
     }
     Some(specs)
@@ -6295,7 +6321,7 @@ fn prepare_scale_vec_remainder_aux(store: &Store, ops: &[Op], model: &TrustedMod
             Op::ScaleVec { x, scale, out, shift } => (*x, *scale, *out, *shift),
             _ => return None,
         };
-        if shift as usize != count { return None; }
+        if shift as usize + 1 != count { return None; }
         let xv = store.get(x);
         let sv = store.get(scale);
         let ov = store.get(out);
@@ -6317,7 +6343,8 @@ fn prepare_scale_vec_remainder_aux(store: &Store, ops: &[Op], model: &TrustedMod
                 .checked_sub(to_i64(ov[i]).checked_mul(two_shift)?)?
                 .checked_add(half)?;
             if rem < 0 || rem as u64 >= two_shift as u64 { return None; }
-            for j in 0..count {
+            columns[shift as usize][i] = ov[i];
+            for j in 0..shift as usize {
                 columns[j][i] = Goldilocks::from_u64(((rem as u64) >> j) & 1);
             }
         }
@@ -15864,7 +15891,7 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             ReverseReduction::ScaleVecShifted { proof } => {
                 b.virtual_proof(&proof.prod, 3)?;
                 b.same_poly(&proof.bind)?;
-                b.opening(&proof.opening, proof.remainder_bits.len())?;
+                b.opening(&proof.opening, proof.remainder_bits.len() + 2)?;
             }
             ReverseReduction::ScaleGate { proof } => {
                 b.virtual_proof(&proof.prod, 3)?;
@@ -26179,6 +26206,72 @@ mod tests {
             &forged_proof, &mut tv);
         assert!(got.is_none(),
             "AUDIT FAILURE: forged BroadcastScale output claim was ACCEPTED");
+    }
+
+    /// AUDIT RED→GREEN (ScaleVecShifted): forged caller out claim with an
+    /// interpolating same_poly fake; the committed out column at the merged
+    /// point rejects it.
+    #[test]
+    fn audit_scale_vec_shifted_forged_output_claim_must_reject() {
+        let mut store = Store::new();
+        let l = 32usize;
+        let shift = 4u32;
+        let xv: Vec<Goldilocks> = (0..l).map(|i| from_i64((i as i64 % 7) - 3)).collect();
+        let sv: Vec<Goldilocks> = (0..4).map(|i| from_i64((i as i64) + 1)).collect();
+        let x = store.push(xv);
+        let scale = store.push(sv);
+        let out = store.push(vec![Goldilocks::ZERO; l]);
+        store.push((0..(1usize << shift))
+            .map(|i| Goldilocks::from_u64(i as u64)).collect());
+        let ops = vec![Op::ScaleVec { x, scale, out, shift }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops);
+        let lgl = l.trailing_zeros() as usize;
+        let point: Vec<Ef> = (0..lgl).map(|b| ef_u64(7 + b as u64)).collect();
+        let genuine = ef_eval(store.get(out), &point);
+        let forged = genuine + Ef::ONE;
+        let aux_prove = prepare_scale_vec_remainder_aux(&store, &ops, &model)
+            .expect("aux").remove(0);
+        let commitment = aux_prove.descriptor.commitment.clone();
+        let mut tp = Transcript::new(b"audit-scalevec-shift");
+        let (proof, _claims) = prove_reverse_scale_vec_shifted(
+            &store, &ops[0], &point, genuine, aux_prove, &mut tp).expect("honest proof");
+        let mut tp = Transcript::new(b"audit-scalevec-shift");
+        tp.absorb(&bincode::serialize(&commitment).unwrap());
+        tp.absorb(b"zkie-scalevec-shift-v1");
+        let q: Vec<Ef> = tp.ef_field_vec(lgl);
+        let gamma = tp.ef_field();
+        let terms = scale_vec_shift_terms(shift as usize, gamma);
+        let (ok, z, _fc) = efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, &mut tp);
+        assert!(ok);
+        let _ = q;
+        let fe3 = proof.prod.final_evals[3];
+        let out_ef = ef_lift(store.get(out));
+        let d = forged - ef_eval(store.get(out), &point);
+        let u0 = vec![Ef::ZERO; lgl];
+        let u1 = vec![Ef::ONE; lgl];
+        let v00 = efo::eq_poly(&u0, &point).unwrap();
+        let v01 = efo::eq_poly(&u1, &point).unwrap();
+        let v10 = efo::eq_poly(&u0, &z).unwrap();
+        let v11 = efo::eq_poly(&u1, &z).unwrap();
+        let det = v00 * v11 - v01 * v10;
+        let a = d * v11 * det.inverse();
+        let b = -d * v10 * det.inverse();
+        let chi0 = efo::eq_evals(&u0);
+        let chi1 = efo::eq_evals(&u1);
+        let f_fake: Vec<Ef> = (0..l).map(|i| out_ef[i] + a * chi0[i] + b * chi1[i]).collect();
+        let fake_bind = efo::prove_same_poly_ef(&f_fake,
+            &[(point.clone(), forged), (z.clone(), fe3)], &mut tp).0;
+        let mut forged_proof = proof;
+        forged_proof.bind = fake_bind;
+        let desc = prepare_scale_vec_remainder_aux(&store, &ops, &model)
+            .expect("aux2").remove(0).descriptor;
+        let mut tv = Transcript::new(b"audit-scalevec-shift");
+        let got = verify_reverse_scale_vec_shifted(&ops[0], &point, forged,
+            Some(&desc), &forged_proof, &mut tv);
+        assert!(got.is_none(),
+            "AUDIT FAILURE: forged ScaleVecShifted output claim was ACCEPTED");
     }
 
     /// PR#45 B1: ScaleGate reverse roundtrip (exact and rounded), plus
