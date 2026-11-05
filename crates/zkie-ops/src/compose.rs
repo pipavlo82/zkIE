@@ -446,6 +446,10 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
         // table is authenticated by the lookup sub-proof/root, not as an
         // execution input.
         Op::Softmax { idx, out, .. } => Some((vec![i(*idx)?], vec![f(*out)?])),
+        // B1: the stable index writes out; masked = x + mask is replayed by
+        // the reduction, so both field tensors are reverse inputs.
+        Op::StableSoftmaxIndex { x, mask, out, .. } =>
+            Some((vec![f(*x)?, f(*mask)?], vec![i(*out)?])),
         _ => None,
     }
 }
@@ -2685,6 +2689,313 @@ fn verify_reverse_softmax(op: &Op, point: &[Ef], value: Ef,
     lk
 }
 
+fn stable_softmax_index_dims(op: &Op) -> Option<(T, T, T, i64, usize, usize, usize)> {
+    match op {
+        Op::StableSoftmaxIndex { x, mask, out, offset, table_len, m, n } => {
+            if !m.is_power_of_two() || !n.is_power_of_two() || *table_len < 2
+                || !table_len.is_power_of_two() || *offset == i64::MIN { return None; }
+            let len = m.checked_mul(*n)?;
+            if len < 32 || !len.is_power_of_two() { return None; }
+            Some((*x, *mask, *out, *offset, *table_len, *m, *n))
+        }
+        _ => None,
+    }
+}
+
+fn ssi_cols(table_len: usize) -> Option<usize> {
+    if !table_len.is_power_of_two() { return None; }
+    Some(6 + 3 * SSI_RANGE_BITS + table_len.trailing_zeros() as usize)
+}
+
+fn ssi_formula_terms(g1: Ef, g2: Ef, g3: Ef, ofs: Ef, l1: Ef) -> Vec<(Ef, Vec<usize>)> {
+    vec![
+        (g1, vec![0usize, 4usize, 4usize]),
+        (-g1, vec![0usize, 3usize, 4usize]),
+        (g2, vec![0usize, 5usize, 5usize]),
+        (-g2 * l1, vec![0usize, 5usize]),
+        (-g2, vec![0usize, 4usize, 5usize]),
+        (g2 * l1, vec![0usize, 4usize]),
+        (g3, vec![0usize, 3usize]),
+        (-g3, vec![0usize, 1usize]),
+        (g3, vec![0usize, 2usize]),
+        (-g3 * ofs, vec![0usize]),
+    ]
+}
+
+fn ssi_row_terms(g1: Ef, g2: Ef, g3: Ef, n_inv: Ef) -> Vec<(Ef, Vec<usize>)> {
+    vec![
+        (g1, vec![0usize, 1usize, 1usize]),
+        (-g1, vec![0usize, 1usize]),
+        (g2, vec![0usize, 1usize]),
+        (-g2 * n_inv, vec![0usize, 4usize]),
+        (g3, vec![0usize, 1usize, 2usize]),
+        (-g3 * n_inv, vec![0usize, 3usize]),
+    ]
+}
+
+/// Range virtual MLE indices: 0 = eq, 1 = masked, 2 = row_max_b, 3 = w,
+/// 4 = trunc, 5 = idx_f, then the bit columns starting at 6 (column c[6+j]
+/// maps to MLE index 6+j). Each relation is one linear decomposition
+///   high - low - sum_k 2^k bit_k = 0
+/// weighted by a single gamma power (all its terms must share the weight so
+/// the pointwise identity cancels), plus per-bit Booleanity constraints, each
+/// weighted by its own distinct gamma power.
+fn ssi_range_terms(gamma: Ef, lg_l: usize) -> Vec<(Ef, Vec<usize>)> {
+    let bits = SSI_RANGE_BITS;
+    let mut terms = Vec::new();
+    let mut gp = Ef::ONE;
+    for rel in 0..3usize {
+        let (hi, lo) = match rel {
+            0 => (2usize, 1usize),  // row_max_b - masked = mdiff
+            1 => (4, 3),            // trunc - w = tr_w
+            _ => (4, 5),            // trunc - idx_f = diff
+        };
+        let base = 6 + rel * bits;
+        let w = gp;
+        gp = gp * gamma;
+        terms.push((w, vec![0usize, hi]));
+        terms.push((-w, vec![0usize, lo]));
+        for k in 0..bits {
+            terms.push((-w * ef_u64(1u64 << k), vec![0usize, base + k]));
+        }
+        for k in 0..bits {
+            terms.push((gp, vec![0usize, base + k, base + k]));
+            terms.push((-gp, vec![0usize, base + k]));
+            gp = gp * gamma;
+        }
+    }
+    let base = 6 + 3 * bits;
+    let w = gp;
+    gp = gp * gamma;
+    terms.push((w, vec![0usize, 5usize]));
+    for k in 0..lg_l {
+        terms.push((-w * ef_u64(1u64 << k), vec![0usize, base + k]));
+    }
+    for k in 0..lg_l {
+        terms.push((gp, vec![0usize, base + k, base + k]));
+        terms.push((-gp, vec![0usize, base + k]));
+        gp = gp * gamma;
+    }
+    let _ = gp;
+    terms
+}
+
+/// B1: reverse StableSoftmaxIndex (index output). Proves the row-max
+/// selection and relu/clamp/range relations, binds the output idx claim to the
+/// committed idx_f column, and returns x/mask claims at the formula endpoint.
+fn prove_reverse_stable_softmax_index(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    aux: PreparedAux, transcript: &mut Transcript)
+    -> Option<(ReverseStableSoftmaxIndexProof, Vec<EfClaim>)>
+{
+    let (x, mask, out, offset, table_len, m, n) = stable_softmax_index_dims(op)?;
+    let len = m.checked_mul(n)?;
+    let lgl = len.trailing_zeros() as usize;
+    let lg_m = m.trailing_zeros() as usize;
+    let lg_n = n.trailing_zeros() as usize;
+    let lg_l = table_len.trailing_zeros() as usize;
+    let cols = ssi_cols(table_len)?;
+    if point.len() != lgl || aux.descriptor.role != AuxRole::StableSoftmaxIndexWitness
+        || aux.descriptor.len != len || aux.descriptor.arity != lgl
+        || aux.descriptor.columns != cols || aux.columns.len() != cols
+        || aux.columns.iter().any(|c| c.len() != len) { return None; }
+    let xv = store.get(x);
+    let mv = store.get(mask);
+    let idxs = store.idx.get(out)?;
+    if xv.len() != len || mv.len() != len || idxs.len() != len { return None; }
+    // Recompute and verify every precommitted witness column.
+    let mut row_max_i = vec![i64::MIN; m];
+    let mut masked = vec![0i64; len];
+    for i in 0..m {
+        for j in 0..n {
+            let at = i * n + j;
+            masked[at] = to_i64(xv[at]).checked_add(to_i64(mv[at]))?;
+            if masked[at] > row_max_i[i] { row_max_i[i] = masked[at]; }
+        }
+    }
+    let mut sel = vec![Goldilocks::ZERO; len];
+    for i in 0..m {
+        let pick = (0..n).find(|&j| masked[i * n + j] == row_max_i[i])?;
+        sel[i * n + pick] = Goldilocks::ONE;
+    }
+    let two22 = 1i64 << SSI_RANGE_BITS;
+    for i in 0..m {
+        for j in 0..n {
+            let at = i * n + j;
+            let rmax = row_max_i[i];
+            let w = masked[at].checked_sub(rmax)?.checked_add(offset)?;
+            let trunc = w.max(0);
+            let idx_v = idxs[at] as i64;
+            let mdiff = rmax.checked_sub(masked[at])?;
+            let tr_w = trunc.checked_sub(w)?;
+            let diff = trunc.checked_sub(idx_v)?;
+            if !(0..two22).contains(&mdiff) || !(0..two22).contains(&tr_w)
+                || !(0..two22).contains(&diff) || idx_v < 0
+                || (idx_v as u64) >= table_len as u64
+                || idx_v != trunc.min((table_len - 1) as i64) { return None; }
+            if aux.columns[0][at] != from_i64(masked[at])
+                || aux.columns[1][at] != from_i64(rmax)
+                || aux.columns[2][at] != from_i64(w)
+                || aux.columns[3][at] != from_i64(trunc)
+                || aux.columns[4][at] != Goldilocks::from_u64(idx_v as u64)
+                || aux.columns[5][at] != sel[at] { return None; }
+            for b in 0..SSI_RANGE_BITS {
+                if aux.columns[6 + b][at] != Goldilocks::from_u64(((mdiff as u64) >> b) & 1)
+                    || aux.columns[6 + SSI_RANGE_BITS + b][at]
+                        != Goldilocks::from_u64(((tr_w as u64) >> b) & 1)
+                    || aux.columns[6 + 2 * SSI_RANGE_BITS + b][at]
+                        != Goldilocks::from_u64(((diff as u64) >> b) & 1) { return None; }
+            }
+            for b in 0..lg_l {
+                if aux.columns[6 + 3 * SSI_RANGE_BITS + b][at]
+                    != Goldilocks::from_u64(((idx_v as u64) >> b) & 1) { return None; }
+            }
+        }
+    }
+    let c: Vec<Vec<Ef>> = lift_columns(&aux.columns);
+    let ones = vec![Ef::ONE; len];
+    let ofs = ef_i64(offset);
+    let l1 = ef_u64((table_len - 1) as u64);
+    transcript.absorb(b"zkie-stable-softmax-index-v1");
+    transcript.absorb_u64(m as u64);
+    transcript.absorb_u64(n as u64);
+    transcript.absorb_u64(offset as u64);
+    transcript.absorb_u64(table_len as u64);
+    let qf = transcript.ef_field_vec(lgl);
+    let g1 = transcript.ef_field();
+    let g2 = transcript.ef_field();
+    let g3 = transcript.ef_field();
+    let eqf = efo::eq_evals(&qf);
+    let f_terms = ssi_formula_terms(g1, g2, g3, ofs, l1);
+    let f_mles: Vec<&[Ef]> = vec![&eqf, &c[0], &c[1], &c[2], &c[3], &c[4], &ones];
+    let (formula, z_f) = efo::prove_virtual(&f_mles, &f_terms, Ef::ZERO, transcript);
+    if z_f.len() != lgl || formula.final_evals.len() != 7 { return None; }
+    let u = z_f[lg_n..].to_vec();
+    if u.len() != lg_m { return None; }
+    let eq_row = efo::eq_evals(&u);
+    let eq_b: Vec<Ef> = (0..len).map(|i| eq_row[i / n]).collect();
+    let r1 = transcript.ef_field();
+    let r2 = transcript.ef_field();
+    let r3 = transcript.ef_field();
+    let n_inv = ef_u64(n as u64).inverse();
+    let row_terms = ssi_row_terms(r1, r2, r3, n_inv);
+    let r_mles: Vec<&[Ef]> = vec![&eq_b, &c[5], &c[0], &c[1], &ones];
+    let (row, z_row) = efo::prove_virtual(&r_mles, &row_terms, Ef::ZERO, transcript);
+    if z_row.len() != lgl || row.final_evals.len() != 5 { return None; }
+    let qc = transcript.ef_field_vec(lgl);
+    let gc = transcript.ef_field();
+    let eqc = efo::eq_evals(&qc);
+    let range_terms = ssi_range_terms(gc, lg_l);
+    let mut range_mles: Vec<&[Ef]> = vec![&eqc, &c[0], &c[1], &c[2], &c[3], &c[4]];
+    range_mles.extend(c[6..].iter().map(Vec::as_slice));
+    let (range, z_c) = efo::prove_virtual(&range_mles, &range_terms, Ef::ZERO, transcript);
+    let fe_c_len = 6 + cols - 6;
+    if z_c.len() != lgl || range.final_evals.len() != fe_c_len { return None; }
+    let (bind, _) = efo::prove_same_poly_ef(
+        &c[4], &[(point.to_vec(), value), (z_f.clone(), formula.final_evals[5])], transcript);
+    let x_eval = ef_eval(xv, &z_f);
+    let mask_eval = ef_eval(mv, &z_f);
+    if x_eval + mask_eval != formula.final_evals[1] { return None; }
+    let mut idxs_o = Vec::new();
+    let mut points_o = Vec::new();
+    let mut values_o = Vec::new();
+    for col in 0..=4usize {
+        idxs_o.push(col); points_o.push(z_f.clone()); values_o.push(formula.final_evals[1 + col]);
+    }
+    for (col, val) in [(0usize, row.final_evals[2]), (1, row.final_evals[3]), (5, row.final_evals[1])] {
+        idxs_o.push(col); points_o.push(z_row.clone()); values_o.push(val);
+    }
+    for col in 0..=4usize {
+        idxs_o.push(col); points_o.push(z_c.clone()); values_o.push(range.final_evals[1 + col]);
+    }
+    // MLE column c[6+j] is stored at range.final_evals[6+j].
+    for col in 6..cols {
+        idxs_o.push(col); points_o.push(z_c.clone());
+        values_o.push(range.final_evals[col]);
+    }
+    let opening = open_aux(aux, &idxs_o, &points_o, &values_o)?;
+    Some((ReverseStableSoftmaxIndexProof { formula, row, range, bind, x_eval, mask_eval, opening },
+        vec![
+            EfClaim { tensor_id: x, point: z_f.clone(), value: x_eval },
+            EfClaim { tensor_id: mask, point: z_f, value: mask_eval },
+        ]))
+}
+
+fn verify_reverse_stable_softmax_index(op: &Op, point: &[Ef], value: Ef,
+    aux: &AuxDescriptor, proof: &ReverseStableSoftmaxIndexProof, transcript: &mut Transcript)
+    -> Option<Vec<EfClaim>>
+{
+    let (x, mask, _out, offset, table_len, m, n) = stable_softmax_index_dims(op)?;
+    let len = m.checked_mul(n)?;
+    let lgl = len.trailing_zeros() as usize;
+    let lg_m = m.trailing_zeros() as usize;
+    let lg_n = n.trailing_zeros() as usize;
+    let lg_l = table_len.trailing_zeros() as usize;
+    let cols = ssi_cols(table_len)?;
+    if point.len() != lgl || aux.role != AuxRole::StableSoftmaxIndexWitness
+        || aux.len != len || aux.arity != lgl || aux.columns != cols
+        || proof.formula.final_evals.len() != 7 || proof.row.final_evals.len() != 5
+        || proof.range.final_evals.len() != cols { return None; }
+    transcript.absorb(b"zkie-stable-softmax-index-v1");
+    transcript.absorb_u64(m as u64);
+    transcript.absorb_u64(n as u64);
+    transcript.absorb_u64(offset as u64);
+    transcript.absorb_u64(table_len as u64);
+    let qf = transcript.ef_field_vec(lgl);
+    let g1 = transcript.ef_field();
+    let g2 = transcript.ef_field();
+    let g3 = transcript.ef_field();
+    let ofs = ef_i64(offset);
+    let l1 = ef_u64((table_len - 1) as u64);
+    let f_terms = ssi_formula_terms(g1, g2, g3, ofs, l1);
+    let (okf, z_f, fcf) = efo::verify_virtual(&proof.formula, &f_terms, Ef::ZERO, lgl, transcript);
+    if !okf || z_f.len() != lgl { return None; }
+    let ff = &proof.formula.final_evals;
+    if ff[0] != ef_eq_poly(&qf, &z_f) || fcf != efo::virtual_eval(&f_terms, ff) { return None; }
+    let u = z_f[lg_n..].to_vec();
+    if u.len() != lg_m { return None; }
+    let r1 = transcript.ef_field();
+    let r2 = transcript.ef_field();
+    let r3 = transcript.ef_field();
+    let n_inv = ef_u64(n as u64).inverse();
+    let row_terms = ssi_row_terms(r1, r2, r3, n_inv);
+    let (okr, z_row, fcr) = efo::verify_virtual(&proof.row, &row_terms, Ef::ZERO, lgl, transcript);
+    if !okr || z_row.len() != lgl { return None; }
+    let fr = &proof.row.final_evals;
+    if fr[0] != ef_eq_poly(&u, &z_row[lg_n..])
+        || fcr != efo::virtual_eval(&row_terms, fr) { return None; }
+    let qc = transcript.ef_field_vec(lgl);
+    let gc = transcript.ef_field();
+    let range_terms = ssi_range_terms(gc, lg_l);
+    let (okc, z_c, fcc) = efo::verify_virtual(&proof.range, &range_terms, Ef::ZERO, lgl, transcript);
+    if !okc || z_c.len() != lgl { return None; }
+    let fc = &proof.range.final_evals;
+    if fc[0] != ef_eq_poly(&qc, &z_c) || fcc != efo::virtual_eval(&range_terms, fc) { return None; }
+    if proof.x_eval + proof.mask_eval != ff[1] { return None; }
+    if efo::verify_same_poly(&proof.bind,
+        &[(point.to_vec(), value), (z_f.clone(), ff[5])], transcript).is_none() { return None; }
+    let mut idxs = Vec::new();
+    let mut points = Vec::new();
+    let mut values = Vec::new();
+    for col in 0..=4usize {
+        idxs.push(col); points.push(z_f.clone()); values.push(ff[1 + col]);
+    }
+    for (col, val) in [(0usize, fr[2]), (1, fr[3]), (5, fr[1])] {
+        idxs.push(col); points.push(z_row.clone()); values.push(val);
+    }
+    for col in 0..=4usize {
+        idxs.push(col); points.push(z_c.clone()); values.push(fc[1 + col]);
+    }
+    // MLE column c[6+j] is stored at range.final_evals[6+j].
+    for col in 6..cols {
+        idxs.push(col); points.push(z_c.clone()); values.push(fc[col]);
+    }
+    if !verify_aux_open(aux, &idxs, &points, &values, &proof.opening) { return None; }
+    Some(vec![
+        EfClaim { tensor_id: x, point: z_f.clone(), value: proof.x_eval },
+        EfClaim { tensor_id: mask, point: z_f, value: proof.mask_eval },
+    ])
+}
+
 // S7c Scatter reverse reduction: the routing arrays token_id/expert_of are
 // authenticated as one-hot token/expert selectors over the padded position
 // domain, and their active-pair multiset is bound to the (downstream
@@ -3312,6 +3623,8 @@ enum ReverseReduction {
     ScaleGate { proof: ReverseScaleGateProof },
     /// PR#45 B1: row-normalized softmax with e = table[idx].
     Softmax { proof: ReverseSoftmaxProof },
+    /// PR#45 B1: stable row-max index (clamped relu of masked-row max).
+    StableSoftmaxIndex { proof: ReverseStableSoftmaxIndexProof },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4305,7 +4618,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -4359,6 +4672,23 @@ struct ReverseSoftmaxProof {
     sum_opening: EfBatchOpeningProof,
     e_opening: EfBatchOpeningProof,
     rem_opening: EfBatchOpeningProof,
+}
+
+/// B1: reverse StableSoftmaxIndex. Precommitted witness columns
+/// [masked, row_max_b, w, trunc, idx_f, sel] plus range bits prove
+///   w = masked - row_max_b + offset, trunc = max(w,0),
+///   idx = clamp(trunc,0,L-1), 0 <= row_max_b-masked < 2^22,
+///   trunc-w in [0,2^22), trunc-idx in [0,2^22), idx in [0,L),
+/// and that row_max_b is the row maximum via a one-hot selection column.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ReverseStableSoftmaxIndexProof {
+    formula: EfVirtualProof,
+    row: EfVirtualProof,
+    range: EfVirtualProof,
+    bind: EfSamePolyProof,
+    x_eval: Ef,
+    mask_eval: Ef,
+    opening: EfBatchOpeningProof,
 }
 
 /// Deep O7 (b): per-group shared proof data, in ascending trusted-id order.
@@ -4672,6 +5002,118 @@ const SOFTMAX_SCALE_BITS: usize = 16;
 /// (i,j) domain; `SoftmaxRemainder` holds the 16 bits of
 /// rem = e*2^16 - out*S + 2^15 in [0,2^16) (ties-up rounding). The `e`
 /// column itself is the second LookupPairs column.
+const SSI_RANGE_BITS: usize = 22;
+
+/// B1: StableSoftmaxIndex witness columns. Six value columns
+/// [masked, row_max_b, w, trunc, idx_f, sel] followed by range bits:
+/// mdiff=row_max_b-masked (22), tr_w=trunc-w (22), diff=trunc-idx_f (22),
+/// and idx_f (log2 table_len). The tr_w range is required in addition to the
+/// classic relu polynomial: without it, w>0 and trunc=0 would satisfy
+/// trunc*(trunc-w)=0.
+fn stable_softmax_index_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, usize, usize, usize)>>
+{
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::StableSoftmaxIndex { out, table_len, m, n, .. } = op {
+            if !m.is_power_of_two() || !n.is_power_of_two() || *table_len < 2
+                || !table_len.is_power_of_two() { return None; }
+            let len = m.checked_mul(*n)?;
+            if len < 32 || !len.is_power_of_two() { return None; }
+            let key = TensorKey::Index(*out).encoded()?;
+            if *model.tensor_lengths.get(&key)? != len { return None; }
+            let lg_l = table_len.trailing_zeros() as usize;
+            let cols = 6 + 3 * SSI_RANGE_BITS + lg_l;
+            specs.push((i, len, len.trailing_zeros() as usize, cols));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_stable_softmax_index_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<PreparedAux>>
+{
+    let mut prepared = Vec::new();
+    for (op_index, len, arity, cols) in stable_softmax_index_aux_specs(ops, model)? {
+        let (x, mask, out, offset, table_len, m, n) = match &ops[op_index] {
+            Op::StableSoftmaxIndex { x, mask, out, offset, table_len, m, n } =>
+                (*x, *mask, *out, *offset, *table_len, *m, *n),
+            _ => return None,
+        };
+        let lg_l = table_len.trailing_zeros() as usize;
+        if cols != 6 + 3 * SSI_RANGE_BITS + lg_l || m.checked_mul(n)? != len { return None; }
+        let xv = store.get(x);
+        let mv = store.get(mask);
+        let idxs = store.idx.get(out)?;
+        if xv.len() != len || mv.len() != len || idxs.len() != len { return None; }
+        let masked: Vec<i64> = (0..len)
+            .map(|i| to_i64(xv[i]).checked_add(to_i64(mv[i])))
+            .collect::<Option<Vec<_>>>()?;
+        let mut row_max = vec![Goldilocks::ZERO; m];
+        let mut row_max_i = vec![i64::MIN; m];
+        for i in 0..m {
+            let mut best = masked[i * n];
+            for j in 0..n { if masked[i * n + j] > best { best = masked[i * n + j]; } }
+            row_max_i[i] = best;
+            row_max[i] = from_i64(best);
+        }
+        let mut sel = vec![Goldilocks::ZERO; len];
+        for i in 0..m {
+            let pick = (0..n).find(|&j| masked[i * n + j] == row_max_i[i])?;
+            sel[i * n + pick] = Goldilocks::ONE;
+        }
+        let two22 = 1i64 << SSI_RANGE_BITS;
+        let mut col = vec![vec![Goldilocks::ZERO; len]; cols];
+        for i in 0..m {
+            for j in 0..n {
+                let at = i * n + j;
+                let masked_i = masked[at];
+                let rmax = row_max_i[i];
+                let w = masked_i.checked_sub(rmax)?.checked_add(offset)?;
+                let trunc = w.max(0);
+                let idx_v = idxs[at] as i64;
+                if trunc.checked_sub(idx_v)? < 0 { return None; }
+                let mdiff = rmax.checked_sub(masked_i)?;
+                let tr_w = trunc.checked_sub(w)?;
+                let diff = trunc.checked_sub(idx_v)?;
+                if !(0..two22).contains(&mdiff) || !(0..two22).contains(&tr_w)
+                    || !(0..two22).contains(&diff) || idx_v < 0 || (idx_v as u64) >= table_len as u64
+                    || idx_v != trunc.min((table_len - 1) as i64) {
+                    return None;
+                }
+                col[0][at] = from_i64(masked_i);
+                col[1][at] = from_i64(rmax);
+                col[2][at] = from_i64(w);
+                col[3][at] = from_i64(trunc);
+                col[4][at] = Goldilocks::from_u64(idx_v as u64);
+                col[5][at] = sel[at];
+                for b in 0..SSI_RANGE_BITS {
+                    col[6 + b][at] = Goldilocks::from_u64(((mdiff as u64) >> b) & 1);
+                    col[6 + SSI_RANGE_BITS + b][at] = Goldilocks::from_u64(((tr_w as u64) >> b) & 1);
+                    col[6 + 2 * SSI_RANGE_BITS + b][at] =
+                        Goldilocks::from_u64(((diff as u64) >> b) & 1);
+                }
+                for b in 0..lg_l {
+                    col[6 + 3 * SSI_RANGE_BITS + b][at] =
+                        Goldilocks::from_u64(((idx_v as u64) >> b) & 1);
+                }
+            }
+        }
+        let padded = 1usize.checked_shl(arity as u32)?;
+        for c in &mut col { c.resize(padded, Goldilocks::ZERO); }
+        let vars = cols.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+        let refs: Vec<&[Goldilocks]> = col.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        prepared.push(PreparedAux {
+            descriptor: AuxDescriptor { op_index, role: AuxRole::StableSoftmaxIndexWitness, len, arity, columns: cols, commitment },
+            columns: col, prover_data, protocol, whir,
+        });
+    }
+    Some(prepared)
+}
+
 fn softmax_aux_specs(ops: &[Op], model: &TrustedModelManifest)
     -> Option<(Vec<(usize, usize, usize, usize)>, Vec<(usize, usize, usize, usize)>)>
 {
@@ -5157,6 +5599,10 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleGateRemainder, len, arity, cols))),
         None => return false,
     };
+    match stable_softmax_index_aux_specs(ops, model) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::StableSoftmaxIndexWitness, len, arity, cols))),
+        None => return false,
+    };
     match softmax_aux_specs(ops, model) {
         Some((sums, rems)) => {
             all.extend(sums.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::SoftmaxSum, len, arity, cols)));
@@ -5181,7 +5627,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -6240,6 +6686,16 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 }
                 ReverseReduction::Softmax { proof }
             }
+            Op::StableSoftmaxIndex { .. } => {
+                let auxp = aux.remove(&(op_index, AuxRole::StableSoftmaxIndexWitness))?;
+                let (proof, incoming) = prove_reverse_stable_softmax_index(
+                    store, op, &point, value, auxp, transcript)?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::StableSoftmaxIndex { proof }
+            }
             Op::CombineIdx { a, b, scale, out: out_t, .. } => {
                 // S5 (reverse): out = scale*a + b at the claim point. When the
                 // verifier can replay the output (and inputs) from public
@@ -6589,6 +7045,15 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 let rem_aux = find(AuxRole::SoftmaxRemainder)?;
                 for c in verify_reverse_softmax(op, &point, value, pairs, mult, sum_aux, rem_aux,
                     model, dynamic, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+            }
+            (Op::StableSoftmaxIndex { .. }, ReverseReduction::StableSoftmaxIndex { proof }) => {
+                let descriptor = aux.iter().find(|a| a.op_index == op_index
+                    && a.role == AuxRole::StableSoftmaxIndexWitness)?;
+                for c in verify_reverse_stable_softmax_index(op, &point, value, descriptor,
+                    proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -13268,6 +13733,7 @@ pub fn prove_committed_shard_dag_bound(
     prepared.extend(prepare_scale_vec_remainder_aux(store, ops, model)?);
     prepared.extend(prepare_scale_gate_aux(store, ops, model)?);
     prepared.extend(prepare_softmax_aux(store, ops, model)?);
+    prepared.extend(prepare_stable_softmax_index_aux(store, ops, model)?);
     prepared.extend(prepare_argmax_aux(store, ops)?);
     prepared.extend(prepare_expert_routing_aux(store, ops)?);
     prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
@@ -13561,6 +14027,15 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
     // charges the maximum descriptor column count (a safe upper bound; the
     // verifier later checks each opening against its exact descriptor).
     let max_aux_columns = aux.iter().map(|a| a.columns).max().unwrap_or(1);
+    // B1 StableSoftmaxIndex opening claim count: 5 (formula) + 3 (row) +
+    // 5 + 3*22 + log2(table_len) (range). The step carries no op index, so
+    // charge the maximum over the trusted graph's SSI ops; overcharging is
+    // safe and the verifier still checks the exact descriptor opening.
+    let ssi_open_claims = ops.iter().filter_map(|op| match op {
+        Op::StableSoftmaxIndex { table_len, .. } if table_len.is_power_of_two() =>
+            Some(13 + 3 * SSI_RANGE_BITS + table_len.trailing_zeros() as usize),
+        _ => None,
+    }).max().unwrap_or(13 + 3 * SSI_RANGE_BITS);
     for step in &proof.reverse.steps {
         for out in &step.outputs {
             if let Some(m) = &out.merge { b.same_poly(m)?; }
@@ -13680,6 +14155,13 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.opening(&proof.sum_opening, 2)?;
                 b.opening(&proof.e_opening, 2)?;
                 b.opening(&proof.rem_opening, SOFTMAX_SCALE_BITS)?;
+            }
+            ReverseReduction::StableSoftmaxIndex { proof } => {
+                b.virtual_proof(&proof.formula, 3)?;
+                b.virtual_proof(&proof.row, 3)?;
+                b.virtual_proof(&proof.range, 3)?;
+                b.same_poly(&proof.bind)?;
+                b.opening(&proof.opening, ssi_open_claims)?;
             }
             ReverseReduction::LookupGroups { groups } => {
                 for g in groups {
@@ -14004,11 +14486,9 @@ fn op_lookup_pushes(op: &Op, resolve_identity: &dyn Fn(usize) -> Option<T>) -> O
             resolve_identity(*table_len)?,
             resolve_identity(1usize << 22)?,
         ]),
-        Op::StableSoftmaxIndex { table_len, .. } => Some(vec![
-            resolve_identity(*table_len)?,
-            resolve_identity(1usize << 22)?,
-            resolve_identity(1usize << 22)?,
-        ]),
+        // B1: the stable-index reverse reduction proves idx/clamp/relu ranges
+        // with precommitted bits, so no public identity table is required.
+        Op::StableSoftmaxIndex { .. } => Some(vec![]),
         Op::Relu { .. } => Some(vec![resolve_identity(1usize << 22)?]),
         Op::Scale { shift, .. } | Op::ScaleVec { shift, .. } if *shift > 0 => {
             Some(vec![resolve_identity(1usize << shift)?])
@@ -23054,6 +23534,144 @@ mod tests {
         bad.outputs.get_mut(&out).unwrap()[0] += Goldilocks::ONE;
         assert!(!verify_committed_shard_dag_bound_bytes(
             &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &bad));
+    }
+
+    /// PR#45 B1: StableSoftmaxIndex reverse roundtrip and tamper rejection
+    /// (direct and bound bytes entry). The witness exercises all three formula
+    /// branches: negative w (trunc=0), unclamped trunc, and trunc >= L-1.
+    #[test]
+    fn b1_stable_softmax_index_reverse_roundtrip_and_tamper() {
+        let mut store = Store::new();
+        let (m, n, table_len, offset) = (4usize, 8usize, 16usize, 20i64);
+        let len = m * n;
+        let xv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64) * 7 % 23) - 11)).collect();
+        let mv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64) * 5 % 7) - 3)).collect();
+        let x = store.push(xv.clone());
+        let mask = store.push(mv.clone());
+        let out = store.push_idx(vec![]);
+        let ops = vec![Op::StableSoftmaxIndex { x, mask, out, offset, table_len, m, n }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops).with_index_shapes(&[(out, len)].into());
+        let aux = prepare_stable_softmax_index_aux(&store, &ops, &model)
+            .expect("SSI aux").remove(0);
+        let desc = aux.descriptor.clone();
+        let point: Vec<Ef> = (0..len.trailing_zeros())
+            .map(|b| ef_u64(2 + b as u64)).collect();
+        let out_col: Vec<Goldilocks> = store.idx[out].iter()
+            .map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let value = ef_eval(&out_col, &point);
+
+        let mut tp = Transcript::new(b"b1-ssi");
+        let (proof, claims) = prove_reverse_stable_softmax_index(
+            &store, &ops[0], &point, value, aux, &mut tp).expect("SSI proof");
+        assert_eq!(claims.len(), 2, "SSI returns x and mask claims");
+        assert_eq!(claims[0].tensor_id, x);
+        assert_eq!(claims[1].tensor_id, mask);
+        let mut tv = Transcript::new(b"b1-ssi");
+        assert!(verify_reverse_stable_softmax_index(
+            &ops[0], &point, value, &desc, &proof, &mut tv).is_some(),
+            "honest SSI must verify");
+
+        // Output / x-eval / formula-value / row-sel / range-bit tamper.
+        let mut tv = Transcript::new(b"b1-ssi");
+        assert!(verify_reverse_stable_softmax_index(
+            &ops[0], &point, value + Ef::ONE, &desc, &proof, &mut tv).is_none());
+        let mut bad = proof.clone();
+        bad.x_eval += Ef::ONE;
+        let mut tv = Transcript::new(b"b1-ssi");
+        assert!(verify_reverse_stable_softmax_index(
+            &ops[0], &point, value, &desc, &bad, &mut tv).is_none(),
+            "tampered x eval must break x+mask=masked");
+        for pos in [1usize, 2, 3, 4, 5] {
+            let mut bad = proof.clone();
+            bad.formula.final_evals[pos] += Ef::ONE;
+            let mut tv = Transcript::new(b"b1-ssi");
+            assert!(verify_reverse_stable_softmax_index(
+                &ops[0], &point, value, &desc, &bad, &mut tv).is_none(),
+                "tampered formula eval {pos} must be rejected");
+        }
+        let mut bad = proof.clone();
+        bad.row.final_evals[1] += Ef::ONE;
+        let mut tv = Transcript::new(b"b1-ssi");
+        assert!(verify_reverse_stable_softmax_index(
+            &ops[0], &point, value, &desc, &bad, &mut tv).is_none(),
+            "tampered sel eval must be rejected");
+        let mut bad = proof.clone();
+        bad.range.final_evals[6] += Ef::ONE;
+        let mut tv = Transcript::new(b"b1-ssi");
+        assert!(verify_reverse_stable_softmax_index(
+            &ops[0], &point, value, &desc, &bad, &mut tv).is_none(),
+            "tampered range bit must be rejected");
+        let mut wrong = desc.clone();
+        wrong.columns += 1;
+        let mut tv = Transcript::new(b"b1-ssi");
+        assert!(verify_reverse_stable_softmax_index(
+            &ops[0], &point, value, &wrong, &proof, &mut tv).is_none());
+
+        // Prover-side witness authentication: any aux column that is not the
+        // forward witness must fail closed before a proof is emitted.
+        let aux2 = prepare_stable_softmax_index_aux(&store, &ops, &model)
+            .expect("SSI aux2").remove(0);
+        let mut tampered = aux2;
+        tampered.columns[0][0] += Goldilocks::ONE;
+        assert!(prove_reverse_stable_softmax_index(
+            &store, &ops[0], &point, value, tampered,
+            &mut Transcript::new(b"b1-ssi")).is_none(),
+            "masked column not equal to x+mask must fail closed");
+        let aux3 = prepare_stable_softmax_index_aux(&store, &ops, &model)
+            .expect("SSI aux3").remove(0);
+        let mut tampered = aux3;
+        tampered.columns[4][0] += Goldilocks::ONE;
+        assert!(prove_reverse_stable_softmax_index(
+            &store, &ops[0], &point, value, tampered,
+            &mut Transcript::new(b"b1-ssi")).is_none(),
+            "idx_f not equal to the forward output must fail closed");
+
+        // A forged clamped index (idx != min(trunc,L-1)) has no aux witness.
+        let mut forged_store = Store::new();
+        let fx = forged_store.push(xv.clone());
+        let fm = forged_store.push(mv.clone());
+        let fo = forged_store.push_idx(vec![]);
+        let fops = vec![Op::StableSoftmaxIndex {
+            x: fx, mask: fm, out: fo, offset, table_len, m, n }];
+        forward_ops(&mut forged_store, &fops);
+        // Position 1 has trunc=10 and true idx=10; 0 is in range but not the
+        // clamp value, so the explicit clamp check must fail closed.
+        forged_store.idx[fo][1] = 0;
+        let fmodel = TrustedModelManifest::from_offline_commitment(
+            &[], &forged_store.owned_slices(), &fops)
+            .with_index_shapes(&[(fo, len)].into());
+        assert!(prepare_stable_softmax_index_aux(&forged_store, &fops, &fmodel).is_none(),
+            "non-clamped forward index must fail closed");
+
+        // Bound bytes entry: x/mask are inputs, out is the index output.
+        let execution = TrustedExecution {
+            inputs: [(x, xv), (mask, mv)].into(),
+            outputs: [(TensorKey::Index(out).encoded().unwrap(), out_col)].into(),
+        };
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 0);
+        let proof2 = prove_committed_shard_dag_bound(
+            &mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("SSI bound proof");
+        assert!(proof2.aux.iter().any(|a| a.role == AuxRole::StableSoftmaxIndexWitness));
+        let bytes = bincode::serialize(&proof2).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        for bad in 0..3usize {
+            let mut e = execution.clone();
+            match bad {
+                0 => e.inputs.get_mut(&x).unwrap()[3] += Goldilocks::ONE,
+                1 => e.inputs.get_mut(&mask).unwrap()[5] += Goldilocks::ONE,
+                _ => e.outputs.get_mut(&TensorKey::Index(out).encoded().unwrap())
+                    .unwrap()[1] += Goldilocks::ONE,
+            }
+            assert!(!verify_committed_shard_dag_bound_bytes(
+                &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &e),
+                "tampered SSI execution {bad} must be rejected");
+        }
     }
 
     /// PR#45 B1: ScaleGate reverse roundtrip (exact and rounded), plus
