@@ -25695,6 +25695,256 @@ mod tests {
         assert!(rejects(&bad, &bytes_t), "forged tied argmax output must reject");
     }
 
+    /// AUDIT RED TEST (RmsNorm F1): forge the caller's out claim while
+    /// keeping the honest virtual proofs and replacing only the bind with a
+    /// same_poly over an interpolating fake polynomial. Expected after the
+    /// fix: rejection. Before the fix this test FAILS (attack accepted).
+    #[test]
+    #[ignore = "AUDIT RED: forged output claim is accepted (same_poly output-binding gap); enable after fix"]
+    fn audit_rms_norm_forged_output_claim_must_reject() {
+        let mut store = Store::new();
+        let (m, d, n_real) = (4usize, 8usize, 5usize);
+        let len = m * d;
+        let xv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 13) % 17) - 8)).collect();
+        let wv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 5) % 9) + 1)).collect();
+        let x = store.push(xv);
+        let w = store.push(wv);
+        let out = store.push(vec![Goldilocks::ZERO; len]);
+        let rsqrt_t = store.push((0..32).map(|i| from_i64(1000 + i as i64)).collect());
+        let limb_t = store.push((0..65536).map(|i| from_i64(i as i64)).collect());
+        let ops = vec![Op::RmsNorm { x, w, out, rsqrt_table: rsqrt_t,
+            limb_table: limb_t, m, d, n_real }];
+        forward_ops(&mut store, &ops);
+        let cache_dir = std::env::temp_dir()
+            .join(format!("zkie-audit-rms-{}", std::process::id()));
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(
+            &cached, &store.owned_slices(), &ops);
+        let mut auxv = prepare_rms_norm_aux(&store, &ops, &model).expect("aux");
+        let take = |v: &mut Vec<PreparedAux>, role: AuxRole| {
+            let pos = v.iter().position(|p| p.descriptor.role == role).unwrap();
+            v.remove(pos)
+        };
+        let descs = [
+            take(&mut auxv, AuxRole::RmsNormRowWitness).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormOutWitness).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormRsqrtPairs).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormRsqrtMultiplicity).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormLimbLoPairs).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormLimbLoMultiplicity).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormLimbHiPairs).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormLimbHiMultiplicity).descriptor.clone(),
+        ];
+        let point: Vec<Ef> = (0..len.trailing_zeros())
+            .map(|b| ef_u64(2 + b as u64)).collect();
+        let genuine = ef_eval(store.get(out), &point);
+        let forged = genuine + Ef::ONE;
+        let mut auxall = prepare_rms_norm_aux(&store, &ops, &model).expect("aux2");
+        let auxp = RmsAux {
+            row: take(&mut auxall, AuxRole::RmsNormRowWitness),
+            out: take(&mut auxall, AuxRole::RmsNormOutWitness),
+            rsqrt_pairs: take(&mut auxall, AuxRole::RmsNormRsqrtPairs),
+            rsqrt_mult: take(&mut auxall, AuxRole::RmsNormRsqrtMultiplicity),
+            limb_lo_pairs: take(&mut auxall, AuxRole::RmsNormLimbLoPairs),
+            limb_lo_mult: take(&mut auxall, AuxRole::RmsNormLimbLoMultiplicity),
+            limb_hi_pairs: take(&mut auxall, AuxRole::RmsNormLimbHiPairs),
+            limb_hi_mult: take(&mut auxall, AuxRole::RmsNormLimbHiMultiplicity),
+        };
+        let mut tp = Transcript::new(b"audit-rmsnorm");
+        let (proof, _claims) = prove_reverse_rms_norm(
+            &store, &ops[0], &point, genuine, auxp, &model, &mut tp).expect("honest proof");
+
+        // Replay the verifier/prover transcript to the bind position.
+        let (_, _, _, rsqrt_id, limb_id, mm, dd, nn) = rms_norm_dims(&ops[0]).unwrap();
+        let lgl = len.trailing_zeros() as usize;
+        let lg_d = d.trailing_zeros() as usize;
+        let lg_m = m.trailing_zeros() as usize;
+        let arity = rms_row_arity(m).unwrap();
+        let lay = rms_row_layout(n_real).unwrap();
+        let rsqrt_len = model.lookup_lengths[&rsqrt_id];
+        let limb_len = model.lookup_lengths[&limb_id];
+        let mut t = Transcript::new(b"audit-rmsnorm");
+        t.absorb(b"zkie-rmsnorm-v1");
+        t.absorb_u64(mm as u64); t.absorb_u64(dd as u64);
+        t.absorb_u64(nn as u64); t.absorb_u64(rsqrt_len as u64);
+        t.absorb_u64(limb_len as u64);
+        let u_row = t.ef_field_vec(arity);
+        let g_row = t.ef_field();
+        let row_terms = rms_row_terms(g_row, n_real, &lay);
+        let (ok, z_row, _) = efo::verify_virtual(&proof.row, &row_terms, Ef::ZERO, arity, &mut t);
+        assert!(ok);
+        let u_ms = t.ef_field_vec(lg_m);
+        let g_ms = t.ef_field();
+        let d_inv = ef_u64(d as u64).inverse();
+        let ms_terms = vec![
+            (g_ms, vec![0usize, 1usize, 2usize, 2usize]),
+            (-g_ms * d_inv, vec![0usize, 3usize]),
+        ];
+        let (ok, z_ms, _) = efo::verify_virtual(&proof.ms, &ms_terms, Ef::ZERO, lgl, &mut t);
+        assert!(ok);
+        let q_out = t.ef_field_vec(lgl);
+        let g_out = t.ef_field();
+        let two32 = ef_u64(1u64 << 32);
+        let half32 = ef_u64(1u64 << 31);
+        let out_terms = vec![
+            (g_out, vec![0usize, 1usize, 2usize, 3usize]),
+            (-g_out * two32, vec![0usize, 4usize]),
+            (-g_out, vec![0usize, 5usize]),
+            (-g_out * ef_u64(1u64 << 16), vec![0usize, 6usize]),
+            (g_out * half32, vec![0usize, 7usize]),
+        ];
+        let (ok, z_out, _) = efo::verify_virtual(&proof.out, &out_terms, Ef::ZERO, lgl, &mut t);
+        assert!(ok);
+        let _ = (u_row, u_ms, q_out, z_row, z_ms);
+        let fo = proof.out.final_evals.clone();
+        let fo4 = fo[4];
+        // f' = out + a*chi0 + b*chi1 with f'(point)=forged, f'(z_out)=fo4.
+        let out_ef = ef_lift(store.get(out));
+        let dlt = forged - ef_eval(store.get(out), &point);
+        let u0 = vec![Ef::ZERO; lgl];
+        let u1 = vec![Ef::ONE; lgl];
+        let v00 = efo::eq_poly(&u0, &point).unwrap();
+        let v01 = efo::eq_poly(&u1, &point).unwrap();
+        let v10 = efo::eq_poly(&u0, &z_out).unwrap();
+        let v11 = efo::eq_poly(&u1, &z_out).unwrap();
+        let det = v00 * v11 - v01 * v10;
+        let a = dlt * v11 * det.inverse();
+        let b = -dlt * v10 * det.inverse();
+        let chi0 = efo::eq_evals(&u0);
+        let chi1 = efo::eq_evals(&u1);
+        let f_fake: Vec<Ef> = (0..len).map(|i| out_ef[i] + a * chi0[i] + b * chi1[i]).collect();
+        let fake_bind = efo::prove_same_poly_ef(&f_fake,
+            &[(point.clone(), forged), (z_out.clone(), fo4)], &mut t).0;
+        // Regenerate the post-bind auxiliary lookups under the forged
+        // transcript state (a real malicious prover can do this; the
+        // transcript is public input to the prover).
+        let fo3 = fo[3]; let fo5 = fo[5]; let fo6 = fo[6];
+        let mut auxatk = prepare_rms_norm_aux(&store, &ops, &model).expect("aux3");
+        let rsqrt_pairs = take(&mut auxatk, AuxRole::RmsNormRsqrtPairs);
+        let rsqrt_mult = take(&mut auxatk, AuxRole::RmsNormRsqrtMultiplicity);
+        let lo_pairs = take(&mut auxatk, AuxRole::RmsNormLimbLoPairs);
+        let lo_mult = take(&mut auxatk, AuxRole::RmsNormLimbLoMultiplicity);
+        let hi_pairs = take(&mut auxatk, AuxRole::RmsNormLimbHiPairs);
+        let hi_mult = take(&mut auxatk, AuxRole::RmsNormLimbHiMultiplicity);
+        let mut p_rstd_atk = z_out[lg_d..].to_vec();
+        p_rstd_atk.resize(arity, Ef::ZERO);
+        let rsqrt_xs: Vec<u32> = (0..m)
+            .map(|r| to_i64(rsqrt_pairs.columns[0][r]) as u32).collect();
+        let rsqrt_ys: Vec<Goldilocks> = (0..m)
+            .map(|r| rsqrt_pairs.columns[1][r]).collect();
+        let rsqrt_atk = internal_lookup_prove(&store, rsqrt_id, rsqrt_pairs,
+            rsqrt_mult, 0, 1, &rsqrt_xs, &rsqrt_ys, &p_rstd_atk, fo3,
+            &model, &mut t).expect("rsqrt atk");
+        let lo_xs: Vec<u32> = lo_pairs.columns[0].iter()
+            .map(|&v| to_i64(v) as u32).collect();
+        let lo_ys: Vec<Goldilocks> = lo_pairs.columns[0].clone();
+        let limb_lo_atk = internal_lookup_prove(&store, limb_id, lo_pairs,
+            lo_mult, 0, 0, &lo_xs, &lo_ys, &z_out, fo5, &model, &mut t)
+            .expect("limb lo atk");
+        let hi_xs: Vec<u32> = hi_pairs.columns[1].iter()
+            .map(|&v| to_i64(v) as u32).collect();
+        let hi_ys: Vec<Goldilocks> = hi_pairs.columns[1].clone();
+        let limb_hi_atk = internal_lookup_prove(&store, limb_id, hi_pairs,
+            hi_mult, 1, 1, &hi_xs, &hi_ys, &z_out, fo6, &model, &mut t)
+            .expect("limb hi atk");
+        let mut forged_proof = proof;
+        forged_proof.bind = fake_bind;
+        forged_proof.rsqrt = rsqrt_atk;
+        forged_proof.limb_lo = limb_lo_atk;
+        forged_proof.limb_hi = limb_hi_atk;
+        let refs = RmsAuxRefs {
+            row: &descs[0], out: &descs[1], rsqrt_pairs: &descs[2],
+            rsqrt_mult: &descs[3], limb_lo_pairs: &descs[4],
+            limb_lo_mult: &descs[5], limb_hi_pairs: &descs[6],
+            limb_hi_mult: &descs[7],
+        };
+        let mut tv = Transcript::new(b"audit-rmsnorm");
+        let got = verify_reverse_rms_norm(&ops[0], &point, forged, refs, &model,
+            &forged_proof, &mut tv);
+        assert!(got.is_none(),
+            "AUDIT FAILURE: forged RmsNorm output claim was ACCEPTED");
+    }
+
+    /// AUDIT RED TEST (systemic same_poly output-binding gap): a malicious
+    /// prover keeps the honest virtual proof and cross-point data but forges
+    /// the caller's output claim, replacing only the same_poly bind with one
+    /// over an interpolating fake polynomial f'. The verifier discards the
+    /// merged claim, so it cannot tell f' from the real out column.
+    /// Expected after the fix: rejection. Before the fix this test FAILS.
+    #[test]
+    #[ignore = "AUDIT RED: forged output claim is accepted (same_poly output-binding gap); enable after fix"]
+    fn audit_scale_vec_forged_output_claim_must_reject() {
+        let mut store = Store::new();
+        let l = 32usize;
+        let xv: Vec<Goldilocks> = (0..l).map(|i| from_i64((i as i64 % 7) + 1)).collect();
+        let sv: Vec<Goldilocks> = (0..8).map(|i| from_i64((i as i64 % 3) + 1)).collect();
+        let x = store.push(xv);
+        let scale = store.push(sv);
+        let out = store.push(vec![Goldilocks::ZERO; l]);
+        let ops = vec![Op::ScaleVec { x, scale, out, shift: 0 }];
+        forward_ops(&mut store, &ops);
+        let lgl = l.trailing_zeros() as usize;
+        let point: Vec<Ef> = (0..lgl).map(|b| ef_u64(3 + b as u64)).collect();
+        let genuine = ef_eval(store.get(out), &point);
+        let forged = genuine + Ef::ONE;
+
+        // Honest proof for the honest claim.
+        let mut tp = Transcript::new(b"audit-scalevec");
+        let (proof, _claims) = prove_reverse_scale_vec(
+            &store, &ops[0], &point, genuine, &mut tp).expect("honest proof");
+
+        // Replay the prover transcript state after the virtual proof.
+        let mut tp = Transcript::new(b"audit-scalevec");
+        let _q: Vec<Ef> = tp.ef_field_vec(lgl);
+        let terms = exact_product_terms();
+        assert!(efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, &mut tp).0);
+        let z = _q.clone(); // placeholder; replaced below from the virtual replay
+        let _ = z;
+        // Recover z from the verifier's replay: verify_virtual returns it.
+        let mut tp = Transcript::new(b"audit-scalevec");
+        let _q: Vec<Ef> = tp.ef_field_vec(lgl);
+        let (ok, z, _fc) = efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, &mut tp);
+        assert!(ok);
+        let fe3 = proof.prod.final_evals[3];
+        // f' = out + a*eq(point) + b*eq(z), with f'(point)=forged, f'(z)=fe3.
+        let out_ef = ef_lift(store.get(out));
+        let d = forged - ef_eval(store.get(out), &point);
+        // Multilinear basis with known values at `point` and `z`: chi_0 =
+        // prod(1-X_j) and chi_1 = prod X_j.
+        let u0 = vec![Ef::ZERO; lgl];
+        let u1 = vec![Ef::ONE; lgl];
+        let v00 = efo::eq_poly(&u0, &point).unwrap();
+        let v01 = efo::eq_poly(&u1, &point).unwrap();
+        let v10 = efo::eq_poly(&u0, &z).unwrap();
+        let v11 = efo::eq_poly(&u1, &z).unwrap();
+        let det = v00 * v11 - v01 * v10;
+        let a = d * v11 * det.inverse();
+        let b = -d * v10 * det.inverse();
+        let chi0 = efo::eq_evals(&u0);
+        let chi1 = efo::eq_evals(&u1);
+        let f_fake: Vec<Ef> = (0..l)
+            .map(|i| out_ef[i] + a * chi0[i] + b * chi1[i]).collect();
+        let fake_bind = efo::prove_same_poly_ef(&f_fake,
+            &[(point.clone(), forged), (z.clone(), fe3)], &mut tp).0;
+        let mut forged_proof = proof;
+        forged_proof.bind = fake_bind;
+
+        // Sanity: the fake bind itself must verify at the same transcript state.
+        let mut tchk = Transcript::new(b"audit-scalevec");
+        let _q2: Vec<Ef> = tchk.ef_field_vec(lgl);
+        let (ok2, z2, _fc2) = efo::verify_virtual(&forged_proof.prod, &terms, Ef::ZERO, lgl, &mut tchk);
+        assert!(ok2 && z2 == z);
+        let bind_ok = efo::verify_same_poly(&forged_proof.bind,
+            &[(point.clone(), forged), (z.clone(), fe3)], &mut tchk).is_some();
+        eprintln!("AUDIT bind_ok={bind_ok}");
+        let mut tv = Transcript::new(b"audit-scalevec");
+        let got = verify_reverse_scale_vec(&ops[0], &point, forged, &forged_proof, &mut tv);
+        assert!(got.is_none(),
+            "AUDIT FAILURE: forged ScaleVec output claim was ACCEPTED");
+    }
+
     /// PR#45 B1: ScaleGate reverse roundtrip (exact and rounded), plus
     /// output/aux tamper rejection.
     #[test]
