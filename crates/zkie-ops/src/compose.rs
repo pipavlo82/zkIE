@@ -410,7 +410,7 @@ impl TensorKey {
     }
 }
 
-fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
+pub(crate) fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
     let f = |id| TensorKey::Field(id).encoded();
     let i = |id| TensorKey::Index(id).encoded();
     match op {
@@ -15990,11 +15990,16 @@ pub fn verify_committed_shard_dag_bound(
         // sampling r (public statement + model + execution + graph + aux).
         let r: Vec<Ef> = token_binding_challenge(statement, model, execution, ops, ops_per_shard, &proof.aux, descriptor.arity);
         if tb.point != r { return false; }
-        let x_hat = embedding_x_hat(&tokens, base, d, &r);
-        if tb.claimed != x_hat {
-            return false; // proof-carried claimed value must match the recomputed one
+        // B2: the embedding table can be laid out column-major ([d, base],
+        // GPT-2's transposed lm_head) or row-major ([base, d], Gemma3/
+        // DeepSeek embed_tokens). Both formulas bind the public tokens to the
+        // committed index column; accept either canonical layout.
+        let x_hat_c = embedding_x_hat(&tokens, base, d, &r);
+        let x_hat_r = embedding_x_hat_rowmajor(&tokens, base, d, &r);
+        if tb.claimed != x_hat_c && tb.claimed != x_hat_r {
+            return false; // proof-carried claimed value must match a canonical layout
         }
-        if !verify_aux_open(descriptor, &[0usize], &[r], &[x_hat], &tb.opening) { return false; }
+        if !verify_aux_open(descriptor, &[0usize], &[r], &[tb.claimed], &tb.opening) { return false; }
     }
     true
 }
@@ -16125,6 +16130,24 @@ fn embedding_x_hat(tokens: &[u32], base: usize, d: usize, r: &[Ef]) -> Ef {
                 eq = eq * (rb * b + (Ef::ONE - rb) * (Ef::ONE - b));
             }
             out = out + eq * ef_u64((k * base + t as usize) as u64);
+        }
+    }
+    out
+}
+
+/// B2: row-major embedding expansion (`idx[i*D+d] = token_i*base + d`), the
+/// layout used by row-major embed_tokens tables (Gemma3, DeepSeek).
+fn embedding_x_hat_rowmajor(tokens: &[u32], base: usize, d: usize, r: &[Ef]) -> Ef {
+    let mut out = Ef::ZERO;
+    for (i, &t) in tokens.iter().enumerate() {
+        for k in 0..d {
+            let idx = i * d + k;
+            let mut eq = Ef::ONE;
+            for (bit, &rb) in r.iter().enumerate() {
+                let b = ef_u64(((idx >> bit) & 1) as u64);
+                eq = eq * (rb * b + (Ef::ONE - rb) * (Ef::ONE - b));
+            }
+            out = out + eq * ef_u64((t as usize * base + k) as u64);
         }
     }
     out
@@ -25537,6 +25560,139 @@ mod tests {
                 &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &e),
                 "tampered RoPE execution {bad} must be rejected");
         }
+    }
+
+    /// PR#45 B2: public bundle + independent verifier contract, plus the
+    /// tamper matrix (model root, prompt, response, output, embedding token,
+    /// argmax/tie). The verifier side reads only bundle.bin + proof.bin.
+    #[test]
+    fn b2_public_bundle_independent_verifier_and_tamper_matrix() {
+        use crate::bundle::{write_bundle, verify_bundle_dir, PublicBundle};
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, _, _) = s6_lm_setup(0x71, &tokens, base, false);
+        let (emb_idx, sel, thr, gate, d1, d2, out) = match (&ops[0], &ops[2]) {
+            (Op::Lookup { idx, .. }, Op::Argmax { sel, thr, gate, d1, d2, out, .. }) =>
+                (*idx, *sel, *thr, *gate, *d1, *d2, *out),
+            _ => unreachable!(),
+        };
+        forward_ops(&mut store, &ops);
+        let shapes: std::collections::BTreeMap<T, usize> =
+            [(emb_idx, base * base), (out, base)].into();
+        let model = TrustedModelManifest::from_offline_commitment(
+            &cached, &store.owned_slices(), &ops).with_index_shapes(&shapes);
+        let emb_idx_key = TensorKey::Index(emb_idx).encoded().unwrap();
+        let emb_idx_vals: Vec<Goldilocks> = store.idx[emb_idx].iter()
+            .map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let out_vals: Vec<Goldilocks> = store.idx[out].iter()
+            .map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(emb_idx_key, emb_idx_vals.clone())].into(),
+            outputs: [
+                (sel, store.get(sel).to_vec()), (thr, store.get(thr).to_vec()),
+                (gate, store.get(gate).to_vec()), (d1, store.get(d1).to_vec()),
+                (d2, store.get(d2).to_vec()), (out_key, out_vals.clone()),
+            ].into(),
+        };
+        let stmt = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(), response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        let proof = prove_committed_shard_dag_bound(
+            &mut store, &ops, 1, &whir, &cached, 0, 0, &stmt, &model, &execution)
+            .expect("LM bundle proof");
+        let bytes = bincode::serialize(&proof).unwrap();
+        let dir = std::env::temp_dir().join(format!("zkie-b2-bundle-{}", std::process::id()));
+        let bundle = PublicBundle::new(ops.clone(), 1, stmt.clone(), model.clone(),
+            execution.clone());
+        write_bundle(&dir, &bundle, &bytes).unwrap();
+        assert!(verify_bundle_dir(&dir), "independent verifier must accept");
+        let rejects = |b: &PublicBundle, p: &[u8]| -> bool {
+            write_bundle(&dir, b, p).is_ok() && !verify_bundle_dir(&dir)
+        };
+
+        // Model-root tamper: a manifest committed from a different weight.
+        let wte = match &ops[0] { Op::Lookup { table, .. } => *table, _ => unreachable!() };
+        if let TensorData::Owned(v) = &mut store.v[wte] { v[0] += Goldilocks::ONE; }
+        let bad_cache = std::env::temp_dir()
+            .join(format!("zkie-b2-badcache-{}", std::process::id()));
+        let cached_bad = commit_model_weights(&store, &ops, bad_cache.to_str().unwrap());
+        let model_bad = TrustedModelManifest::from_offline_commitment(
+            &cached_bad, &store.owned_slices(), &ops).with_index_shapes(&shapes);
+        let mut bad = bundle.clone();
+        bad.model = model_bad;
+        assert!(rejects(&bad, &bytes), "tampered model root must be rejected");
+
+        // Prompt / response tamper.
+        let mut bad = bundle.clone();
+        bad.statement = PublicStatement::LanguageModel {
+            prompt: vec![0, 1, 5], response: tokens[3..].to_vec(), next_token: Some(0) };
+        assert!(rejects(&bad, &bytes), "tampered prompt must be rejected");
+        let mut bad = bundle.clone();
+        bad.statement = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(), response: vec![3, 5, 5, 6, 7],
+            next_token: Some(0) };
+        assert!(rejects(&bad, &bytes), "tampered response must be rejected");
+
+        // Public output and embedding-token tamper.
+        let mut bad = bundle.clone();
+        bad.execution.outputs.get_mut(&out_key).unwrap()[2] += Goldilocks::ONE;
+        assert!(rejects(&bad, &bytes), "tampered argmax output must be rejected");
+        let mut bad = bundle.clone();
+        bad.execution.inputs.get_mut(&emb_idx_key).unwrap()[base] += Goldilocks::ONE;
+        assert!(rejects(&bad, &bytes), "tampered embedding token must be rejected");
+
+        // Argmax/tie: the tied setup's first maximum is 3; claiming the tied
+        // second maximum (4) in the statement or in the public argmax column
+        // must both reject.
+        let (mut store_t, ops_t, whir_t, cached_t, _, _) =
+            s6_lm_setup(0x72, &tokens, base, true);
+        let (emb_idx_t, sel_t, thr_t, gate_t, d1_t, d2_t, out_t) =
+            match (&ops_t[0], &ops_t[2]) {
+                (Op::Lookup { idx, .. }, Op::Argmax { sel, thr, gate, d1, d2, out, .. }) =>
+                    (*idx, *sel, *thr, *gate, *d1, *d2, *out),
+                _ => unreachable!(),
+            };
+        forward_ops(&mut store_t, &ops_t);
+        let shapes_t: std::collections::BTreeMap<T, usize> =
+            [(emb_idx_t, base * base), (out_t, base)].into();
+        let model_t = TrustedModelManifest::from_offline_commitment(
+            &cached_t, &store_t.owned_slices(), &ops_t).with_index_shapes(&shapes_t);
+        let emb_key_t = TensorKey::Index(emb_idx_t).encoded().unwrap();
+        let emb_vals_t: Vec<Goldilocks> = store_t.idx[emb_idx_t].iter()
+            .map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let out_key_t = TensorKey::Index(out_t).encoded().unwrap();
+        let out_vals_t: Vec<Goldilocks> = store_t.idx[out_t].iter()
+            .map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let execution_t = TrustedExecution {
+            inputs: [(emb_key_t, emb_vals_t)].into(),
+            outputs: [
+                (sel_t, store_t.get(sel_t).to_vec()), (thr_t, store_t.get(thr_t).to_vec()),
+                (gate_t, store_t.get(gate_t).to_vec()), (d1_t, store_t.get(d1_t).to_vec()),
+                (d2_t, store_t.get(d2_t).to_vec()), (out_key_t, out_vals_t),
+            ].into(),
+        };
+        let stmt_t = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(), response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        let proof_t = prove_committed_shard_dag_bound(
+            &mut store_t, &ops_t, 1, &whir_t, &cached_t, 0, 0, &stmt_t, &model_t, &execution_t)
+            .expect("tied LM proof");
+        let bytes_t = bincode::serialize(&proof_t).unwrap();
+        let bundle_t = PublicBundle::new(ops_t.clone(), 1, stmt_t.clone(), model_t.clone(),
+            execution_t.clone());
+        write_bundle(&dir, &bundle_t, &bytes_t).unwrap();
+        assert!(verify_bundle_dir(&dir));
+        let mut bad = bundle_t.clone();
+        bad.statement = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(), response: vec![4, 4, 5, 6, 7],
+            next_token: Some(0) };
+        assert!(rejects(&bad, &bytes_t), "tied second maximum claim must reject");
+        let mut bad = bundle_t.clone();
+        bad.execution.outputs.get_mut(&out_key_t).unwrap()[2] = Goldilocks::from_u64(4);
+        assert!(rejects(&bad, &bytes_t), "forged tied argmax output must reject");
     }
 
     /// PR#45 B1: ScaleGate reverse roundtrip (exact and rounded), plus

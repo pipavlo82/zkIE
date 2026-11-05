@@ -57,11 +57,11 @@ statement through the bound entry (B2/B3, not yet).
 | Add / MatMul / Transpose / Projection / Lookup / GeluIndex / Scale / ScaleVec | yes | yes | no (B2) | — |
 | Relu | yes | yes | TimesFM (B2) | — |
 | Argmax / TopKSelect / Scatter / BroadcastScale / Gather / GatherMatMul / CombineIdx / IdxBroadcast / PadIdx | yes | yes | DeepSeek segmented (B3 for single statement) | — |
-| Softmax | softmax_scaled.rs | **no** | all four models | B1 priority 1 |
-| ScaleGate | OpProof::ScaleGate | **no** | B3 router | B1 priority 1 |
-| StableSoftmaxIndex | softmax_scaled.rs | **no** | all four models | B1 priority 2 |
-| RmsNorm | rms_norm.rs | **no** | Gemma3/DeepSeek/TimesFM | B1 priority 2 |
-| RoPE | rope.rs | **no** | Gemma3/DeepSeek | B1 priority 2 |
+| Softmax | softmax_scaled.rs | yes (`908e00b`) | all four models | done (B1) |
+| ScaleGate | OpProof::ScaleGate | yes (`c47ed80`) | B3 router | done (B1) |
+| StableSoftmaxIndex | softmax_scaled.rs | yes (`74088e4`) | all four models | done (B1) |
+| RmsNorm | rms_norm.rs | yes (`990b709`) | Gemma3/DeepSeek/TimesFM | done (B1) |
+| RoPE | rope.rs | yes (`2346cf3`) | Gemma3/DeepSeek | done (B1) |
 | LayerNormCentered | layer_norm_centered.rs | **no** | GPT-2/TimesFM | out of the five-op scope; stays fail-closed and is listed as a remaining support gap |
 | SoftmaxIndex / Layernorm / BatchedMatMul | some | no | none of the four | out of scope; fail-closed |
 
@@ -86,3 +86,36 @@ statement through the bound entry (B2/B3, not yet).
 - B3 needs the Softmax/ScaleGate reductions plus a single-statement MoE
   route→TopK→Scatter→expert→gate→Gather chain. This inventory is not B3
   acceptance.
+
+## 5. B1 closure and B2 bundle status
+
+All five priority ops now have bound reverse reductions on
+`fix/soundness-repair` (Softmax `908e00b`, ScaleGate `c47ed80`,
+StableSoftmaxIndex `74088e4`, RmsNorm `990b709`, RoPE `2346cf3`). Each
+reduction commits its witnesses before the transcript challenges, proves the
+forward rounding/range/index semantics with EF virtuals, and authenticates
+the endpoints against the committed tensors/tables; the old unsafe entries
+remain permanently closed.
+
+B2 adds the public bundle + independent verifier contract (`src/bundle.rs`,
+`src/bin/verify_bundle.rs`):
+
+- `bundle.bin` carries only the trusted op graph, the public statement, the
+  root-only model manifest and the caller-owned execution I/O; `proof.bin`
+  carries the bound proof. The verifier process loads exactly these two files
+  and nothing else (no weights, store or prover caches).
+- The token binding accepts both canonical embedding layouts: column-major
+  (`d*base + token`, GPT-2's transposed lm_head) and row-major
+  (`token*base + d`, Gemma3/DeepSeek embed_tokens). Prompt, response, output
+  and embedding-token tampering are rejected, as are model-root changes and
+  argmax/tie forgeries (test
+  `b2_public_bundle_independent_verifier_and_tamper_matrix`).
+- The independent process test covers missing/corrupt artifacts and the
+  fail-closed binary contract.
+
+Remaining B2 work for the four real-model examples is the per-model public
+execution assembly (input tables, execution outputs) and full-graph proving.
+GPT-2/TimesFM still hit the out-of-scope fail-closed `LayerNormCentered` gap;
+Gemma3/DeepSeek are fully covered by the five B1 reductions. The per-op
+RmsNorm rsqrt table side is O(2^23); cross-op aggregation is the deeper O7/B3
+work agreed with the TL.
