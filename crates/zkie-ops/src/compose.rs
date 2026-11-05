@@ -22601,6 +22601,149 @@ mod tests {
         assert!(total_decodable > 0);
     }
 
+    /// S8/C1: structured mutations must be fed to the RAW verifier
+    /// (`verify_committed_shard_dag_bound`), not the public bytes entry. The
+    /// production bytes entry wraps the verifier in `guard_verify`, which
+    /// converts a panic into `false`; that only proves no panic escapes the
+    /// public API. Here `catch_unwind` is used purely as a detector: `Err`
+    /// fails the test ("a panic happened"), `Ok(false)` is the expected
+    /// rejection, and `Ok(true)` on an invalid mutation fails. Each sample
+    /// has a wall-clock budget so a malicious length cannot hang the test.
+    #[test]
+    fn s8_raw_structured_mutations_do_not_panic() {
+        use std::time::{Duration, Instant};
+        let (ops, whir, model, execution, bytes) = s8_bound_fixture(0x5805);
+        let base_model = model.clone();
+        let raw_ok = |p: &BoundExecutionProof, m: &TrustedModelManifest| {
+            verify_committed_shard_dag_bound(
+                &ops, 1, &whir, p, &PublicStatement::Generic, m, &execution)
+        };
+        let honest: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let t_honest = Instant::now();
+        assert!(raw_ok(&honest, &base_model), "honest fixture must pass raw verifier");
+        assert!(t_honest.elapsed() < Duration::from_secs(10), "honest fixture exceeded budget");
+        eprintln!("S8 raw-fuzz honest fixture: {:?}", t_honest.elapsed());
+
+        let samples = std::cell::Cell::new(0usize);
+        let check = |what: &str, mutate: &dyn Fn(&mut BoundExecutionProof),
+                         m: &TrustedModelManifest| {
+            let mut p: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+            mutate(&mut p);
+            // Re-serialize so the corpus is exactly what an attacker can send
+            // and bincode's structural constraints are exercised.
+            let wire = bincode::serialize(&p).expect("serialize mutated proof");
+            let decoded: BoundExecutionProof = match decode_proof_limited(&wire) {
+                Some(v) => v,
+                None => return,
+            };
+            let t = Instant::now();
+            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                raw_ok(&decoded, m)
+            }));
+            let dt = t.elapsed();
+            match got {
+                Ok(true) => panic!("{what}: raw verifier accepted an invalid mutation"),
+                Ok(false) => {}
+                Err(_) => panic!("{what}: raw verifier PANICKED (guard-free path)"),
+            }
+            assert!(dt < Duration::from_secs(10), "{what}: exceeded time budget ({dt:?})");
+            samples.set(samples.get() + 1);
+        };
+        let clone_step = |p: &BoundExecutionProof, i: usize| -> ReverseStep {
+            bincode::deserialize(&bincode::serialize(&p.reverse.steps[i]).unwrap()).unwrap()
+        };
+
+        check("empty reverse steps", &|p| p.reverse.steps.clear(), &base_model);
+        check("drop last reverse step", &|p| { p.reverse.steps.pop(); }, &base_model);
+        check("empty step outputs", &|p| { for s in &mut p.reverse.steps { s.outputs.clear(); } }, &base_model);
+        check("extended output point", &|p| { for s in &mut p.reverse.steps { for o in &mut s.outputs { o.point.push(Ef::ONE); } } }, &base_model);
+        check("empty output point", &|p| { for s in &mut p.reverse.steps { for o in &mut s.outputs { o.point.clear(); } } }, &base_model);
+        let dup = |p: &mut BoundExecutionProof| {
+            let s = clone_step(p, 0);
+            p.reverse.steps.push(s);
+        };
+        check("duplicated reverse step", &dup, &base_model);
+        check("empty aux descriptors", &|p| p.aux.clear(), &base_model);
+        check("aux arity overflow", &|p| { for a in &mut p.aux { a.arity = usize::MAX; } }, &base_model);
+        check("aux columns overflow", &|p| { for a in &mut p.aux { a.columns = usize::MAX; } }, &base_model);
+        check("aux len overflow", &|p| { for a in &mut p.aux { a.len = usize::MAX; } }, &base_model);
+        check("aux op index huge", &|p| { for a in &mut p.aux { a.op_index = usize::MAX; } }, &base_model);
+        check("duplicate aux descriptor", &|p| { if let Some(a) = p.aux.first().cloned() { p.aux.push(a); } }, &base_model);
+        check("empty weight openings", &|p| p.weight_openings.clear(), &base_model);
+        check("duplicate weight opening", &|p| {
+            if let Some(w) = p.weight_openings.first() {
+                let c: WeightBatchOpening = bincode::deserialize(&bincode::serialize(w).unwrap()).unwrap();
+                p.weight_openings.push(c);
+            }
+        }, &base_model);
+        check("weight table index huge", &|p| {
+            if let Some(w) = p.weight_openings.first_mut() {
+                if let Some(x) = w.table_idxs.first_mut() { *x = usize::MAX; }
+            }
+        }, &base_model);
+        check("weight point length", &|p| {
+            if let Some(w) = p.weight_openings.first_mut() {
+                if let Some(x) = w.points.first_mut() { x.push(Ef::ONE); }
+            }
+        }, &base_model);
+        check("weight claimed length", &|p| {
+            if let Some(w) = p.weight_openings.first_mut() { w.claimed.pop(); }
+        }, &base_model);
+        check("weight proof dropped", &|p| {
+            if let Some(w) = p.weight_openings.first_mut() { w.proof = None; }
+        }, &base_model);
+        check("sel opening count mismatch", &|p| {
+            if p.sel_openings.is_empty() {
+                if let Some(opening) = p.weight_openings.iter().find_map(|w| w.proof.clone()) {
+                    p.sel_openings.push(BoundSelOpening {
+                        points: Vec::new(), claimed: Vec::new(), opening,
+                    });
+                }
+            } else {
+                p.sel_openings.clear();
+            }
+        }, &base_model);
+        check("generic token binding injected", &|p| {
+            let opening = p.sel_openings.first().map(|s| s.opening.clone())
+                .or_else(|| p.weight_openings.iter().find_map(|w| w.proof.clone()));
+            if let Some(opening) = opening {
+                p.token_binding = Some(BoundTokenBinding { point: Vec::new(), claimed: Ef::ONE, opening });
+            }
+        }, &base_model);
+
+        // WHIR/parameter and manifest mutations (trusted caller data is still
+        // policy-checked and must fail closed, not panic).
+        let check_model = |what: &str, mutate: &dyn Fn(&mut TrustedModelManifest)| {
+            let mut m = base_model.clone();
+            mutate(&mut m);
+            let t = Instant::now();
+            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                raw_ok(&honest, &m)
+            }));
+            let dt = t.elapsed();
+            match got {
+                Ok(true) => panic!("{what}: verifier accepted a degraded manifest"),
+                Ok(false) => {}
+                Err(_) => panic!("{what}: raw verifier PANICKED on manifest mutation"),
+            }
+            assert!(dt < Duration::from_secs(10), "{what}: manifest check exceeded budget");
+            samples.set(samples.get() + 1);
+        };
+        check_model("legacy 96-bit manifest", &|m| m.batches[0].security = 96);
+        check_model("manifest pow overflow", &|m| m.batches[0].pow_bits = usize::MAX);
+        check_model("manifest num_vars overflow", &|m| m.batches[0].num_vars = usize::MAX);
+        check_model("manifest arity overflow", &|m| m.batches[0].arity = usize::MAX);
+        check_model("manifest chunk overflow", &|m| {
+            m.batches[0].chunk_bits = usize::MAX;
+            m.batches[0].chunk_index = usize::MAX;
+        });
+        check_model("manifest table ids empty", &|m| m.batches[0].table_ids.clear());
+        check_model("manifest graph mismatch", &|m| m.graph.push(0));
+
+        eprintln!("S8 raw-fuzz: decoded-and-verified samples={}", samples.get());
+        assert!(samples.get() >= 25, "corpus too small: {}", samples.get());
+    }
+
     #[test]
     fn s8_gelu_and_scalevec_aux_mutations_reject_without_panic() {
         let (ops, whir, model, execution, bytes) = s8_gelu_fixture();
