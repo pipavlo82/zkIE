@@ -103,7 +103,10 @@ B2 adds the public bundle + independent verifier contract (`src/bundle.rs`,
 - `bundle.bin` carries only the trusted op graph, the public statement, the
   root-only model manifest and the caller-owned execution I/O; `proof.bin`
   carries the bound proof. The verifier process loads exactly these two files
-  and nothing else (no weights, store or prover caches).
+  and nothing else (no weights, store or prover caches). **bundle.bin 不含任何
+  权重数据**：权重只以 manifest 中的 commitment root 形式出现，roots 是唯一
+  的权重认证源；`verify_bundle_dir` 的 whir 参数是遗留签名占位，verifier
+  内部按 `VERIFIER_SECURITY`/各 opening arity 重建 WHIR。
 - The token binding accepts both canonical embedding layouts: column-major
   (`d*base + token`, GPT-2's transposed lm_head) and row-major
   (`token*base + d`, Gemma3/DeepSeek embed_tokens). Prompt, response, output

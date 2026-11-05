@@ -5,7 +5,9 @@
 //! `proof.bin` (the BoundExecutionProof bytes). The verifier binary loads
 //! only these files — no weights, no prover caches, no store — and returns
 //! the bound verifier's decision. The manifest is the offline commit's
-//! root-only view; committed tensor data never enters the bundle.
+//! root-only view; committed tensor data never enters the bundle. Weight
+//! authenticity comes exclusively from the manifest roots/commitments, not
+//! from bundle data.
 
 use crate::compose::{
     verify_committed_shard_dag_bound_bytes, CachedWeightBatch, Op, PublicStatement, Store,
@@ -77,6 +79,10 @@ pub fn write_bundle(dir: &Path, bundle: &PublicBundle, proof: &[u8]) -> std::io:
 pub fn verify_bundle_dir(dir: &Path) -> bool {
     let bundle = match PublicBundle::read(dir) { Some(b) => b, None => return false };
     let proof = match read_proof(dir) { Some(p) => p, None => return false };
+    // The bound verifier rebuilds its WHIR parameters from VERIFIER_SECURITY
+    // and each opening's arity; the `whir` argument is part of the legacy
+    // signature and is ignored (`let _ = whir` in the verifier). Pass a
+    // policy-default instance only to satisfy that signature.
     let whir = zkie_core::pcs::whir::Whir::new_testing(5);
     verify_committed_shard_dag_bound_bytes(
         &proof, &bundle.ops, bundle.ops_per_shard, &whir,
