@@ -5479,7 +5479,8 @@ struct ReverseScaleProof {
 }
 
 fn prove_reverse_scale(store: &Store, op: &Op, point: &[Ef], value: Ef,
-    aux: Option<PreparedAux>, transcript: &mut Transcript) -> Option<(ReverseScaleProof, EfClaim)>
+    aux: Option<PreparedAux>, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<(ReverseScaleProof, EfClaim)>
 {
     let (x, out, factor, shift) = match op {
         Op::Scale { x, out, factor, shift } => (*x, *out, *factor, *shift),
@@ -5520,6 +5521,9 @@ fn prove_reverse_scale(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let mut points = vec![padded_point; aux.descriptor.columns];
     points.extend((0..aux.descriptor.columns).map(|_| bool_point.clone()));
     let mut values = bit_evals.clone(); values.extend_from_slice(&booleanity.final_evals[1..]);
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&aux.descriptor, &idxs, &points, &values)?;
+    }
     let opening = open_aux(aux, &idxs, &points, &values)?;
     Some((ReverseScaleProof { remainder_bits: bit_evals, booleanity: Some(booleanity), opening: Some(opening),
         input_eval: if factor == 0 { Some(x_eval) } else { None } },
@@ -5527,7 +5531,8 @@ fn prove_reverse_scale(store: &Store, op: &Op, point: &[Ef], value: Ef,
 }
 
 fn verify_reverse_scale(op: &Op, point: &[Ef], value: Ef, aux: Option<&AuxDescriptor>,
-    proof: &ReverseScaleProof, transcript: &mut Transcript) -> Option<EfClaim>
+    proof: &ReverseScaleProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<EfClaim>
 {
     let (x, factor, shift) = match op {
         Op::Scale { x, factor, shift, .. } => (*x, *factor, *shift),
@@ -5587,7 +5592,9 @@ fn verify_reverse_scale(op: &Op, point: &[Ef], value: Ef, aux: Option<&AuxDescri
     let mut points = vec![padded_point; descriptor.columns];
     points.extend((0..descriptor.columns).map(|_| bool_point.clone()));
     let mut values = proof.remainder_bits.clone(); values.extend_from_slice(&booleanity.final_evals[1..]);
-    if !verify_aux_open(descriptor, &idxs, &points, &values, opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(descriptor, &idxs, &points, &values)?;
+    } else if !verify_aux_open(descriptor, &idxs, &points, &values, opening) { return None; }
     Some(EfClaim { tensor_id: x, point: point.to_vec(), value: x_eval })
 }
 
@@ -5669,7 +5676,8 @@ fn argmax_bit_bool_terms(gamma: Ef, count: usize) -> Vec<(Ef, Vec<usize>)> {
 }
 
 fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
-    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseArgmaxProof, Vec<EfClaim>)>
+    aux: PreparedAux, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<(ReverseArgmaxProof, Vec<EfClaim>)>
 {
     let (x, sel, thr, gate, d1, d2, out, m, n) = match op {
         Op::Argmax { x, sel, thr, gate, d1, d2, out, m, n } => (*x, *sel, *thr, *gate, *d1, *d2, *out, *m, *n),
@@ -5815,6 +5823,9 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     push!(0, argmax_pad_point(&zg, arity), col_eval(0, &zg));
     push!(0, argmax_pad_point(&zd1, arity), col_eval(0, &zd1));
     push!(0, argmax_pad_point(&zd2, arity), col_eval(0, &zd2));
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&aux.descriptor, &idxs, &points, &values)?;
+    }
     let opening = open_aux(aux, &idxs, &points, &values)?;
 
     let x_z6 = thr_sum.final_evals[2];
@@ -5834,7 +5845,8 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 }
 
 fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
-    descriptor: &AuxDescriptor, proof: &ReverseArgmaxProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
+    descriptor: &AuxDescriptor, proof: &ReverseArgmaxProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
 {
     let (x, sel, thr, gate, d1, d2, out, m, n) = match op {
         Op::Argmax { x, sel, thr, gate, d1, d2, out, m, n } => (*x, *sel, *thr, *gate, *d1, *d2, *out, *m, *n),
@@ -5970,7 +5982,9 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let sel_d2_idx = idxs.len();
     push!(0, argmax_pad_point(&zd2, arity));
     let padded = 1usize.checked_shl(arity as u32)?;
-    if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(descriptor, &idxs, &points, &proof.aux_values)?;
+    } else if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
     let av = &proof.aux_values;
 
     // Pointwise bindings against the committed aux (linear relations).
@@ -8580,7 +8594,8 @@ fn verify_reverse_lookup(op: &Op, point: &[Ef], value: Ef, pairs: &AuxDescriptor
 }
 
 fn prove_reverse_projection(store: &Store, op: &Op, point: &[Ef], value: Ef,
-    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseProjectionProof, Vec<EfClaim>)>
+    aux: PreparedAux, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<(ReverseProjectionProof, Vec<EfClaim>)>
 {
     let (x, w, bias, out, m, k, n, shift) = match op {
         Op::Projection { x, w, bias, out, m, k, n, shift, .. } => {
@@ -8635,6 +8650,9 @@ fn prove_reverse_projection(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let mut points = vec![padded_point; aux.descriptor.columns];
     points.extend((0..aux.descriptor.columns).map(|_| bool_point.clone()));
     let mut values = bit_evals.clone(); values.extend_from_slice(&booleanity.final_evals[1..]);
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&aux.descriptor, &idxs, &points, &values)?;
+    }
     let opening = open_aux(aux, &idxs, &points, &values)?;
     let mut xp = ch.clone(); xp.extend_from_slice(u);
     let mut wp = v.to_vec(); wp.extend_from_slice(&ch);
@@ -8643,7 +8661,8 @@ fn prove_reverse_projection(store: &Store, op: &Op, point: &[Ef], value: Ef,
 }
 
 fn verify_reverse_projection(op: &Op, point: &[Ef], value: Ef, aux: &AuxDescriptor,
-    proof: &ReverseProjectionProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
+    proof: &ReverseProjectionProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
 {
     let (x, w, bias, m, k, n, shift) = match op {
         Op::Projection { x, w, bias, m, k, n, shift, .. } => (*x, *w, *bias, *m, *k, *n, *shift),
@@ -8676,7 +8695,9 @@ fn verify_reverse_projection(op: &Op, point: &[Ef], value: Ef, aux: &AuxDescript
     let mut idxs: Vec<usize> = (0..aux.columns).collect(); idxs.extend(0..aux.columns);
     let mut points = vec![padded_point; aux.columns]; points.extend((0..aux.columns).map(|_| bool_point.clone()));
     let mut values = proof.remainder_bits.clone(); values.extend_from_slice(&proof.booleanity.final_evals[1..]);
-    if !verify_aux_open(aux, &idxs, &points, &values, &proof.opening) { return None; }
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(aux, &idxs, &points, &values)?;
+    } else if !verify_aux_open(aux, &idxs, &points, &values, &proof.opening) { return None; }
     let mut xp = ch.clone(); xp.extend_from_slice(u);
     let mut wp = v.to_vec(); wp.extend_from_slice(&ch);
     Some(vec![EfClaim { tensor_id: x, point: xp, value: proof.matmul.sumcheck.f_eval }, EfClaim { tensor_id: w, point: wp, value: proof.matmul.sumcheck.h_eval }, EfClaim { tensor_id: bias, point: point.to_vec(), value: proof.bias }])
@@ -8913,7 +8934,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 ReverseReduction::Lookup { proof }
             }
             Op::Projection { .. } => {
-                let (proof, incoming) = prove_reverse_projection(store, op, &point, value, aux.remove(&(op_index, AuxRole::ProjectionBits))?, transcript)?;
+                let (proof, incoming) = prove_reverse_projection(store, op, &point, value, aux.remove(&(op_index, AuxRole::ProjectionBits))?, transcript, aux_rec.as_deref_mut())?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -8925,7 +8946,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                     Op::Scale { shift: 0, .. } => None,
                     _ => Some(aux.remove(&(op_index, AuxRole::ScaleRemainder))?),
                 };
-                let (proof, c) = prove_reverse_scale(store, op, &point, value, prepared, transcript)?;
+                let (proof, c) = prove_reverse_scale(store, op, &point, value, prepared, transcript, aux_rec.as_deref_mut())?;
                 absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                 claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 ReverseReduction::Scale { proof }
@@ -8933,7 +8954,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
             Op::Argmax { .. } => {
                 let pairs: Vec<(T, Vec<Ef>, Ef)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
                 let prepared_aux = aux.remove(&(op_index, AuxRole::ArgmaxWitness))?;
-                let reduced = prove_reverse_argmax(store, op, &pairs, prepared_aux, transcript);
+                let reduced = prove_reverse_argmax(store, op, &pairs, prepared_aux, transcript, aux_rec.as_deref_mut());
                 let (proof, incoming) = reduced?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
@@ -9365,7 +9386,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
             }
             (Op::Projection { .. }, ReverseReduction::Projection { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ProjectionBits)?;
-                for c in verify_reverse_projection(op, &point, value, descriptor, proof, transcript)? {
+                for c in verify_reverse_projection(op, &point, value, descriptor, proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -9374,13 +9395,13 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 let descriptor = if matches!(op, Op::Scale { shift: 0, .. }) { None } else {
                     Some(aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ScaleRemainder)?)
                 };
-                let c = verify_reverse_scale(op, &point, value, descriptor, proof, transcript)?;
+                let c = verify_reverse_scale(op, &point, value, descriptor, proof, transcript, aux_rec.as_deref_mut())?;
                 absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                 claims.entry(c.tensor_id).or_default().push((c.point, c.value));
             }
             (Op::Argmax { .. }, ReverseReduction::Argmax { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ArgmaxWitness)?;
-                for c in verify_reverse_argmax(op, &merged_out, descriptor, proof, transcript)? {
+                for c in verify_reverse_argmax(op, &merged_out, descriptor, proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -16549,7 +16570,9 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.sumcheck(&proof.matmul.sumcheck)?;
                 b.virtual_proof(&proof.booleanity, 3)?;
                 // The opening covers each remainder column at two points.
-                b.opening(&proof.opening, 2 * proof.remainder_bits.len())?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.opening, 2 * proof.remainder_bits.len())?;
+                }
             }
             ReverseReduction::Lookup { proof } => {
                 b.fractional(&proof.witness)?;
@@ -16570,8 +16593,10 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             }
             ReverseReduction::Scale { proof } => {
                 if let Some(v) = &proof.booleanity { b.virtual_proof(v, 3)?; }
-                if let Some(o) = &proof.opening {
-                    b.opening(o, 2 * proof.remainder_bits.len())?;
+                if proof_aux_layout < 2 {
+                    if let Some(o) = &proof.opening {
+                        b.opening(o, 2 * proof.remainder_bits.len())?;
+                    }
                 }
             }
             ReverseReduction::Argmax { proof } => {
@@ -16580,7 +16605,9 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                           &proof.d2_rel] {
                     b.virtual_proof(v, 3)?;
                 }
-                b.opening(&proof.opening, proof.aux_values.len())?;
+                if proof_aux_layout < 2 {
+                    b.opening(&proof.opening, proof.aux_values.len())?;
+                }
             }
             ReverseReduction::GatherMatMul { proof } => {
                 b.virtual_proof(&proof.matmul.sumcheck, 3)?;
@@ -18025,11 +18052,11 @@ mod tests {
         let prover_aux = scale_aux(0, 4, zero_bits.clone());
         let verifier_aux = scale_aux(0, 4, zero_bits);
         let mut tp = Transcript::new(b"scale-zero-rebuilt");
-        let (proof, claim) = prove_reverse_scale(&store, &op, &point, value, Some(prover_aux), &mut tp)
+        let (proof, claim) = prove_reverse_scale(&store, &op, &point, value, Some(prover_aux), &mut tp, None)
             .expect("a rebuilt proof for a nonzero field value is constructible");
         assert_eq!(claim.value, ef_eval(store.get(x), &point));
         let mut tv = Transcript::new(b"scale-zero-rebuilt");
-        assert!(verify_reverse_scale(&op, &point, value, Some(&verifier_aux.descriptor), &proof, &mut tv).is_none());
+        assert!(verify_reverse_scale(&op, &point, value, Some(&verifier_aux.descriptor), &proof, &mut tv, None).is_none());
     }
 
     #[test]
