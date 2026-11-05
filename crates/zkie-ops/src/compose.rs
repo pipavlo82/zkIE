@@ -2966,7 +2966,7 @@ fn ssi_row_terms(g1: Ef, g2: Ef, g3: Ef, n_inv: Ef) -> Vec<(Ef, Vec<usize>)> {
 /// the pointwise identity cancels), plus per-bit Booleanity constraints, each
 /// weighted by its own distinct gamma power.
 fn ssi_range_terms(gamma: Ef, lg_l: usize) -> Vec<(Ef, Vec<usize>)> {
-    let bits = SSI_RANGE_BITS;
+    let bits = SSI_RANGE_BITS; // measured width, see the constant comment
     let mut terms = Vec::new();
     let mut gp = Ef::ONE;
     for rel in 0..3usize {
@@ -3043,7 +3043,7 @@ fn prove_reverse_stable_softmax_index(store: &Store, op: &Op, point: &[Ef], valu
         let pick = (0..n).find(|&j| masked[i * n + j] == row_max_i[i])?;
         sel[i * n + pick] = Goldilocks::ONE;
     }
-    let two22 = 1i64 << SSI_RANGE_BITS;
+    let two_range = 1i64 << SSI_RANGE_BITS;
     for i in 0..m {
         for j in 0..n {
             let at = i * n + j;
@@ -3054,8 +3054,8 @@ fn prove_reverse_stable_softmax_index(store: &Store, op: &Op, point: &[Ef], valu
             let mdiff = rmax.checked_sub(masked[at])?;
             let tr_w = trunc.checked_sub(w)?;
             let diff = trunc.checked_sub(idx_v)?;
-            if !(0..two22).contains(&mdiff) || !(0..two22).contains(&tr_w)
-                || !(0..two22).contains(&diff) || idx_v < 0
+            if !(0..two_range).contains(&mdiff) || !(0..two_range).contains(&tr_w)
+                || !(0..two_range).contains(&diff) || idx_v < 0
                 || (idx_v as u64) >= table_len as u64
                 || idx_v != trunc.min((table_len - 1) as i64) { return None; }
             if aux.columns[0][at] != from_i64(masked[at])
@@ -6955,7 +6955,14 @@ const SOFTMAX_REM_BITS: usize = 21;
 /// (i,j) domain; `SoftmaxRemainder` holds the B = SOFTMAX_REM_BITS bits of
 /// rem = e*2^B - out*S + 2^(B-1) in [0,2^B) (ties-up rounding). The `e`
 /// column itself is the second LookupPairs column.
-const SSI_RANGE_BITS: usize = 22;
+/// StableSoftmaxIndex range width. The witness proves three non-negative
+/// quantities: `mdiff = rmax - masked`, `tr_w = trunc - w`, and
+/// `diff = trunc - idx`. Measured over the full real graphs:
+/// GPT-2 max mdiff=1,075,866,322 / tr_w=1,073,769,170 (31 bits),
+/// TimesFM max mdiff=29,803,701 / tr_w=27,706,549 (25 bits).
+/// ceil(log2(global max)) = 31, so B=32 (one bit of margin) covers
+/// 2^32 = 4,294,967,296 and fails closed above it.
+const SSI_RANGE_BITS: usize = 32;
 
 /// B1: StableSoftmaxIndex witness columns. Six value columns
 /// [masked, row_max_b, w, trunc, idx_f, sel] followed by range bits:
@@ -7015,7 +7022,7 @@ fn prepare_stable_softmax_index_aux(store: &Store, ops: &[Op], model: &TrustedMo
             let pick = (0..n).find(|&j| masked[i * n + j] == row_max_i[i])?;
             sel[i * n + pick] = Goldilocks::ONE;
         }
-        let two22 = 1i64 << SSI_RANGE_BITS;
+        let two_range = 1i64 << SSI_RANGE_BITS;
         let mut col = vec![vec![Goldilocks::ZERO; len]; cols];
         for i in 0..m {
             for j in 0..n {
@@ -7029,9 +7036,10 @@ fn prepare_stable_softmax_index_aux(store: &Store, ops: &[Op], model: &TrustedMo
                 let mdiff = rmax.checked_sub(masked_i)?;
                 let tr_w = trunc.checked_sub(w)?;
                 let diff = trunc.checked_sub(idx_v)?;
-                if !(0..two22).contains(&mdiff) || !(0..two22).contains(&tr_w)
-                    || !(0..two22).contains(&diff) || idx_v < 0 || (idx_v as u64) >= table_len as u64
+                if !(0..two_range).contains(&mdiff) || !(0..two_range).contains(&tr_w)
+                    || !(0..two_range).contains(&diff) || idx_v < 0 || (idx_v as u64) >= table_len as u64
                     || idx_v != trunc.min((table_len - 1) as i64) {
+                    eprintln!("SSI aux fail op={op_index} at={at} masked={masked_i} rmax={rmax} w={w} trunc={trunc} idx={idx_v} mdiff={mdiff} tr_w={tr_w} diff={diff} table_len={table_len}");
                     return None;
                 }
                 col[0][at] = from_i64(masked_i);
@@ -7507,7 +7515,13 @@ fn prepare_lnc_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
     let mut witnesses: std::collections::BTreeMap<usize, LncWitness> = Default::default();
     for (i, op) in ops.iter().enumerate() {
         if matches!(op, Op::LayerNormCentered { .. }) {
-            witnesses.insert(i, build_lnc_witness(store, op, model)?);
+            match build_lnc_witness(store, op, model) {
+                Some(w) => { witnesses.insert(i, w); }
+                None => {
+                    eprintln!("LNC aux fail op={i}");
+                    return None;
+                }
+            }
         }
     }
     let mut prepared = Vec::new();
@@ -8177,7 +8191,11 @@ fn prepare_softmax_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
                 let rem = to_i64(ev[at]).checked_mul(two)?
                     .checked_sub(to_i64(ov[at]).checked_mul(s)?)?
                     .checked_add(half)?;
-                if rem < 0 || (rem as u64) >= (window as u64) { return None; }
+                if rem < 0 || (rem as u64) >= (window as u64) {
+                    eprintln!("softmax aux fail op={op_index} row={i} col={j} S={s} e={} out={} rem={rem} window={window}",
+                        to_i64(ev[at]), to_i64(ov[at]));
+                    return None;
+                }
                 for b in 0..SOFTMAX_REM_BITS {
                     cols[b][at] = Goldilocks::from_u64(((rem as u64) >> b) & 1);
                 }
@@ -8196,8 +8214,13 @@ fn prepare_softmax_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
     Some(prepared)
 }
 
-const ARGMAX_D2_BITS: usize = 23;
-const ARGMAX_TIE_BITS: usize = 24;
+/// Argmax witness range widths. `d2` is the top-minus-second logit gap and
+/// `tie = d2 - before + sel`. Full real-graph scan (GPT-2 M=16, one Argmax
+/// of 16x65536): max gap = max tie = 2,348,020,452,072 (42 bits);
+/// ceil(log2) = 42, so 43 bits (one bit of margin) cover < 2^43. TimesFM has
+/// no Argmax op. The earlier 23/24-bit bound was hit at gap=18,990,631,562.
+const ARGMAX_D2_BITS: usize = 43;
+const ARGMAX_TIE_BITS: usize = 43;
 const ARGMAX_BEFORE_COL: usize = 1;
 const ARGMAX_D2_COL: usize = 2;
 const ARGMAX_TIE_COL: usize = ARGMAX_D2_COL + ARGMAX_D2_BITS;
@@ -8266,22 +8289,34 @@ fn prepare_argmax_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
         let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
         for i in 0..m {
             let oi = outs[i] as usize;
-            if oi >= n { return None; }
+            if oi >= n {
+                eprintln!("argmax aux fail op={op_index} row={i} out={oi} >= n={n}");
+                return None;
+            }
             for j in 0..n {
                 let at = i * n + j;
                 let sv = selv[at];
-                if sv != Goldilocks::ZERO && sv != Goldilocks::ONE { return None; }
+                if sv != Goldilocks::ZERO && sv != Goldilocks::ONE {
+                    eprintln!("argmax aux fail op={op_index} at={at} sel not boolean");
+                    return None;
+                }
                 columns[0][at] = sv;
                 // before = 1[j < out_i] is a SUFFIX indicator over one-hot sel.
                 columns[1][at] = if j < oi { Goldilocks::ONE } else { Goldilocks::ZERO };
                 let gap = to_i64(d2v[at]);
-                if gap < 0 || (gap as u64) >= (1u64 << ARGMAX_D2_BITS) { return None; }
+                if gap < 0 || (gap as u64) >= (1u64 << ARGMAX_D2_BITS) {
+                    eprintln!("argmax aux fail op={op_index} at={at} gap={gap} bits={ARGMAX_D2_BITS}");
+                    return None;
+                }
                 for b in 0..ARGMAX_D2_BITS {
                     columns[2 + b][at] = Goldilocks::from_u64(((gap as u64) >> b) & 1);
                 }
                 // tie_gap = d2 - before + sel must be a non-negative integer.
                 let tie = gap - if j < oi { 1i64 } else { 0i64 } + to_i64(sv);
-                if tie < 0 || (tie as u64) >= (1u64 << ARGMAX_TIE_BITS) { return None; }
+                if tie < 0 || (tie as u64) >= (1u64 << ARGMAX_TIE_BITS) {
+                    eprintln!("argmax aux fail op={op_index} at={at} tie={tie} bits={ARGMAX_TIE_BITS} gap={gap}");
+                    return None;
+                }
                 for b in 0..ARGMAX_TIE_BITS {
                     columns[2 + ARGMAX_D2_BITS + b][at] = Goldilocks::from_u64(((tie as u64) >> b) & 1);
                 }
@@ -9780,7 +9815,9 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
     let mut group_roots: std::collections::BTreeMap<T, Vec<(Ef, Ef)>> =
         std::collections::BTreeMap::new();
     let mut steps = Vec::new();
+    let op_trace = std::env::var("ZKIE_TRACE_PROVE").is_ok();
     for (op_index, op) in ops.iter().enumerate().rev() {
+        if op_trace { eprintln!("PROVE reverse op {op_index}: {op:?}"); }
         let mut out_claims = Vec::new();
         for id in reverse_op_io(op)?.1 {
             let cs = match claims.remove(&id) { Some(c) => c, None => continue };
@@ -10255,7 +10292,9 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
     let mut group_roots: std::collections::BTreeMap<T, Vec<(Ef, Ef)>> =
         std::collections::BTreeMap::new();
     let mut steps = step_slice.iter();
+    let op_trace = std::env::var("ZKIE_TRACE_PROVE").is_ok();
     for (op_index, op) in ops.iter().enumerate().rev() {
+        if op_trace { eprintln!("VERIFY reverse op {op_index}: {op:?}"); }
         let mut local = Vec::new();
         for id in reverse_op_io(op)?.1 {
             if let Some(cs) = claims.remove(&id) { local.push((id, cs)); }
@@ -17139,31 +17178,35 @@ fn peak_rss_kb() -> u64 {
 fn prepare_all_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
     -> Option<Vec<PreparedAux>>
 {
-    let mut prepared = prepare_projection_aux(store, ops)?;
-    prepared.extend(prepare_scale_aux(store, ops, model)?);
-    prepared.extend(prepare_scale_vec_out_aux(store, ops)?);
-    prepared.extend(prepare_broadcast_scale_out_aux(store, ops)?);
-    prepared.extend(prepare_scale_gate_out_aux(store, ops)?);
-    prepared.extend(prepare_scale_vec_remainder_aux(store, ops, model)?);
-    prepared.extend(prepare_scale_gate_aux(store, ops, model)?);
-    prepared.extend(prepare_softmax_out_aux(store, ops)?);
-    prepared.extend(prepare_softmax_aux(store, ops, model)?);
-    prepared.extend(prepare_stable_softmax_index_aux(store, ops, model)?);
-    prepared.extend(prepare_rms_norm_aux(store, ops, model)?);
-    prepared.extend(prepare_lnc_aux(store, ops, model)?);
-    prepared.extend(prepare_rope_out_aux(store, ops)?);
-    prepared.extend(prepare_rope_aux(store, ops, model)?);
-    prepared.extend(prepare_argmax_aux(store, ops)?);
-    prepared.extend(prepare_expert_routing_aux(store, ops)?);
-    prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
-    prepared.extend(prepare_lookup_aux(store, ops, model)?);
-    prepared.extend(prepare_lookup_group_aux(store, ops, model)?);
-    prepared.extend(prepare_gelu_range_aux(store, ops, model)?);
-    prepared.extend(prepare_topk_aux(store, ops)?);
-    prepared.extend(prepare_topk_range_aux(store, ops)?);
-    prepared.extend(prepare_topk_thr_range_aux(store, ops)?);
-    prepared.extend(prepare_topk_tie_aux(store, ops)?);
-    prepared.extend(prepare_scatter_aux(store, ops, model)?);
+    let tr = std::env::var("ZKIE_TRACE_PROVE").is_ok();
+    macro_rules! step {
+        ($name:literal, $e:expr) => {{ if tr { eprintln!("AUX stage {}", $name); } $e }};
+    }
+    let mut prepared = step!("projection", prepare_projection_aux(store, ops)?);
+    prepared.extend(step!("scale", prepare_scale_aux(store, ops, model)?));
+    prepared.extend(step!("scale_vec_out", prepare_scale_vec_out_aux(store, ops)?));
+    prepared.extend(step!("broadcast_scale_out", prepare_broadcast_scale_out_aux(store, ops)?));
+    prepared.extend(step!("scale_gate_out", prepare_scale_gate_out_aux(store, ops)?));
+    prepared.extend(step!("scale_vec_remainder", prepare_scale_vec_remainder_aux(store, ops, model)?));
+    prepared.extend(step!("scale_gate", prepare_scale_gate_aux(store, ops, model)?));
+    prepared.extend(step!("softmax_out", prepare_softmax_out_aux(store, ops)?));
+    prepared.extend(step!("softmax", prepare_softmax_aux(store, ops, model)?));
+    prepared.extend(step!("stable_softmax_index", prepare_stable_softmax_index_aux(store, ops, model)?));
+    prepared.extend(step!("rms_norm", prepare_rms_norm_aux(store, ops, model)?));
+    prepared.extend(step!("lnc", prepare_lnc_aux(store, ops, model)?));
+    prepared.extend(step!("rope_out", prepare_rope_out_aux(store, ops)?));
+    prepared.extend(step!("rope", prepare_rope_aux(store, ops, model)?));
+    prepared.extend(step!("argmax", prepare_argmax_aux(store, ops)?));
+    prepared.extend(step!("expert_routing", prepare_expert_routing_aux(store, ops)?));
+    prepared.extend(step!("gather_routing", prepare_gather_routing_aux(store, ops, model)?));
+    prepared.extend(step!("lookup", prepare_lookup_aux(store, ops, model)?));
+    prepared.extend(step!("lookup_group", prepare_lookup_group_aux(store, ops, model)?));
+    prepared.extend(step!("gelu_range", prepare_gelu_range_aux(store, ops, model)?));
+    prepared.extend(step!("topk", prepare_topk_aux(store, ops)?));
+    prepared.extend(step!("topk_range", prepare_topk_range_aux(store, ops)?));
+    prepared.extend(step!("topk_thr_range", prepare_topk_thr_range_aux(store, ops)?));
+    prepared.extend(step!("topk_tie", prepare_topk_tie_aux(store, ops)?));
+    prepared.extend(step!("scatter", prepare_scatter_aux(store, ops, model)?));
     prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
     Some(prepared)
 }
@@ -17174,7 +17217,10 @@ pub fn prove_committed_shard_dag_bound(
     _tokens_t: T, _argmax_t: T, statement: &PublicStatement, model: &TrustedModelManifest, execution: &TrustedExecution,
 ) -> Option<BoundExecutionProof> {
     let _ = (ops_per_shard, whir);
+    let trace = std::env::var("ZKIE_TRACE_PROVE").is_ok();
+    if trace { eprintln!("PROVE stage weight_locations"); }
     trusted_weight_locations(model, ops)?;
+    if trace { eprintln!("PROVE stage cached batches"); }
     if cached.len() != model.batches.len() { return None; }
     for (cached, expected) in cached.iter().zip(&model.batches) {
         if cached.arity != expected.arity || cached.num_tables != expected.num_tables
@@ -17201,7 +17247,9 @@ pub fn prove_committed_shard_dag_bound(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(256);
     store.enable_projection_cache(cache_mb.saturating_mul(1024 * 1024));
+    if trace { eprintln!("PROVE stage forward"); }
     forward_ops(store, ops);
+    if trace { eprintln!("PROVE stage execution outputs"); }
     for (&id, expected) in &execution.outputs {
         if usize::BITS != 64 { return None; }
         let tag = 1usize << (usize::BITS - 1);
@@ -17212,13 +17260,28 @@ pub fn prove_committed_shard_dag_bound(
             if idx.len() != expected.len() || idx.iter().zip(expected).any(|(&a, &b)| Goldilocks::from_u64(a as u64) != b) { return None; }
         }
     }
+    if trace { eprintln!("PROVE stage prepare_all_aux"); }
     let prepared = prepare_all_aux(store, ops, model)?;
+    if trace { eprintln!("PROVE stage commit_aux_groups aux={}", prepared.len()); }
     let (aux_plan, aux_groups, aux_prepared_groups) = commit_aux_groups_from(&prepared, ops, model)?;
+    if trace {
+        eprintln!("PROVE stage groups={}", aux_groups.len());
+        let softmax_ops = ops.iter()
+            .filter(|o| matches!(o, Op::Softmax { .. })).count();
+        let lnc_ops = ops.iter()
+            .filter(|o| matches!(o, Op::LayerNormCentered { .. })).count();
+        let group_tables = static_lookup_groups(ops, model)?.len();
+        let sel: usize = ops.iter().filter_map(|o| match o {
+            Op::Argmax { m, .. } => Some(*m), _ => None }).sum();
+        eprintln!("PROVE opening lower bound: softmax_tables={softmax_ops} lnc_tables={lnc_ops} lookup_group_tables={group_tables} sel={sel} token=1 pooled_groups<={}",
+            aux_groups.len());
+    }
     let mut aux_recorder = AuxOpenRecorder::new(aux_plan);
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
     // S6 (bound): selector openings + embedding token binding, built against
     // the same aux commitments the reverse reduction uses.
     let (sel_openings, token_binding) = prove_bound_lm_bindings(&prepared, store, ops, ops_per_shard, statement, model, execution, &aux)?;
+    if trace { eprintln!("PROVE stage execution_seeds"); }
     let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux, &aux_groups)?;
     let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
     let certified = certified_index_tensors(ops, execution);
@@ -17230,9 +17293,13 @@ pub fn prove_committed_shard_dag_bound(
     }
     // Deep O7 (a): derive each static lookup group's common (α, β) after the
     // model/execution/aux absorption and before the reverse DAG.
+    if trace { eprintln!("PROVE stage lookup groups"); }
     let lookup_groups = derive_lookup_group_ab(&mut transcript, ops, model)?;
+    if trace { eprintln!("PROVE stage reverse DAG"); }
     let (reverse, prover_leaves) = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution), &lookup_groups, Some(&mut aux_recorder))?;
+    if trace { eprintln!("PROVE stage pooled aux openings"); }
     let aux_pooled = build_pooled_aux_openings(&aux_recorder, &aux_prepared_groups)?;
+    if trace { eprintln!("PROVE stage weight grouping"); }
     // O2 (TL Q3): the prover uses its own residual claims; the verifier-side
     // replay is optional, for separately-accounted self-verify measurements
     // and a leaf consistency check. Default off: no prover self-verification.
@@ -19115,6 +19182,42 @@ mod tests {
         assert_eq!(cols[tie + 1][4], Goldilocks::ONE);
         assert_eq!(cols[tie + 2][4], Goldilocks::ONE);
         assert_eq!(cols[tie][5], Goldilocks::ONE); // selected cell tie = 1
+    }
+
+    #[test]
+    fn argmax_range_measured_window() {
+        // The measured GPT-2 gap/tie maximum is 2,348,020,452,072 (42 bits);
+        // it must prepare with the 43-bit window. Exactly 2^43 fails closed.
+        let gap = 2_348_020_452_072i64;
+        let base = gap + 1_000_000;
+        let make = |g: i64| -> Vec<Goldilocks> {
+            (0..2).flat_map(|_| [from_i64(base), from_i64(base - g),
+                from_i64(base - 2 * g.min(1_000_000)), from_i64(0)]).collect()
+        };
+        let mut store = Store::new();
+        let x = store.push(make(gap));
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let out = store.push_idx(vec![]);
+        let ops = vec![Op::Argmax { x, sel, thr, gate, d1, d2, out, m: 2, n: 4 }];
+        forward_ops(&mut store, &ops);
+        assert!(prepare_argmax_aux(&store, &ops).is_some(),
+            "measured Argmax gap must prepare");
+        let mut store = Store::new();
+        let x = store.push(make(1i64 << 43));
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let out = store.push_idx(vec![]);
+        let ops = vec![Op::Argmax { x, sel, thr, gate, d1, d2, out, m: 2, n: 4 }];
+        forward_ops(&mut store, &ops);
+        assert!(prepare_argmax_aux(&store, &ops).is_none(),
+            "gap 2^43 must fail closed");
     }
 
     #[test]
@@ -27470,6 +27573,61 @@ mod tests {
                 &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &e),
                 "tampered SSI execution {bad} must be rejected");
         }
+    }
+
+    /// SSI range width from measured extremes: the measured GPT-2 mdiff of
+    /// 1,075,866,322 proves with the 32-bit window (it was outside the old
+    /// 22-bit bound), while a value exactly 2^32 fails closed.
+    #[test]
+    fn ssi_range_measured_window() {
+        let (m, n, table_len, offset) = (4usize, 8usize, 16usize, 0i64);
+        let len = m * n;
+        let make_x = |big: i64| -> Vec<Goldilocks> {
+            let row = [0i64, big, -5, -4, -3, -2, -1, 0];
+            (0..m).flat_map(|_| row.iter().map(|&v| from_i64(v))).collect()
+        };
+        let mut store = Store::new();
+        let xv = make_x(-1_075_866_322);
+        let x = store.push(xv);
+        let mask = store.push(vec![Goldilocks::ZERO; len]);
+        let out = store.push_idx(vec![]);
+        let ops = vec![Op::StableSoftmaxIndex { x, mask, out, offset,
+            table_len, m, n }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops)
+            .with_index_shapes(&[(out, len)].into());
+        let aux = prepare_stable_softmax_index_aux(&store, &ops, &model)
+            .expect("measured SSI range must prepare").remove(0);
+        let desc = aux.descriptor.clone();
+        let point: Vec<Ef> = (0..len.trailing_zeros())
+            .map(|b| ef_u64(2 + b as u64)).collect();
+        let out_col: Vec<Goldilocks> = store.idx[out].iter()
+            .map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let value = ef_eval(&out_col, &point);
+        let mut tp = Transcript::new(b"ssi-range-window");
+        let (proof, _claims) = prove_reverse_stable_softmax_index(
+            &store, &ops[0], &point, value, aux, &mut tp, None)
+            .expect("measured SSI range proof");
+        let mut tv = Transcript::new(b"ssi-range-window");
+        assert!(verify_reverse_stable_softmax_index(
+            &ops[0], &point, value, &desc, &proof, &mut tv, None).is_some(),
+            "measured SSI range must verify");
+
+        // Exactly 2^32 is outside the committed range.
+        let mut store = Store::new();
+        let xv = make_x(-(1i64 << 32));
+        let x = store.push(xv);
+        let mask = store.push(vec![Goldilocks::ZERO; len]);
+        let out = store.push_idx(vec![]);
+        let ops = vec![Op::StableSoftmaxIndex { x, mask, out, offset,
+            table_len, m, n }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops)
+            .with_index_shapes(&[(out, len)].into());
+        assert!(prepare_stable_softmax_index_aux(&store, &ops, &model).is_none(),
+            "range 2^32 must fail closed");
     }
 
     /// AUDIT RED→GREEN (StableSoftmaxIndex): forged caller out claim with an

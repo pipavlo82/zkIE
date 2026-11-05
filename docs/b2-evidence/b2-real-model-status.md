@@ -116,6 +116,34 @@ Rerun on `fix/soundness-repair` after the eight per-op out-witness fixes
   `op 11` has masked=-1,073,800,612, rmax=-7,380, w=-1,071,696,080 and
   `tr_w=1,071,696,080 > 2^22`. TimesFM `op 52` likewise has
   masked=-5,849,165, rmax=1,458,654, w=-5,210,667, tr_w=5,210,667 and
-  mdiff=7,307,819, both above 2^22. The mask magnitude exceeds the SSI
-  reduction's 22-bit `w/tr_w/diff` bound. This is the next boundary and is
-  not changed in this stage.
+  mdiff=7,307,819, both above 2^22. Full-graph scans then measured the true
+  SSI maxima (GPT-2 mdiff=1,075,866,322 / tr_w=1,073,769,170; TimesFM
+  29,803,701 / 27,706,549) and `SSI_RANGE_BITS` was set to 32.
+
+- SSI range width fixed from a full scan: GPT-2 max mdiff=1,075,866,322 /
+  tr_w=1,073,769,170 (31 bits), TimesFM max mdiff=29,803,701 /
+  tr_w=27,706,549 (25 bits); `SSI_RANGE_BITS=32` covers both. The full
+  GPT-2 graph now passes SSI and LNC aux preparation.
+- Argmax range width fixed from a full scan: GPT-2 max d2 gap = max tie =
+  2,348,020,452,072 (42 bits); `ARGMAX_D2_BITS=ARGMAX_TIE_BITS=43`. The
+  first failure was gap=18,990,631,562, again well below the maximum.
+  TimesFM has no Argmax op.
+- Diagnostic markers were added to the aux-preparation and reverse-DAG fail
+  paths (`ZKIE_TRACE_PROVE=1` stage/op traces plus always-on
+  `softmax/SSI/LNC/argmax aux fail` lines), so a future boundary is no
+  longer a silent `None`.
+
+- After the measured widths (Softmax 21, SSI 32, Argmax 43), **all aux
+  preparation stages pass on both full graphs**: GPT-2 reaches
+  `commit_aux_groups aux=2181` (10 groups) and TimesFM reaches
+  `aux=4534`. LNC, Softmax, SSI and Argmax are all in the passing set.
+- The full proofs are structurally over `MAX_EFFECTIVE_OPENINGS=64`: the
+  budget charges one base opening per per-op static table, and GPT-2 has
+  144 Softmax exp-table openings + 25 LNC rsqrt openings (≥169), plus the
+  static lookup group, 16 Argmax selector openings, token binding, pooled
+  groups and weight batches. TimesFM has 320 Softmax + 20 LNC (≥340).
+  The verifiers would reject at `security_policy_ok` before any
+  cryptographic check, so the multi-hour DAG provers were stopped after
+  aux preparation. M4 per-table LogUp aggregation is the required next step
+  (it collapses the 144/320 Softmax openings and 25/20 LNC rsqrt openings
+  to one per table).

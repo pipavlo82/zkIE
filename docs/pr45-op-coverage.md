@@ -114,6 +114,45 @@ Regression `softmax_rowsum_window_measured`: S=86,741 (original failure),
 S=674,671 (measured max), and S=2^16 prove; S=2^21+1 with an error of exactly
 +2^20 (remainder 2^21) fails closed.
 
+## 2c. Measured fixed-point range limits
+
+Real graph boundaries are not guessable from the op contract; each ranged
+operator must be sized from measured extremes with one bit of margin. The
+scanners live in `models/*/examples/softmax_scan.rs` (Softmax, SSI, LNC).
+Measured over the full GPT-2 (M=16) and TimesFM (SEQ=16) graphs:
+
+| quantity | constant | coverage | measured max | margin |
+|---|---|---|---|---|
+| Softmax row sum S | `SOFTMAX_REM_BITS=21` | 2^21 = 2,097,152 | 674,671 (TimesFM op328 row15; GPT-2 573,417 op142 row15) | 3.1x |
+| SSI `mdiff = rmax-masked` | `SSI_RANGE_BITS=32` | 2^32 = 4,294,967,296 | 1,075,866,322 (GPT-2 op2090) | 4.0x |
+| SSI `tr_w = trunc-w` | `SSI_RANGE_BITS=32` | 2^32 | 1,073,769,170 (GPT-2 op2090) | 4.0x |
+| SSI `diff = trunc-idx` | `SSI_RANGE_BITS=32` | 2^32 | 1 | — |
+| LNC mean | 16-bit signed raw + 16-bit rem | mean in [-2^31, 2^31) | 319,512 (GPT-2) / 22,822 (TimesFM) | >6000x |
+| LNC out pin `out-b+2^31` | 32-bit limbs | 2^32 | 2,161,616,942 (GPT-2) / 2,148,437,433 (TimesFM) | 1.99x |
+| LNC out remainder | 2x16-bit limbs | 2^32 | range by construction | — |
+| Argmax `d2` gap | `ARGMAX_D2_BITS=43` | 2^43 = 8,796,093,022,208 | 2,348,020,452,072 (GPT-2 op2117) | 3.7x |
+| Argmax `tie` gap | `ARGMAX_TIE_BITS=43` | 2^43 | 2,348,020,452,072 (same location) | 3.7x |
+
+Every widening keeps the Boolean decomposition canonical and charges one
+extra column/claim (Softmax: +1 remainder bit; SSI: +3 range columns per
+bit). The PCS opening count K is unchanged by these width changes.
+
+**Full-graph K implication.** With per-op static-table openings still
+charged, the monolithic B2 proof exceeds the 64-opening cap before any
+cryptographic check: GPT-2 has 144 Softmax exp-table + 25 LNC rsqrt
+openings (>=169) plus Argmax selectors (16), static lookup groups, token
+binding, pooled groups and weight batches; TimesFM has 320 + 20 (>=340).
+M4 per-table LogUp aggregation is required to collapse these to one per
+table before a complete bundle can verify.
+
+**Lesson (recorded per TL):** the first failure under a given width is not
+the maximum. A full-graph scan is required before sizing a range constant;
+the 17-bit Softmax failure at S=227,312 hid rows up to 674,671; the SSI
+22-bit failure at mdiff=7.3M hid GPT-2 values above 2^30; and the Argmax
+23-bit failure at gap=18,990,631,562 hid a real maximum of
+2,348,020,452,072. Measured maxima plus one bit of margin, with a scanner
+and a boundary regression per operator, is the standing procedure.
+
 ## 3. Implementation constraints for B1
 
 - New reductions must be EF (claim points/values/terminals), integrate with
