@@ -20980,7 +20980,10 @@ mod tests {
         let c = store.push(vec![]);
         let ops = vec![Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts: e_count }];
         let whir = Whir::new_testing(5);
-        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s7-cache");
+        static S7_CACHE_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let s7_cache = format!("/tmp/zkie-s7-cache-{}-{}", std::process::id(),
+            S7_CACHE_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let cached = commit_model_weights(&store, &ops, &s7_cache);
         forward_ops(&mut store, &ops);
         let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
             .with_index_shapes(&[(expert_of, s)].into());
@@ -26364,7 +26367,12 @@ mod tests {
             cur = out;
         }
         forward_ops(&mut store, &ops);
-        let cache = std::env::temp_dir().join(format!("zkie-o7m1-{}", std::process::id()));
+        static O7M1_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let uniq = O7M1_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cache = std::env::temp_dir().join(format!(
+            "zkie-o7m1-{}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos()).unwrap_or(0), uniq));
         let cached = commit_model_weights(&store, &ops, cache.to_str().unwrap());
         let model = TrustedModelManifest::from_offline_commitment(
             &cached, &store.owned_slices(), &ops);
@@ -26429,6 +26437,7 @@ mod tests {
         eprintln!("O7-M1 synthetic: old_K={} aux_groups={} group_cols={} (M2 pooling target)",
             budget.openings, plan.groups.len(),
             plan.groups.iter().map(|g| g.1).sum::<usize>());
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
     /// CI lint: no production `verify_same_poly(...).is_none()` discard
