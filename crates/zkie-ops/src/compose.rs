@@ -14832,6 +14832,22 @@ pub struct CachedWeightBatch {
     pub cache_path: std::path::PathBuf,
 }
 
+/// P1 A-table registry entry carried in the trusted manifest. Phase 1 only
+/// carries the registry; it is not absorbed into the transcript yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ATableKind { Compute, File }
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ATableEntry {
+    pub kind: ATableKind,
+    pub length: usize,
+    pub arity: usize,
+    pub file_path: Option<String>,
+    pub digest: Option<[u32; 8]>,
+}
+
 /// Caller-owned public model identity created from the trusted offline commit.
 /// It must be persisted and supplied independently of the incoming proof.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -14842,6 +14858,9 @@ pub struct TrustedModelManifest {
     lookup_roots: std::collections::BTreeMap<T, zkie_core::pcs::whir::Commitment>,
     lookup_lengths: std::collections::BTreeMap<T, usize>,
     identity_tables: std::collections::BTreeMap<T, usize>,
+    /// P1 A-table registry (Phase 1: carried only, not absorbed).
+    #[serde(default)]
+    pub a_tables: std::collections::BTreeMap<T, ATableEntry>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -14859,7 +14878,33 @@ struct TrustedWeightBatch {
     chunk_index: usize,
 }
 
+/// Phase 1 zero-risk transcript view: exactly the pre-P1 manifest fields in
+/// their original declaration order. `a_tables` is deliberately excluded so
+/// adding the carried registry does not change proof bytes or transcripts.
+#[derive(serde::Serialize)]
+struct TrustedModelTranscriptView<'a> {
+    batches: &'a [TrustedWeightBatch],
+    graph: &'a [u8],
+    tensor_lengths: &'a std::collections::BTreeMap<T, usize>,
+    lookup_roots: &'a std::collections::BTreeMap<T, zkie_core::pcs::whir::Commitment>,
+    lookup_lengths: &'a std::collections::BTreeMap<T, usize>,
+    identity_tables: &'a std::collections::BTreeMap<T, usize>,
+}
+
 impl TrustedModelManifest {
+    /// Canonical transcript bytes fixed at the 712f513 baseline. Phase 1 must
+    /// not absorb `a_tables`; Phase 2 will add a separate digest absorption.
+    pub fn transcript_bytes(&self) -> Option<Vec<u8>> {
+        bincode::serialize(&TrustedModelTranscriptView {
+            batches: &self.batches,
+            graph: &self.graph,
+            tensor_lengths: &self.tensor_lengths,
+            lookup_roots: &self.lookup_roots,
+            lookup_lengths: &self.lookup_lengths,
+            identity_tables: &self.identity_tables,
+        }).ok()
+    }
+
     pub fn from_offline_commitment(cached: &[CachedWeightBatch], tables: &[&[Goldilocks]], ops: &[Op]) -> Self {
         let mut tensor_lengths = std::collections::BTreeMap::new();
         for op in ops {
@@ -14958,7 +15003,7 @@ impl TrustedModelManifest {
             security: b.security, pow_bits: b.pow_bits,
             table_ids: b.table_ids.clone(), tensor_lengths: b.tensor_lengths.clone(),
             chunk_bits: b.chunk_bits, chunk_index: b.chunk_index,
-        }).collect(), graph: bincode::serialize(ops).expect("serialize op graph"), tensor_lengths, lookup_roots, lookup_lengths, identity_tables }
+        }).collect(), graph: bincode::serialize(ops).expect("serialize op graph"), tensor_lengths, lookup_roots, lookup_lengths, identity_tables, a_tables: Default::default() }
     }
 
     /// Attach caller-trusted index-tensor lengths from the offline model schema.
@@ -17206,7 +17251,7 @@ fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &Trusted
     // length, arity, columns); roots are bound below via bincode(aux).
     if !validate_aux_descriptors(ops, model, aux) { return None; }
     let mut transcript = Transcript::new(b"zkie-bound-execution-v1");
-    transcript.absorb(&bincode::serialize(model).ok()?);
+    transcript.absorb(&model.transcript_bytes()?);
     transcript.absorb(&bincode::serialize(execution).ok()?);
     transcript.absorb(&bincode::serialize(aux).ok()?);
     if validate_aux_plan(ops, model, aux_groups).is_none() { return None; }
@@ -17252,7 +17297,7 @@ fn token_binding_challenge(
 ) -> Vec<Ef> {
     let mut ts = Transcript::new(b"zkie-committed-public-v1");
     ts.absorb(&bincode::serialize(statement).unwrap());
-    ts.absorb(&bincode::serialize(model).unwrap());
+    ts.absorb(&model.transcript_bytes().unwrap());
     ts.absorb(&bincode::serialize(execution).unwrap());
     absorb_statement(&mut ts, ops, ops_per_shard);
     for a in aux {
@@ -27264,6 +27309,81 @@ mod tests {
         (ops, whir, model, execution, bytes)
     }
 
+    fn p1_fnv64(bytes: &[u8]) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    /// P1 Phase 1 hard baseline: with an empty A-registry, the S8 fixture's
+    /// proof bytes and the manifest transcript bytes are byte-identical to
+    /// 712f513 (length + FNV-1a frozen here). Any accidental absorption of
+    /// `a_tables` into the transcript changes the transcript hash and fails.
+    /// Phase 2 digest absorption is expected to update this test deliberately.
+    #[test]
+    fn p1_phase1_frozen_baseline_bytes() {
+        let (_ops, _whir, model, _execution, bytes) = s8_bound_fixture(0x5903);
+        assert!(model.a_tables.is_empty(), "fixture manifest must carry no A-registry");
+        let transcript = model.transcript_bytes().expect("manifest transcript");
+        assert_eq!(transcript.len(), 348, "transcript length differs from 712f513");
+        assert_eq!(p1_fnv64(&transcript), 0x9e74faf818ed0523,
+            "transcript bytes differ from 712f513");
+        assert_eq!(bytes.len(), 9085, "proof length differs from 712f513");
+        assert_eq!(p1_fnv64(&bytes), 0x9d2e67cdfa963c2f,
+            "proof bytes differ from 712f513");
+    }
+
+    /// P1 Phase 1: the manifest (including the A-registry) survives a bincode
+    /// roundtrip, and a populated registry is deliberately NOT absorbed into
+    /// the transcript in Phase 1.
+    #[test]
+    fn p1_phase1_manifest_a_tables_serde_roundtrip() {
+        let (_ops, _whir, model, _execution, _bytes) = s8_bound_fixture(0x5903);
+        let mut carried = model.clone();
+        carried.a_tables.insert(7, ATableEntry {
+            kind: ATableKind::File,
+            length: 1024,
+            arity: 10,
+            file_path: Some("tables/rsqrt.bin".to_string()),
+            digest: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+        });
+        carried.a_tables.insert(9, ATableEntry {
+            kind: ATableKind::Compute,
+            length: 2048,
+            arity: 11,
+            file_path: None,
+            digest: None,
+        });
+        let ser = bincode::serialize(&carried).expect("serialize manifest");
+        let back: TrustedModelManifest = bincode::deserialize(&ser).expect("deserialize manifest");
+        assert_eq!(back.a_tables.len(), 2);
+        assert_eq!(back.a_tables[&7], carried.a_tables[&7]);
+        assert_eq!(back.a_tables[&9], carried.a_tables[&9]);
+        assert_eq!(back.transcript_bytes().unwrap(), model.transcript_bytes().unwrap(),
+            "Phase 1 must not absorb the A-registry into the transcript");
+    }
+
+    /// P1 Phase 1: the bundle version is 5, and a version-4 bundle is rejected
+    /// before the proof is decoded (no silent reinterpretation).
+    #[test]
+    fn p1_phase1_v4_bundle_is_rejected() {
+        use crate::bundle::{write_proof, PublicBundle, BUNDLE_VERSION};
+        assert_eq!(BUNDLE_VERSION, 5);
+        let (ops, _whir, model, execution, proof) = s8_bound_fixture(0x5903);
+        let dir = std::env::temp_dir().join(format!(
+            "zkie-p1-v4-reject-{}", std::process::id()));
+        let mut bundle = PublicBundle::new(ops, 1, PublicStatement::Generic, model, execution);
+        bundle.version = 4;
+        bundle.write(&dir).expect("write v4 bundle");
+        write_proof(&dir, &proof).expect("write proof");
+        assert!(PublicBundle::read(&dir).is_none(), "v4 bundle must not load");
+        assert!(!crate::bundle::verify_bundle_dir(&dir), "v4 bundle must not verify");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// S9 2c: the honest fixture's proof is inside both verifier caps, and
     /// its opening count is covered by the provisioned per-opening security.
     #[test]
@@ -30209,6 +30329,7 @@ mod tests {
             lookup_roots: Default::default(),
             lookup_lengths: Default::default(),
             identity_tables: Default::default(),
+            a_tables: Default::default(),
         };
         let mut rng = XorShift64::new(0x5B17);
         let f: Vec<Goldilocks> = (0..512).map(|_| rng.field()).collect();

@@ -1756,6 +1756,7 @@ dependencies = [
  "p3-maybe-rayon",
  "rayon",
  "serde",
+ "serde_json",
  "zkie-core",
 ]
 

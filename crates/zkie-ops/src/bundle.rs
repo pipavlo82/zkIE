@@ -22,7 +22,9 @@ use std::path::Path;
 /// descriptors (`AUX_LAYOUT_VERSION = 1` in compose.rs). Old bundles
 /// (version 1) are rejected; there is no silent reinterpretation.
 /// M4 adds per-table internal lookup batch openings: version 4.
-pub const BUNDLE_VERSION: u32 = 4;
+/// P1 Phase 1 adds the carried A-table registry (not yet absorbed):
+/// version 5; v4 and older are rejected.
+pub const BUNDLE_VERSION: u32 = 5;
 /// Hard cap on each serialized bundle file before decoding.
 pub const MAX_BUNDLE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
