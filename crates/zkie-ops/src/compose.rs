@@ -2058,6 +2058,9 @@ struct ReverseBroadcastScaleProof {
 struct ReverseScaleVecProof {
     prod: EfVirtualProof,
     bind: EfSamePolyProof,
+    /// Opens the committed out column at the merged same_poly point and at
+    /// the virtual out endpoint, authenticating the merged claim.
+    out_opening: EfBatchOpeningProof,
     /// log2 of the scale period, prover-supplied; the returned scale claim at
     /// this arity is authenticated upstream, which pins it unless the scale
     /// is constant.
@@ -2197,7 +2200,8 @@ fn verify_reverse_broadcast_scale(op: &Op, point: &[Ef], value: Ef,
 }
 
 fn prove_reverse_scale_vec(store: &Store, op: &Op, point: &[Ef], value: Ef,
-    transcript: &mut Transcript) -> Option<(ReverseScaleVecProof, Vec<EfClaim>)>
+    aux: PreparedAux, transcript: &mut Transcript)
+    -> Option<(ReverseScaleVecProof, Vec<EfClaim>)>
 {
     let (x, scale, out, shift) = scale_vec_dims(op)?;
     if shift != 0 { return None; }
@@ -2210,6 +2214,14 @@ fn prove_reverse_scale_vec(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let lgl = l.trailing_zeros() as usize;
     let lgs = sv.len().trailing_zeros() as usize;
     if point.len() != lgl { return None; }
+    let aux_arity = aux.descriptor.arity;
+    let aux_len = 1usize.checked_shl(aux_arity as u32)?;
+    if aux.descriptor.role != AuxRole::ScaleVecOut || aux.descriptor.len != l
+        || aux_arity < lgl || aux_arity < 5 || aux.descriptor.columns != 1
+        || aux.columns.len() != 1 || aux.columns[0].len() != aux_len
+        || aux.columns[0][..l] != ov[..] { return None; }
+    // Bind the out witness before any challenge is sampled.
+    transcript.absorb(&bincode::serialize(&aux.descriptor.commitment).ok()?);
     let scale_b: Vec<Ef> = (0..l).map(|i| Ef::from(sv[i % sv.len()])).collect();
     let q: Vec<Ef> = transcript.ef_field_vec(lgl);
     let eq = efo::eq_evals(&q);
@@ -2218,13 +2230,19 @@ fn prove_reverse_scale_vec(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let ov_ef = ef_lift(ov);
     let (prod, z) = efo::prove_virtual(&[&eq, &xv_ef, &scale_b, &ov_ef], &terms, Ef::ZERO, transcript);
     if z.len() != lgl || prod.final_evals.len() != 4 { return None; }
-    let (bind, _) = efo::prove_same_poly_ef(&ov_ef, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
+    let (bind, merged) = efo::prove_same_poly_ef(&ov_ef, &[(point.to_vec(), value), (z.clone(), prod.final_evals[3])], transcript);
+    let mut merged_point = bind.merged_point.clone();
+    merged_point.resize(aux_arity, Ef::ZERO);
+    let mut z_pad = z.clone();
+    z_pad.resize(aux_arity, Ef::ZERO);
+    let out_opening = open_aux(aux, &[0, 0],
+        &[merged_point, z_pad], &[merged, prod.final_evals[3]])?;
     let x_val = prod.final_evals[1];
     let s_val = prod.final_evals[2];
     let xk = TensorKey::Field(x).encoded()?;
     let sk = TensorKey::Field(scale).encoded()?;
     let _ = &prod;
-    Some((ReverseScaleVecProof { prod, bind, scale_arity: lgs },
+    Some((ReverseScaleVecProof { prod, bind, out_opening, scale_arity: lgs },
         vec![
             EfClaim { tensor_id: xk, point: z.clone(), value: x_val },
             EfClaim { tensor_id: sk, point: z[..lgs].to_vec(), value: s_val },
@@ -2232,22 +2250,33 @@ fn prove_reverse_scale_vec(store: &Store, op: &Op, point: &[Ef], value: Ef,
 }
 
 fn verify_reverse_scale_vec(op: &Op, point: &[Ef], value: Ef,
-    proof: &ReverseScaleVecProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
+    aux: &AuxDescriptor, proof: &ReverseScaleVecProof, transcript: &mut Transcript)
+    -> Option<Vec<EfClaim>>
 {
     let (x, scale, _out, shift) = scale_vec_dims(op)?;
     if shift != 0 { return None; }
     let lgl = point.len();
     if lgl == 0 || lgl > 30 { return None; }
     if proof.scale_arity > lgl { return None; }
+    let l = 1usize.checked_shl(lgl as u32)?;
+    if aux.role != AuxRole::ScaleVecOut || aux.len != l || aux.arity < lgl
+        || aux.arity < 5 || aux.columns != 1 { return None; }
+    transcript.absorb(&bincode::serialize(&aux.commitment).ok()?);
     let q: Vec<Ef> = transcript.ef_field_vec(lgl);
     let terms = exact_product_terms();
     let (ok, z, fc) = efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, transcript);
     if !ok || z.len() != lgl { return None; }
     let fe = &proof.prod.final_evals;
     if fe.len() != 4 || fe[0] != ef_eq_poly(&q, &z) || fc != efo::virtual_eval(&terms, fe) { return None; }
-    if efo::verify_same_poly(&proof.bind, &[(point.to_vec(), value), (z.clone(), fe[3])], transcript).is_none() {
-        { return None; }
-    }
+    let fe3 = fe[3];
+    let (merged_point, merged) = efo::verify_same_poly(&proof.bind,
+        &[(point.to_vec(), value), (z.clone(), fe3)], transcript)?;
+    let mut merged_point = merged_point;
+    merged_point.resize(aux.arity, Ef::ZERO);
+    let mut z_pad = z.clone();
+    z_pad.resize(aux.arity, Ef::ZERO);
+    if !verify_aux_open(aux, &[0, 0],
+        &[merged_point, z_pad], &[merged, fe3], &proof.out_opening) { return None; }
     let xk = TensorKey::Field(x).encoded()?;
     let sk = TensorKey::Field(scale).encoded()?;
     Some(vec![
@@ -5931,7 +5960,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecOut, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -6275,6 +6304,58 @@ fn prepare_scale_vec_remainder_aux(store: &Store, ops: &[Op], model: &TrustedMod
             op_index, role: AuxRole::ScaleVecRemainder, len, arity, columns: count, commitment,
         };
         prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+    }
+    Some(prepared)
+}
+
+/// ScaleVec shift 0 (exact product) output-witness aux. The out column is
+/// committed so the same_poly merged claim can be authenticated at the merged
+/// point (the fix for the discarded-merge output-binding hole).
+fn scale_vec_out_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, usize, usize, usize)>>
+{
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::ScaleVec { x, scale, shift, .. } = op {
+            if *shift != 0 { continue; }
+            let key = TensorKey::Field(*x).encoded()?;
+            let len = *model.tensor_lengths.get(&key)?;
+            let skey = TensorKey::Field(*scale).encoded()?;
+            let slen = *model.tensor_lengths.get(&skey)?;
+            if len == 0 || !len.is_power_of_two() || slen == 0 || !slen.is_power_of_two()
+                || len % slen != 0 { return None; }
+            specs.push((i, len, len.trailing_zeros().max(5) as usize, 1));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_scale_vec_out_aux(store: &Store, ops: &[Op])
+    -> Option<Vec<PreparedAux>>
+{
+    let mut prepared = Vec::new();
+    for (op_index, op) in ops.iter().enumerate() {
+        if let Op::ScaleVec { x, out, shift, .. } = op {
+            if *shift != 0 { continue; }
+            let xv = store.get(*x);
+            let ov = store.get(*out);
+            let len = xv.len();
+            if len == 0 || ov.len() != len || !len.is_power_of_two() { return None; }
+            let arity = len.trailing_zeros().max(5) as usize;
+            let padded = 1usize.checked_shl(arity as u32)?;
+            let mut col = vec![Goldilocks::ZERO; padded];
+            col[..len].copy_from_slice(ov);
+            let columns = vec![col];
+            let vars = arity;
+            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+            let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+            let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+            let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+            let descriptor = AuxDescriptor {
+                op_index, role: AuxRole::ScaleVecOut, len, arity, columns: 1, commitment,
+            };
+            prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+        }
     }
     Some(prepared)
 }
@@ -7071,6 +7152,10 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleVecRemainder, len, arity, cols))),
         None => return false,
     };
+    match scale_vec_out_aux_specs(ops, model) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleVecOut, len, arity, cols))),
+        None => return false,
+    };
     match scale_gate_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleGateRemainder, len, arity, cols))),
         None => return false,
@@ -7111,7 +7196,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -8121,7 +8206,8 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
             Op::ScaleVec { .. } => {
                 let (_, _, _, shift) = scale_vec_dims(op)?;
                 if shift == 0 {
-                    let (proof, incoming) = prove_reverse_scale_vec(store, op, &point, value, transcript)?;
+                    let auxp = aux.remove(&(op_index, AuxRole::ScaleVecOut))?;
+                    let (proof, incoming) = prove_reverse_scale_vec(store, op, &point, value, auxp, transcript)?;
                     for c in incoming {
                         absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                         claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -8533,7 +8619,9 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
             (Op::ScaleVec { .. }, ReverseReduction::ScaleVec { proof }) => {
                 let (_, _, _, shift) = scale_vec_dims(op)?;
                 if shift != 0 { return None; }
-                for c in verify_reverse_scale_vec(op, &point, value, proof, transcript)? {
+                let descriptor = aux.iter().find(|a| a.op_index == op_index
+                    && a.role == AuxRole::ScaleVecOut);
+                for c in verify_reverse_scale_vec(op, &point, value, descriptor?, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -15280,6 +15368,7 @@ pub fn prove_committed_shard_dag_bound(
     }
     let mut prepared = prepare_projection_aux(store, ops)?;
     prepared.extend(prepare_scale_aux(store, ops, model)?);
+    prepared.extend(prepare_scale_vec_out_aux(store, ops)?);
     prepared.extend(prepare_scale_vec_remainder_aux(store, ops, model)?);
     prepared.extend(prepare_scale_gate_aux(store, ops, model)?);
     prepared.extend(prepare_softmax_aux(store, ops, model)?);
@@ -15687,6 +15776,7 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             ReverseReduction::ScaleVec { proof } => {
                 b.virtual_proof(&proof.prod, 3)?;
                 b.same_poly(&proof.bind)?;
+                b.opening(&proof.out_opening, 2)?;
             }
             ReverseReduction::ScaleVecShifted { proof } => {
                 b.virtual_proof(&proof.prod, 3)?;
@@ -25874,7 +25964,6 @@ mod tests {
     /// merged claim, so it cannot tell f' from the real out column.
     /// Expected after the fix: rejection. Before the fix this test FAILS.
     #[test]
-    #[ignore = "AUDIT RED: forged output claim is accepted (same_poly output-binding gap); enable after fix"]
     fn audit_scale_vec_forged_output_claim_must_reject() {
         let mut store = Store::new();
         let l = 32usize;
@@ -25891,19 +25980,16 @@ mod tests {
         let forged = genuine + Ef::ONE;
 
         // Honest proof for the honest claim.
+        let aux_prove = prepare_scale_vec_out_aux(&store, &ops).expect("aux").remove(0);
+        let commitment = aux_prove.descriptor.commitment.clone();
         let mut tp = Transcript::new(b"audit-scalevec");
-        let (proof, _claims) = prove_reverse_scale_vec(
-            &store, &ops[0], &point, genuine, &mut tp).expect("honest proof");
-
-        // Replay the prover transcript state after the virtual proof.
-        let mut tp = Transcript::new(b"audit-scalevec");
-        let _q: Vec<Ef> = tp.ef_field_vec(lgl);
         let terms = exact_product_terms();
-        assert!(efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, &mut tp).0);
-        let z = _q.clone(); // placeholder; replaced below from the virtual replay
-        let _ = z;
-        // Recover z from the verifier's replay: verify_virtual returns it.
+        let (proof, _claims) = prove_reverse_scale_vec(
+            &store, &ops[0], &point, genuine, aux_prove, &mut tp).expect("honest proof");
+
+        // Replay the post-virtual transcript state (pre-bind).
         let mut tp = Transcript::new(b"audit-scalevec");
+        tp.absorb(&bincode::serialize(&commitment).unwrap());
         let _q: Vec<Ef> = tp.ef_field_vec(lgl);
         let (ok, z, _fc) = efo::verify_virtual(&proof.prod, &terms, Ef::ZERO, lgl, &mut tp);
         assert!(ok);
@@ -25933,14 +26019,16 @@ mod tests {
 
         // Sanity: the fake bind itself must verify at the same transcript state.
         let mut tchk = Transcript::new(b"audit-scalevec");
+        tchk.absorb(&bincode::serialize(&commitment).unwrap());
         let _q2: Vec<Ef> = tchk.ef_field_vec(lgl);
         let (ok2, z2, _fc2) = efo::verify_virtual(&forged_proof.prod, &terms, Ef::ZERO, lgl, &mut tchk);
         assert!(ok2 && z2 == z);
         let bind_ok = efo::verify_same_poly(&forged_proof.bind,
             &[(point.clone(), forged), (z.clone(), fe3)], &mut tchk).is_some();
         eprintln!("AUDIT bind_ok={bind_ok}");
+        let desc = prepare_scale_vec_out_aux(&store, &ops).expect("aux2").remove(0).descriptor;
         let mut tv = Transcript::new(b"audit-scalevec");
-        let got = verify_reverse_scale_vec(&ops[0], &point, forged, &forged_proof, &mut tv);
+        let got = verify_reverse_scale_vec(&ops[0], &point, forged, &desc, &forged_proof, &mut tv);
         assert!(got.is_none(),
             "AUDIT FAILURE: forged ScaleVec output claim was ACCEPTED");
     }
