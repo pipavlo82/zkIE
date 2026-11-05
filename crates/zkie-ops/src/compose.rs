@@ -279,8 +279,9 @@ fn static_lookup_groups(
     let mut groups: std::collections::BTreeMap<T, Vec<usize>> = std::collections::BTreeMap::new();
     for (i, op) in ops.iter().enumerate() {
         if let Op::Lookup { table, .. } = op {
-            if written.contains(table) || model.identity_tables.contains_key(table) {
-                continue; // dynamic / identity: unchanged per-op path
+            if written.contains(table) || model.identity_tables.contains_key(table)
+                || model.a_tables.contains_key(table) {
+                continue; // dynamic / identity / A: no PCS group or root
             }
             model.lookup_roots.get(table)?;
             model.lookup_lengths.get(table)?;
@@ -347,8 +348,9 @@ fn prepare_static_lookup_commits(
             _ => continue,
         };
         for tid in tids {
-            if written.contains(&tid) || model.identity_tables.contains_key(&tid) {
-                continue; // dynamic table or identity table: no static opening
+            if written.contains(&tid) || model.identity_tables.contains_key(&tid)
+                || model.a_tables.contains_key(&tid) {
+                continue; // dynamic / identity / A table: no static commitment
             }
             if !seen.insert(tid) {
                 continue;
@@ -3727,12 +3729,15 @@ fn internal_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
     let witness_value = ef_eval(&pairs.columns[val_col], &w_den_point);
     if w_den != alpha + witness_index + beta * witness_value { return None; }
 
-    let cached_values = store.static_table_commits.get(&table_id).map(|(v, _)| v.as_slice());
-    let table_values_owned = if cached_values.is_none() {
+    let a_values = model.a_table_values(table_id);
+    let cached_values = if a_values.is_none() {
+        store.static_table_commits.get(&table_id).map(|(v, _)| v.as_slice())
+    } else { None };
+    let table_values_owned = if a_values.is_none() && cached_values.is_none() {
         Some(pad_lookup_table(store.get(table_id)))
     } else { None };
-    let table_values: &[Goldilocks] = cached_values
-        .unwrap_or_else(|| table_values_owned.as_deref().unwrap());
+    let table_values: &[Goldilocks] = a_values.or(cached_values)
+        .or(table_values_owned.as_deref())?;
     if table_values.len() != (1usize << multiplicity.descriptor.arity) { return None; }
     let counts: Vec<u64> = multiplicity.columns[0].iter()
         .map(|&v| to_i64(v) as u64).collect();
@@ -3772,6 +3777,10 @@ fn internal_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
         &[t_num_point, padding_point], &[mult_eval, padding_value])?;
     let table_opening = if model.identity_tables.contains_key(&table_id) {
         if table_eval != lookup_index_eval(&t_den_point) { return None; }
+        None
+    } else if model.is_a_table(table_id) {
+        // A table: digest-verified values are the root of trust; no PCS
+        // commitment or opening is produced or consumed.
         None
     } else if let Some(r) = rec.as_deref_mut() {
         // M4: defer the table opening to one per-table batch proof.
@@ -3860,6 +3869,12 @@ fn internal_lookup_verify(table_id: T, pairs: &AuxDescriptor, multiplicity: &Aux
     }
     if model.identity_tables.contains_key(&table_id) {
         if proof.table_opening.is_some() || proof.table_value != lookup_index_eval(&table.q_den) {
+            return None;
+        }
+    } else if let Some(values) = model.a_table_values(table_id) {
+        // A table: the leaf evaluation is checked against the digest-verified
+        // caller-loaded values; A tables never carry a proof-side opening.
+        if proof.table_opening.is_some() || ef_eval(values, &table.q_den) != proof.table_value {
             return None;
         }
     } else if let Some(r) = rec.as_deref_mut() {
@@ -8907,7 +8922,7 @@ fn internal_lookup_member_counts(ops: &[Op], model: &TrustedModelManifest)
 {
     let mut out: std::collections::BTreeMap<T, usize> = Default::default();
     let mut add = |t: T, n: usize| {
-        if !model.identity_tables.contains_key(&t) {
+        if !model.identity_tables.contains_key(&t) && !model.a_tables.contains_key(&t) {
             *out.entry(t).or_default() += n;
         }
     };
@@ -8937,6 +8952,7 @@ fn build_internal_table_openings(rec: &AuxOpenRecorder, store: &Store,
 {
     let mut out = Vec::new();
     for tid in rec.table_ids() {
+        if model.a_tables.contains_key(&tid) { continue; }
         let claims = rec.table_claims_for(tid);
         if claims.is_empty() { continue; }
         let len = *model.lookup_lengths.get(&tid)?;
@@ -9552,17 +9568,17 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
     // per-op table-side fraction tree and its own table opening.
     // O7: reuse the once-per-proof static table commit (same trusted id);
     // otherwise fall back to the per-lookup padded table.
-    let cached_values = store
-        .static_table_commits
-        .get(&table_id)
-        .map(|(v, _)| v.as_slice());
-    let table_values_owned = if cached_values.is_none() {
+    let a_values = model.a_table_values(table_id);
+    let cached_values = if a_values.is_none() {
+        store.static_table_commits.get(&table_id).map(|(v, _)| v.as_slice())
+    } else { None };
+    let table_values_owned = if a_values.is_none() && cached_values.is_none() {
         Some(pad_lookup_table(store.get(table_id)))
     } else {
         None
     };
-    let table_values: &[Goldilocks] = cached_values
-        .unwrap_or_else(|| table_values_owned.as_deref().unwrap());
+    let table_values: &[Goldilocks] = a_values.or(cached_values)
+        .or(table_values_owned.as_deref())?;
     let m: Vec<u64> = multiplicity.columns[0].iter().map(|&v| to_i64(v) as u64).collect();
     let table_bytes = (table_values.len() * std::mem::size_of::<Goldilocks>()) as u64;
     store.o7_table_side_trees.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9602,6 +9618,9 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
         None
     } else if model.identity_tables.contains_key(&table_id) {
         if table_eval != lookup_index_eval(&t_den_point) { return None; }
+        None
+    } else if a_values.is_some() {
+        // A table: digest-verified caller values, no PCS opening.
         None
     } else if let Some(r) = rec.as_deref_mut() {
         // M4: the Softmax fake-Lookup path defers its static table opening to
@@ -9721,6 +9740,12 @@ fn verify_reverse_lookup(op: &Op, point: &[Ef], value: Ef, pairs: &AuxDescriptor
     } else if let Some(&len) = model.identity_tables.get(&table_id) {
         if model.lookup_lengths.get(&table_id) != Some(&len) || proof.table_opening.is_some()
             || proof.table_value != lookup_index_eval(&table.q_den) { return None; }
+    } else if let Some(values) = model.a_table_values(table_id) {
+        // A table: no proof-side opening; the leaf is evaluated against the
+        // digest-verified caller-loaded values.
+        if proof.table_opening.is_some() || ef_eval(values, &table.q_den) != proof.table_value {
+            return None;
+        }
     } else if let Some(r) = rec.as_deref_mut() {
         // M4: batch this table leaf with every other internal lookup of the
         // same table; checked once after the DAG.
@@ -14858,9 +14883,17 @@ pub struct TrustedModelManifest {
     lookup_roots: std::collections::BTreeMap<T, zkie_core::pcs::whir::Commitment>,
     lookup_lengths: std::collections::BTreeMap<T, usize>,
     identity_tables: std::collections::BTreeMap<T, usize>,
-    /// P1 A-table registry (Phase 1: carried only, not absorbed).
+    /// P1 A-table registry (caller copy of the model-distribution sidecar).
+    /// Phase 2: entries are authenticated by digest and never committed.
     #[serde(default)]
     pub a_tables: std::collections::BTreeMap<T, ATableEntry>,
+    /// Caller-loaded A table values, padded to `2^arity`. Never serialized.
+    #[serde(skip)]
+    pub(crate) a_table_values: std::collections::BTreeMap<T, std::sync::Arc<Vec<Goldilocks>>>,
+    /// Effective digests: sidecar value, or the verifier-computed digest for a
+    /// `compute` entry whose sidecar line has none. Never serialized.
+    #[serde(skip)]
+    pub(crate) a_table_digests: std::collections::BTreeMap<T, [u32; 8]>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -14903,6 +14936,68 @@ impl TrustedModelManifest {
             lookup_lengths: &self.lookup_lengths,
             identity_tables: &self.identity_tables,
         }).ok()
+    }
+
+    pub fn is_a_table(&self, id: T) -> bool { self.a_tables.contains_key(&id) }
+
+    /// Padded A table values installed by the caller from the digest-verified
+    /// model distribution. Never read from the proof or the bundle.
+    pub fn a_table_values(&self, id: T) -> Option<&[Goldilocks]> {
+        self.a_table_values.get(&id).map(|v| v.as_slice())
+    }
+
+    pub fn effective_a_digest(&self, id: T) -> Option<[u32; 8]> {
+        self.a_table_digests.get(&id).copied()
+    }
+
+    pub fn lookup_length(&self, id: T) -> Option<usize> {
+        self.lookup_lengths.get(&id).copied()
+    }
+
+    pub(crate) fn is_identity_table_id(&self, id: T) -> bool {
+        self.identity_tables.contains_key(&id)
+    }
+
+    /// Install the caller-loaded registry and values. A-table ids leave the
+    /// PCS rooting path here; their logical lengths stay in `lookup_lengths`
+    /// because reductions and aux plans still need the table shape.
+    pub fn install_a_tables(
+        &mut self,
+        entries: std::collections::BTreeMap<T, ATableEntry>,
+        values: std::collections::BTreeMap<T, std::sync::Arc<Vec<Goldilocks>>>,
+        digests: std::collections::BTreeMap<T, [u32; 8]>,
+    ) -> Option<()> {
+        if values.len() != entries.len() || digests.len() != entries.len() { return None; }
+        for (&id, e) in &entries {
+            if e.length == 0 || e.arity >= usize::BITS as usize
+                || *self.lookup_lengths.get(&id)? != e.length
+                || table_pad_arity(e.length)? != e.arity { return None; }
+            let vals = values.get(&id)?;
+            if vals.len() != 1usize.checked_shl(e.arity as u32)? { return None; }
+            digests.get(&id)?;
+        }
+        for id in entries.keys() { self.lookup_roots.remove(id); }
+        self.a_tables = entries;
+        self.a_table_values = values;
+        self.a_table_digests = digests;
+        Some(())
+    }
+
+    /// P1 Phase 2: absorb the effective A digest set after `bincode(model)`
+    /// and before execution/aux/groups/statement. File paths are not
+    /// absorbed; the digest is the security-relevant value.
+    fn absorb_a_tables(&self, transcript: &mut Transcript) -> Option<()> {
+        transcript.absorb(b"zkie-p1-a-tables-v1");
+        transcript.absorb_u64(self.a_tables.len() as u64);
+        for (&id, e) in &self.a_tables {
+            let digest = self.a_table_digests.get(&id)?;
+            transcript.absorb_u64(id as u64);
+            transcript.absorb_u64(match e.kind { ATableKind::Compute => 0, ATableKind::File => 1 });
+            transcript.absorb_u64(e.length as u64);
+            transcript.absorb_u64(e.arity as u64);
+            for w in digest { transcript.absorb_u64(*w as u64); }
+        }
+        Some(())
     }
 
     pub fn from_offline_commitment(cached: &[CachedWeightBatch], tables: &[&[Goldilocks]], ops: &[Op]) -> Self {
@@ -15003,7 +15098,7 @@ impl TrustedModelManifest {
             security: b.security, pow_bits: b.pow_bits,
             table_ids: b.table_ids.clone(), tensor_lengths: b.tensor_lengths.clone(),
             chunk_bits: b.chunk_bits, chunk_index: b.chunk_index,
-        }).collect(), graph: bincode::serialize(ops).expect("serialize op graph"), tensor_lengths, lookup_roots, lookup_lengths, identity_tables, a_tables: Default::default() }
+        }).collect(), graph: bincode::serialize(ops).expect("serialize op graph"), tensor_lengths, lookup_roots, lookup_lengths, identity_tables, a_tables: Default::default(), a_table_values: Default::default(), a_table_digests: Default::default() }
     }
 
     /// Attach caller-trusted index-tensor lengths from the offline model schema.
@@ -17238,7 +17333,8 @@ fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &Trusted
         reads.extend(op_reads);
     }
     let weights: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
-    let expected_inputs: std::collections::BTreeSet<_> = reads.difference(&writes).copied().filter(|t| !weights.contains(t)).collect();
+    let expected_inputs: std::collections::BTreeSet<_> = reads.difference(&writes).copied()
+        .filter(|t| !weights.contains(t) && !model.a_tables.contains_key(t)).collect();
     let expected_outputs: std::collections::BTreeSet<_> = writes.difference(&reads).copied().collect();
     if expected_outputs.is_empty()
         || execution.inputs.keys().copied().collect::<std::collections::BTreeSet<_>>() != expected_inputs
@@ -17252,6 +17348,7 @@ fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &Trusted
     if !validate_aux_descriptors(ops, model, aux) { return None; }
     let mut transcript = Transcript::new(b"zkie-bound-execution-v1");
     transcript.absorb(&model.transcript_bytes()?);
+    model.absorb_a_tables(&mut transcript)?;
     transcript.absorb(&bincode::serialize(execution).ok()?);
     transcript.absorb(&bincode::serialize(aux).ok()?);
     if validate_aux_plan(ops, model, aux_groups).is_none() { return None; }
@@ -20152,6 +20249,75 @@ mod tests {
         let (s3, o3, m3) = build(32, 4, 1 << 24);
         assert!(scale_vec_remainder_aux_specs(&o3, &m3).is_some());
         assert!(prepare_scale_vec_remainder_aux(&s3, &o3, &m3).is_none());
+    }
+
+    /// P1 Phase 2: an A-class lookup table (digest-verified caller values)
+    /// leaves the PCS path: no lookup root, no group, no internal-table
+    /// opening. Honest proof verifies; changed values or a changed digest
+    /// reject.
+    #[test]
+    fn p1_a_table_lookup_no_pcs_and_digest_bound() {
+        use crate::tables::{hash_a_table, LoadedATables};
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)]);
+        let w = store.push(vec![from_i64(1), from_i64(0), from_i64(0), from_i64(1)]);
+        let bias = store.push(vec![Goldilocks::ZERO; 4]);
+        let p1 = store.push(vec![]);
+        let r1 = store.push(vec![]);
+        let table_vals = vec![from_i64(1), from_i64(3), from_i64(5), from_i64(7)];
+        let table = store.push(table_vals.clone());
+        let lookup = store.push(vec![]);
+        let p2 = store.push(vec![]);
+        let r2 = store.push(vec![]);
+        let out = store.push(vec![]);
+        let idx = store.push_idx(vec![]);
+        let ops = vec![
+            Op::Projection { x, w, bias, out: p1, rem: r1, m: 2, k: 2, n: 2, shift: 3 },
+            Op::GeluIndex { x: p1, out: idx, offset: 2, table_len: 4 },
+            Op::Lookup { idx, out: lookup, table },
+            Op::Projection { x: lookup, w, bias, out: p2, rem: r2, m: 2, k: 2, n: 2, shift: 1 },
+            Op::Add { a: p2, b: x, c: out },
+        ];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
+        let path = std::env::temp_dir().join("zkie-p1-a-lookup");
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let mut model = TrustedModelManifest::from_offline_commitment(
+            &cache, &store.owned_slices(), &ops).with_index_shapes(&[(idx, 4usize)].into());
+        let logical = table_vals.clone();
+        let digest = hash_a_table(table, logical.len(), 5, &logical);
+        let mut padded = logical;
+        padded.resize(32, Goldilocks::ZERO);
+        let entries = [(table, ATableEntry {
+            kind: ATableKind::File, length: 4, arity: 5,
+            file_path: Some("t.bin".to_string()), digest: Some(digest),
+        })].into_iter().collect();
+        let values = [(table, std::sync::Arc::new(padded))].into_iter().collect();
+        let digests = [(table, digest)].into_iter().collect();
+        LoadedATables { entries, values, digests }.install(&mut model).expect("install A");
+        assert!(!model.lookup_roots.contains_key(&table), "A root must be removed");
+        assert!(static_lookup_groups(&ops, &model).unwrap().is_empty());
+        assert!(internal_lookup_member_counts(&ops, &model).is_empty());
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec())].into(),
+            outputs: [(out, vec![from_i64(-10), from_i64(-1), from_i64(8), from_i64(16)])].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("A lookup proof");
+        assert!(proof.internal_table_openings.is_empty(), "A table must not open");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+
+        let mut bad_values = model.clone();
+        std::sync::Arc::make_mut(bad_values.a_table_values.get_mut(&table).unwrap())[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &bad_values, &execution),
+            "changed A values must be rejected");
+
+        let mut bad_digest = model.clone();
+        bad_digest.a_table_digests.insert(table, [7u32; 8]);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &bad_digest, &execution),
+            "changed A digest must shift the challenge and reject");
     }
 
     #[test]
@@ -27318,11 +27484,11 @@ mod tests {
         h
     }
 
-    /// P1 Phase 1 hard baseline: with an empty A-registry, the S8 fixture's
-    /// proof bytes and the manifest transcript bytes are byte-identical to
-    /// 712f513 (length + FNV-1a frozen here). Any accidental absorption of
-    /// `a_tables` into the transcript changes the transcript hash and fails.
-    /// Phase 2 digest absorption is expected to update this test deliberately.
+    /// P1 Phase 2 frozen bytes (empty A-registry fixture). The manifest
+    /// transcript bytes are unchanged from 712f513; the proof transcript now
+    /// absorbs the unconditional `zkie-p1-a-tables-v1` tag + zero entries and
+    /// therefore has a new Phase 2 hash. Any future A-path change must update
+    /// this test deliberately and explain the delta.
     #[test]
     fn p1_phase1_frozen_baseline_bytes() {
         let (_ops, _whir, model, _execution, bytes) = s8_bound_fixture(0x5903);
@@ -27331,9 +27497,9 @@ mod tests {
         assert_eq!(transcript.len(), 348, "transcript length differs from 712f513");
         assert_eq!(p1_fnv64(&transcript), 0x9e74faf818ed0523,
             "transcript bytes differ from 712f513");
-        assert_eq!(bytes.len(), 9085, "proof length differs from 712f513");
-        assert_eq!(p1_fnv64(&bytes), 0x9d2e67cdfa963c2f,
-            "proof bytes differ from 712f513");
+        assert_eq!(bytes.len(), 9085, "proof length changed");
+        assert_eq!(p1_fnv64(&bytes), 0xff4557eaed829cc9,
+            "Phase 2 proof bytes changed unexpectedly");
     }
 
     /// P1 Phase 1: the manifest (including the A-registry) survives a bincode
@@ -28464,6 +28630,59 @@ mod tests {
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad,
             &PublicStatement::Generic, &model, &execution),
             "tampered Softmax per-table batch opening must be rejected");
+    }
+
+    /// P1 Phase 2: the Softmax exp table as an A table. The internal lookup
+    /// uses the digest-verified caller values, produces no table opening, and
+    /// leaves the lookup groups empty (A tables are not PCS-committed).
+    #[test]
+    fn p1_a_table_softmax_internal_lookup_no_opening() {
+        use crate::tables::{hash_a_table, LoadedATables};
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let (m, n) = (4usize, 8usize);
+        let len = m * n;
+        let table_vals: Vec<Goldilocks> = (0..32)
+            .map(|i| from_i64(10842 + (i % 2) as i64)).collect();
+        let table = store.push(table_vals.clone());
+        let idx = store.push_idx((0..len)
+            .map(|i| [1u32, 1, 1, 1, 1, 0, 0, 0][i % 8]).collect());
+        let e = store.push(vec![Goldilocks::ZERO; len]);
+        let out = store.push(vec![Goldilocks::ZERO; len]);
+        let ops = vec![Op::Softmax { idx, e, out, table, m, n }];
+        forward_ops(&mut store, &ops);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-p1-a-softmax");
+        let mut model = TrustedModelManifest::from_offline_commitment(
+            &cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, len)].into());
+        let digest = hash_a_table(table, 32, 5, &table_vals);
+        let entries = [(table, ATableEntry {
+            kind: ATableKind::File, length: 32, arity: 5,
+            file_path: Some("exp.bin".to_string()), digest: Some(digest),
+        })].into_iter().collect();
+        let values = [(table, std::sync::Arc::new(table_vals.clone()))].into_iter().collect();
+        let digests = [(table, digest)].into_iter().collect();
+        LoadedATables { entries, values, digests }.install(&mut model).expect("install A");
+        assert!(static_lookup_groups(&ops, &model).unwrap().is_empty());
+        assert!(internal_lookup_member_counts(&ops, &model).is_empty());
+        let idx_g: Vec<Goldilocks> = store.idx[idx].iter()
+            .map(|&x| Goldilocks::from_u64(x as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(TensorKey::Index(idx).encoded().unwrap(), idx_g)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let whir = Whir::new_testing(5);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir,
+            &cached, 0, 0, &PublicStatement::Generic, &model, &execution)
+            .expect("A Softmax proof");
+        assert!(proof.internal_table_openings.is_empty(), "A exp must not open");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+        let mut bad = model.clone();
+        std::sync::Arc::make_mut(bad.a_table_values.get_mut(&table).unwrap())[1] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &bad, &execution),
+            "changed exp values must be rejected");
     }
 
     /// AUDIT (LNC): a malicious prover keeps the honest virtual proofs and
@@ -30330,6 +30549,8 @@ mod tests {
             lookup_lengths: Default::default(),
             identity_tables: Default::default(),
             a_tables: Default::default(),
+            a_table_values: Default::default(),
+            a_table_digests: Default::default(),
         };
         let mut rng = XorShift64::new(0x5B17);
         let f: Vec<Goldilocks> = (0..512).map(|_| rng.field()).collect();

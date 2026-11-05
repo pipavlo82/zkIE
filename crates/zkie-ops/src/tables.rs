@@ -1,4 +1,4 @@
-//! P1 Phase 1: `tables.meta` sidecar parser skeleton.
+//! P1 Phase 2: `tables.meta` sidecar loading and A-table authentication.
 //!
 //! The sidecar is a JSON document distributed with the model:
 //!
@@ -6,27 +6,42 @@
 //! {
 //!   "version": 1,
 //!   "tables": [
-//!     { "table_id": 7, "kind": "file", "length": 7340032, "arity": 23,
-//!       "file_path": "tables/rsqrt_table_i32.bin", "digest": [1,2,3,4,5,6,7,8] },
-//!     { "table_id": 9, "kind": "compute", "length": 2097152, "arity": 21,
-//!       "file_path": null, "digest": null }
+//!     { "table_id": 5, "kind": "file", "length": 7340032, "arity": 23,
+//!       "file_path": "rsqrt_table_i32.bin", "digest": [1,2,3,4,5,6,7,8] },
+//!     { "table_id": 4, "kind": "compute", "length": 2097152, "arity": 21,
+//!       "file_path": null, "digest": [9,10,11,12,13,14,15,16] }
 //!   ]
 //! }
 //! ```
 //!
-//! Phase 1 only parses and validates the schema. The verifier does not consume
-//! the registry yet (lookup_roots/static_table_commits stay unchanged), and the
-//! registry is carried in `TrustedModelManifest::a_tables` without transcript
-//! absorption. Phase 2 wires loading/digest verification into the verifier.
+//! A tables are public function tables. Their values are computed by the
+//! verifier (public formula + graph parameters) or loaded from a file under
+//! the model directory; the 32-byte digest anchors them to the independently
+//! distributed sidecar. The prover never supplies a digest. Range/identity
+//! tables (row `t = t`) are not listed here; they are generated closed-form.
+//!
+//! Set-level rule: if any entry carries a digest, every entry must carry one
+//! and every computed/loaded digest must match. A `file` entry always
+//! requires a digest. A `compute` entry with no sidecar digest is allowed only
+//! when the whole A set has no digest lines; its computed digest is still
+//! recorded in the verifier-owned map used for transcript absorption.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::compose::{ATableEntry, ATableKind};
+use sha2::{Digest, Sha256};
+use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, PrimeField64};
+use zkie_core::common::fixed_point::from_i32;
+
+use crate::compose::{ATableEntry, ATableKind, Op, TrustedModelManifest, T};
 
 /// Current sidecar schema version.
 pub const TABLES_META_VERSION: u32 = 1;
+/// Digest domain separator (the hash is domain-separated and independent of
+/// the transcript hash).
+pub const A_TABLE_DIGEST_DOMAIN: &[u8] = b"zkie-a-table-v1";
 
 #[derive(Debug)]
 pub enum TableMetaError {
@@ -35,6 +50,9 @@ pub enum TableMetaError {
     UnsupportedVersion(u32),
     DuplicateTable(usize),
     InvalidEntry(String),
+    MissingSidecar(PathBuf),
+    WrongDigest(usize),
+    UnsupportedCompute(usize),
 }
 
 impl fmt::Display for TableMetaError {
@@ -42,13 +60,12 @@ impl fmt::Display for TableMetaError {
         match self {
             TableMetaError::Io(e) => write!(f, "tables.meta I/O error: {e}"),
             TableMetaError::Json(e) => write!(f, "tables.meta JSON error: {e}"),
-            TableMetaError::UnsupportedVersion(v) => {
-                write!(f, "unsupported tables.meta version {v}")
-            }
-            TableMetaError::DuplicateTable(id) => {
-                write!(f, "duplicate tables.meta entry for table {id}")
-            }
+            TableMetaError::UnsupportedVersion(v) => write!(f, "unsupported tables.meta version {v}"),
+            TableMetaError::DuplicateTable(id) => write!(f, "duplicate tables.meta entry for table {id}"),
             TableMetaError::InvalidEntry(msg) => write!(f, "invalid tables.meta entry: {msg}"),
+            TableMetaError::MissingSidecar(p) => write!(f, "missing tables.meta sidecar {}", p.display()),
+            TableMetaError::WrongDigest(id) => write!(f, "A table {id} digest mismatch"),
+            TableMetaError::UnsupportedCompute(id) => write!(f, "A table {id} has no supported compute formula"),
         }
     }
 }
@@ -132,8 +149,8 @@ pub fn parse_tables_meta_str(text: &str)
     Ok(out)
 }
 
-/// Load `<model_dir>/tables.meta`. A missing file is the current empty-registry
-/// behavior; malformed text or schema errors fail closed.
+/// Load `<model_dir>/tables.meta`. A missing file is an empty registry; callers
+/// that know the graph contains required A tables reject separately.
 pub fn load_tables_meta(path: &Path)
     -> Result<BTreeMap<usize, ATableEntry>, TableMetaError>
 {
@@ -144,13 +161,219 @@ pub fn load_tables_meta(path: &Path)
     }
 }
 
+/// Digest of a logical A table: SHA-256 over a domain tag, the table identity
+/// and shape, and every canonical field element (8 bytes LE). The 32-byte
+/// output is returned as eight little-endian 32-bit words.
+pub fn hash_a_table(table_id: T, length: usize, arity: usize, values: &[Goldilocks]) -> [u32; 8] {
+    assert_eq!(values.len(), length, "A digest must cover the logical table");
+    let mut h = Sha256::new();
+    h.update(A_TABLE_DIGEST_DOMAIN);
+    h.update((table_id as u64).to_le_bytes());
+    h.update((length as u64).to_le_bytes());
+    h.update((arity as u64).to_le_bytes());
+    for v in values {
+        h.update(v.as_canonical_u64().to_le_bytes());
+    }
+    let bytes: [u8; 32] = h.finalize().into();
+    let mut words = [0u32; 8];
+    for (i, w) in words.iter_mut().enumerate() {
+        *w = u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap());
+    }
+    words
+}
+
+/// A-table values and digests loaded by the caller from the model
+/// distribution. `values` are zero-padded to `2^arity`.
+pub struct LoadedATables {
+    pub entries: BTreeMap<T, ATableEntry>,
+    pub values: BTreeMap<T, Arc<Vec<Goldilocks>>>,
+    pub digests: BTreeMap<T, [u32; 8]>,
+}
+
+impl LoadedATables {
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+
+    /// Install into a manifest: removes the A ids from the PCS root path and
+    /// stores the runtime values/digests used by the reductions.
+    pub fn install(self, model: &mut TrustedModelManifest) -> Option<()> {
+        model.install_a_tables(self.entries, self.values, self.digests)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AUsage { Exp, FileOnly, LookupFile }
+
+/// A-table ids implied by the trusted graph. `Softmax` exp is compute; norm
+/// rsqrt and RoPE cos/sin are files; a `Lookup` table is an A table only when
+/// the sidecar lists it (otherwise it stays a B table).
+fn a_usage(ops: &[Op]) -> BTreeMap<T, AUsage> {
+    let mut u = BTreeMap::new();
+    for op in ops {
+        match op {
+            Op::Softmax { table, .. } => { u.insert(*table, AUsage::Exp); }
+            Op::RmsNorm { rsqrt_table, .. } => { u.insert(*rsqrt_table, AUsage::FileOnly); }
+            Op::Layernorm { rsqrt_table, .. } => { u.insert(*rsqrt_table, AUsage::FileOnly); }
+            Op::LayerNormCentered { rsqrt_table, .. } => { u.insert(*rsqrt_table, AUsage::FileOnly); }
+            Op::RoPE { cos, sin, .. } => {
+                u.insert(*cos, AUsage::FileOnly);
+                u.insert(*sin, AUsage::FileOnly);
+            }
+            _ => {}
+        }
+    }
+    for op in ops {
+        if let Op::Lookup { table, .. } = op {
+            u.entry(*table).or_insert(AUsage::LookupFile);
+        }
+    }
+    u
+}
+
+fn field_writes(ops: &[Op]) -> BTreeSet<T> {
+    let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
+    let mut w = BTreeSet::new();
+    for op in ops {
+        for t in op.writes() { if t & tag == 0 { w.insert(t); } }
+    }
+    w
+}
+
+fn padded_arity(length: usize) -> Option<usize> {
+    if length == 0 { return None; }
+    Some(length.checked_next_power_of_two()?.max(32).trailing_zeros() as usize)
+}
+
+fn load_file_values(dir: &Path, entry: &ATableEntry) -> Result<Vec<Goldilocks>, TableMetaError> {
+    let rel = entry.file_path.as_deref().ok_or_else(|| TableMetaError::InvalidEntry(
+        "file entry without path".to_string()))?;
+    let path = dir.join(rel);
+    let bytes = std::fs::read(&path).map_err(TableMetaError::Io)?;
+    let want = entry.length.checked_mul(4).ok_or_else(|| TableMetaError::InvalidEntry(
+        "table length overflow".to_string()))?;
+    if bytes.len() != want {
+        return Err(TableMetaError::InvalidEntry(format!(
+            "table {} file length {} != {} entries", path.display(), bytes.len(), entry.length)));
+    }
+    Ok(bytes.chunks_exact(4)
+        .map(|c| from_i32(i32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect())
+}
+
+/// Compute the public exp table used by the attention softmax: index
+/// `i` maps to `x = (i - 2^21) / 2^16` in `[-32, 0]`, value
+/// `round(exp(x) * 2^16)`, clipped to the non-negative i32 range.
+fn compute_exp_values(entry: &ATableEntry) -> Result<Vec<Goldilocks>, TableMetaError> {
+    if entry.length != (1usize << 21) || entry.arity != 21 {
+        return Err(TableMetaError::UnsupportedCompute(0));
+    }
+    let scale = 65536.0f64;
+    let offset = (1usize << 21) as f64;
+    Ok((0..entry.length).map(|i| {
+        let x = ((i as f64) - offset) / scale;
+        let v = (x.exp() * scale).round_ties_even().clamp(0.0, i32::MAX as f64) as i64;
+        zkie_core::common::fixed_point::from_i64(v)
+    }).collect())
+}
+
+/// Load and authenticate the A-table set for `model` from `model_dir`.
+///
+/// Every id required by the graph must be present; every file entry must
+/// exist, have the exact logical length, and match its digest. Range/identity
+/// tables are not entries. The returned values are padded to `2^arity`.
+pub fn load_a_tables(model_dir: &Path, ops: &[Op], model: &TrustedModelManifest)
+    -> Result<LoadedATables, TableMetaError>
+{
+    let sidecar = model_dir.join("tables.meta");
+    let usage = a_usage(ops);
+    let required: Vec<T> = usage.iter()
+        .filter(|(_, u)| !matches!(u, AUsage::LookupFile))
+        .map(|(&id, _)| id).collect();
+    if !sidecar.exists() {
+        if required.is_empty() {
+            return Ok(LoadedATables { entries: BTreeMap::new(), values: BTreeMap::new(), digests: BTreeMap::new() });
+        }
+        return Err(TableMetaError::MissingSidecar(sidecar));
+    }
+    let entries = load_tables_meta(&sidecar)?;
+    let writes = field_writes(ops);
+    for &id in &required {
+        if !entries.contains_key(&id) {
+            return Err(TableMetaError::InvalidEntry(format!(
+                "missing A table {id} required by the graph")));
+        }
+    }
+    // Digest mode is a set-level property.
+    let digest_mode = entries.values().any(|e| e.digest.is_some());
+    if digest_mode && entries.values().any(|e| e.digest.is_none()) {
+        return Err(TableMetaError::InvalidEntry(
+            "set-level all-or-none: some A entries carry a digest and some do not".to_string()));
+    }
+    if !digest_mode && entries.values().any(|e| e.kind == ATableKind::File) {
+        return Err(TableMetaError::InvalidEntry(
+            "file A entries require a digest".to_string()));
+    }
+    let mut values = BTreeMap::new();
+    let mut digests = BTreeMap::new();
+    for (&id, entry) in &entries {
+        let use_kind = match usage.get(&id) {
+            Some(u) => *u,
+            None => return Err(TableMetaError::InvalidEntry(format!(
+                "table {id} is not an A table implied by the trusted graph"))),
+        };
+        if use_kind == AUsage::LookupFile && (writes.contains(&id) || model.is_identity_table_id(id)) {
+            return Err(TableMetaError::InvalidEntry(format!(
+                "table {id} is dynamic/identity and cannot be an A lookup table")));
+        }
+        let expected_logical = model.lookup_length(id).ok_or_else(|| TableMetaError::InvalidEntry(
+            format!("table {id} has no trusted lookup length")))?;
+        if entry.length != expected_logical {
+            return Err(TableMetaError::InvalidEntry(format!(
+                "table {id} length {} != trusted {}", entry.length, expected_logical)));
+        }
+        let arity = padded_arity(entry.length).ok_or_else(|| TableMetaError::InvalidEntry(
+            format!("table {id} has invalid length {}", entry.length)))?;
+        if entry.arity != arity {
+            return Err(TableMetaError::InvalidEntry(format!(
+                "table {id} arity {} != padded {}", entry.arity, arity)));
+        }
+        let (logical_values, kind_ok) = match (use_kind, entry.kind) {
+            (AUsage::Exp, ATableKind::Compute) => (compute_exp_values(entry)?, true),
+            (AUsage::Exp, ATableKind::File) => (load_file_values(model_dir, entry)?, true),
+            (AUsage::FileOnly | AUsage::LookupFile, ATableKind::File) =>
+                (load_file_values(model_dir, entry)?, true),
+            (_, _) => (Vec::new(), false),
+        };
+        if !kind_ok {
+            return Err(TableMetaError::InvalidEntry(format!(
+                "table {id} has a kind not allowed by its graph role")));
+        }
+        let digest = hash_a_table(id, entry.length, entry.arity, &logical_values);
+        if let Some(want) = entry.digest {
+            if want != digest { return Err(TableMetaError::WrongDigest(id)); }
+        }
+        let padded = 1usize.checked_shl(entry.arity as u32).ok_or_else(|| TableMetaError::InvalidEntry(
+            format!("table {id} arity overflow")))?;
+        let mut vals = logical_values;
+        vals.resize(padded, Goldilocks::ZERO);
+        values.insert(id, Arc::new(vals));
+        digests.insert(id, digest);
+    }
+    Ok(LoadedATables { entries, values, digests })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "zkie-tables-meta-{}-{name}.json", std::process::id()))
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zkie-tables-meta-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -178,17 +401,15 @@ mod tests {
 
     #[test]
     fn missing_sidecar_is_empty_registry() {
-        let path = temp_path("missing");
-        let _ = std::fs::remove_file(&path);
-        assert!(load_tables_meta(&path).expect("missing file is empty").is_empty());
+        let dir = temp_dir("missing");
+        assert!(load_tables_meta(&dir.join("tables.meta")).expect("missing file is empty").is_empty());
     }
 
     #[test]
     fn bad_json_is_rejected() {
-        let path = temp_path("bad");
-        std::fs::write(&path, "{not json").unwrap();
-        assert!(matches!(load_tables_meta(&path), Err(TableMetaError::Json(_))));
-        let _ = std::fs::remove_file(&path);
+        let dir = temp_dir("bad");
+        std::fs::write(dir.join("tables.meta"), "{not json").unwrap();
+        assert!(matches!(load_tables_meta(&dir.join("tables.meta")), Err(TableMetaError::Json(_))));
     }
 
     #[test]
@@ -227,5 +448,48 @@ mod tests {
         let unknown = r#"{"version":1,"tables":[],"extra":1}"#;
         assert!(matches!(parse_tables_meta_str(unknown),
             Err(TableMetaError::Json(_))));
+    }
+
+    #[test]
+    fn digest_is_deterministic_and_shape_bound() {
+        let vals: Vec<Goldilocks> = (0..32).map(|i| Goldilocks::from_u64(i)).collect();
+        let a = hash_a_table(3, 32, 5, &vals);
+        assert_eq!(a, hash_a_table(3, 32, 5, &vals));
+        assert_ne!(a, hash_a_table(4, 32, 5, &vals));
+        assert_ne!(a, hash_a_table(3, 32, 6, &vals));
+    }
+
+    #[test]
+    fn file_values_load_and_digest_check() {
+        let dir = temp_dir("fileload");
+        let vals: Vec<i32> = (0..32).map(|i| i - 16).collect();
+        let mut bytes = Vec::new();
+        for v in &vals { bytes.extend_from_slice(&v.to_le_bytes()); }
+        std::fs::write(dir.join("t.bin"), &bytes).unwrap();
+        let logical: Vec<Goldilocks> = vals.iter().map(|&v| from_i32(v)).collect();
+        let digest = hash_a_table(1, 32, 5, &logical);
+        let entry = ATableEntry {
+            kind: ATableKind::File, length: 32, arity: 5,
+            file_path: Some("t.bin".to_string()), digest: Some(digest),
+        };
+        let got = load_file_values(&dir, &entry).unwrap();
+        assert_eq!(got, logical);
+        assert_eq!(hash_a_table(1, 32, 5, &got), digest);
+        let bad = ATableEntry { digest: Some([0u32; 8]), ..entry };
+        assert!(matches!(load_file_values(&dir, &bad), Ok(_))); // loader does not hash
+    }
+
+    #[test]
+    fn compute_exp_matches_public_formula() {
+        let entry = ATableEntry {
+            kind: ATableKind::Compute, length: 1 << 21, arity: 21,
+            file_path: None, digest: None,
+        };
+        let vals = compute_exp_values(&entry).unwrap();
+        assert_eq!(vals.len(), 1 << 21);
+        assert_eq!(vals[0], Goldilocks::ZERO); // exp(-32) rounds to 0
+        let last = vals.last().unwrap().as_canonical_u64();
+        assert!(last > 65500 && last <= 65536, "last={last}");
+        assert!(compute_exp_values(&ATableEntry { length: 32, arity: 5, ..entry }).is_err());
     }
 }
