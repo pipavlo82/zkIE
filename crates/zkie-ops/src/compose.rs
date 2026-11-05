@@ -341,6 +341,7 @@ fn prepare_static_lookup_commits(
             // across all norm ops; commit each non-identity table once.
             Op::RmsNorm { rsqrt_table, limb_table, .. } =>
                 vec![*rsqrt_table, *limb_table],
+            Op::RoPE { range_table, .. } => vec![*range_table],
             _ => continue,
         };
         for tid in tids {
@@ -460,6 +461,10 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
         // rsqrt/limb tables are trusted static tables authenticated by the
         // manifest roots, not execution inputs.
         Op::RmsNorm { x, w, out, .. } => Some((vec![f(*x)?, f(*w)?], vec![f(*out)?])),
+        // B1: RoPE reads x and the cos/sin tables; the range table is a
+        // trusted static table authenticated by its manifest root/identity.
+        Op::RoPE { x, cos, sin, out, .. } =>
+            Some((vec![f(*x)?, f(*cos)?, f(*sin)?], vec![f(*out)?])),
         _ => None,
     }
 }
@@ -3434,11 +3439,11 @@ struct RmsAuxRefs<'a> {
 /// `pairs`, the occurrence counts in `multiplicity`, and the table is the
 /// trusted tensor `table_id` (identity or committed root). No store index
 /// tensor and no returned claim.
-fn rms_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
+fn internal_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
     multiplicity: PreparedAux, idx_col: usize, val_col: usize,
     xs: &[u32], ys: &[Goldilocks], point: &[Ef], value: Ef,
     model: &TrustedModelManifest, transcript: &mut Transcript)
-    -> Option<RmsInternalLookupProof>
+    -> Option<InternalLookupProof>
 {
     if idx_col >= 2 || val_col >= 2 || point.len() != pairs.descriptor.arity
         || pairs.descriptor.columns != 2 ||
@@ -3521,14 +3526,14 @@ fn rms_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
         if opened != table_eval { return None; }
         Some(opening)
     };
-    Some(RmsInternalLookupProof { witness, table, output_index, witness_index,
+    Some(InternalLookupProof { witness, table, output_index, witness_index,
         witness_value, multiplicity: mult_eval, table_value: table_eval, padding,
         pairs_opening, multiplicity_opening, table_opening })
 }
 
-fn rms_lookup_verify(table_id: T, pairs: &AuxDescriptor, multiplicity: &AuxDescriptor,
+fn internal_lookup_verify(table_id: T, pairs: &AuxDescriptor, multiplicity: &AuxDescriptor,
     idx_col: usize, val_col: usize, point: &[Ef], value: Ef,
-    model: &TrustedModelManifest, proof: &RmsInternalLookupProof,
+    model: &TrustedModelManifest, proof: &InternalLookupProof,
     transcript: &mut Transcript) -> Option<()>
 {
     if idx_col >= 2 || val_col >= 2 || point.len() != pairs.arity
@@ -3741,17 +3746,17 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let rsqrt_xs: Vec<u32> = (0..m)
         .map(|r| to_i64(rsqrt_pairs.columns[0][r]) as u32).collect();
     let rsqrt_ys: Vec<Goldilocks> = (0..m).map(|r| rsqrt_pairs.columns[1][r]).collect();
-    let rsqrt = rms_lookup_prove(store, rsqrt_id, rsqrt_pairs, rsqrt_mult, 0, 1,
+    let rsqrt = internal_lookup_prove(store, rsqrt_id, rsqrt_pairs, rsqrt_mult, 0, 1,
         &rsqrt_xs, &rsqrt_ys, &p_rstd, out_vp.final_evals[3], model, transcript)?;
     let lo_xs: Vec<u32> = limb_lo_pairs.columns[0].iter()
         .map(|&v| to_i64(v) as u32).collect();
     let lo_ys: Vec<Goldilocks> = limb_lo_pairs.columns[0].clone();
-    let limb_lo = rms_lookup_prove(store, limb_id, limb_lo_pairs, limb_lo_mult, 0, 0,
+    let limb_lo = internal_lookup_prove(store, limb_id, limb_lo_pairs, limb_lo_mult, 0, 0,
         &lo_xs, &lo_ys, &z_out, out_vp.final_evals[5], model, transcript)?;
     let hi_xs: Vec<u32> = limb_hi_pairs.columns[1].iter()
         .map(|&v| to_i64(v) as u32).collect();
     let hi_ys: Vec<Goldilocks> = limb_hi_pairs.columns[1].clone();
-    let limb_hi = rms_lookup_prove(store, limb_id, limb_hi_pairs, limb_hi_mult, 1, 1,
+    let limb_hi = internal_lookup_prove(store, limb_id, limb_hi_pairs, limb_hi_mult, 1, 1,
         &hi_xs, &hi_ys, &z_out, out_vp.final_evals[6], model, transcript)?;
 
     let mut ridx = Vec::new();
@@ -3877,11 +3882,11 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
     let mut p_rstd = z_out[lg_d..].to_vec();
     p_rstd.resize(arity, Ef::ZERO);
 
-    rms_lookup_verify(rsqrt_id, aux.rsqrt_pairs, aux.rsqrt_mult, 0, 1, &p_rstd,
+    internal_lookup_verify(rsqrt_id, aux.rsqrt_pairs, aux.rsqrt_mult, 0, 1, &p_rstd,
         fo[3], model, &proof.rsqrt, transcript)?;
-    rms_lookup_verify(limb_id, aux.limb_lo_pairs, aux.limb_lo_mult, 0, 0, &z_out,
+    internal_lookup_verify(limb_id, aux.limb_lo_pairs, aux.limb_lo_mult, 0, 0, &z_out,
         fo[5], model, &proof.limb_lo, transcript)?;
-    rms_lookup_verify(limb_id, aux.limb_hi_pairs, aux.limb_hi_mult, 1, 1, &z_out,
+    internal_lookup_verify(limb_id, aux.limb_hi_pairs, aux.limb_hi_mult, 1, 1, &z_out,
         fo[6], model, &proof.limb_hi, transcript)?;
 
     let mut ridx = Vec::new();
@@ -3903,6 +3908,401 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
         EfClaim { tensor_id: x, point: z_out.clone(), value: fo[1] },
         EfClaim { tensor_id: w, point: z_out, value: fo[2] },
     ])
+}
+
+// PR#45 B1: RoPE reverse reduction.
+//
+// Forward (rope.rs): with half = d/2, heads = len(x)/(m*d), and
+//   raw_f = x_first*cos - x_second*sin,  raw_s = x_second*cos + x_first*sin
+// (cos/sin are [m,half] broadcast over heads), out = round(raw / 2^shift)
+// with rem = raw - out*2^shift + 2^(shift-1) in [0,2^shift). Two EF virtuals
+// over the m*heads*half half-domain prove the two rounding identities. The
+// extracted half MLEs are bound to the real x/cos/sin/out tensors at the
+// virtual endpoints (x/cos/sin via returned claims, out via one same_poly),
+// and the caller's full-domain out claim is bound by the multilinear
+// interleaving identity around the half-selector bit. The two remainders are
+// range-proven by aux-only lookups into the trusted identity range table.
+struct RopeWitness {
+    rem_f: Vec<Goldilocks>,
+    rem_s: Vec<Goldilocks>,
+    mult_f: Vec<Goldilocks>,
+    mult_s: Vec<Goldilocks>,
+}
+
+fn rope_dims(op: &Op) -> Option<(T, T, T, T, T, usize, usize, u32)> {
+    match op {
+        Op::RoPE { x, cos, sin, out, range_table, m, d, shift } => {
+            if !m.is_power_of_two() || !d.is_power_of_two() || *d < 2
+                || *shift == 0 || *shift > 16 { return None; }
+            Some((*x, *cos, *sin, *out, *range_table, *m, *d, *shift))
+        }
+        _ => None,
+    }
+}
+
+fn rope_heads(store: &Store, op: &Op) -> Option<usize> {
+    let (x, _, _, _, _, m, d, _) = rope_dims(op)?;
+    let len = store.get(x).len();
+    if m.checked_mul(d)? == 0 || len % (m * d) != 0 { return None; }
+    let heads = len / (m * d);
+    if heads == 0 || !heads.is_power_of_two() { return None; }
+    Some(heads)
+}
+
+fn rope_half_arity(m: usize, heads: usize, d: usize) -> Option<usize> {
+    let half = d / 2;
+    let n = m.checked_mul(heads)?.checked_mul(half)?;
+    if n < 32 || !n.is_power_of_two() { return None; }
+    Some(n.trailing_zeros() as usize)
+}
+
+fn rope_extract(x: &[Goldilocks], m: usize, heads: usize, d: usize, second: bool)
+    -> Option<Vec<Goldilocks>>
+{
+    let half = d / 2;
+    let off = if second { half } else { 0 };
+    let mut out = Vec::with_capacity(m.checked_mul(heads)?.checked_mul(half)?);
+    for p in 0..m {
+        for h in 0..heads {
+            let base = (p * heads + h) * d + off;
+            out.extend_from_slice(&x[base..base + half]);
+        }
+    }
+    Some(out)
+}
+
+fn rope_broadcast_pair(table: &[Goldilocks], m: usize, heads: usize, d: usize)
+    -> Option<Vec<Goldilocks>>
+{
+    let half = d / 2;
+    if table.len() != m.checked_mul(half)? { return None; }
+    let mut out = Vec::with_capacity(m.checked_mul(heads)?.checked_mul(half)?);
+    for p in 0..m {
+        for _h in 0..heads {
+            out.extend_from_slice(&table[p * half..(p + 1) * half]);
+        }
+    }
+    Some(out)
+}
+
+/// Full-domain point from a half-domain point by inserting the half-selector
+/// bit `bit` at position `half_log`.
+fn rope_insert_bit(half_point: &[Ef], half_log: usize, bit: Ef) -> Vec<Ef> {
+    let mut p = Vec::with_capacity(half_point.len() + 1);
+    p.extend_from_slice(&half_point[..half_log]);
+    p.push(bit);
+    p.extend_from_slice(&half_point[half_log..]);
+    p
+}
+
+/// Remove the half-selector bit from a full-domain point.
+fn rope_remove_bit(point: &[Ef], half_log: usize) -> Option<Vec<Ef>> {
+    if point.len() <= half_log { return None; }
+    let mut p = Vec::with_capacity(point.len() - 1);
+    p.extend_from_slice(&point[..half_log]);
+    p.extend_from_slice(&point[half_log + 1..]);
+    Some(p)
+}
+
+/// Project a half-domain point to the cos/sin [m,half] domain (drop the head
+/// coordinates).
+fn rope_table_point(half_point: &[Ef], half_log: usize, head_log: usize) -> Option<Vec<Ef>> {
+    if half_point.len() < half_log.checked_add(head_log)? { return None; }
+    let mut p = Vec::with_capacity(half_point.len() - head_log);
+    p.extend_from_slice(&half_point[..half_log]);
+    p.extend_from_slice(&half_point[half_log + head_log..]);
+    Some(p)
+}
+
+/// The rounding identity for the first half. MLE indices: 0 eq, 1 x_f,
+/// 2 cos_b, 3 x_s, 4 sin_b, 5 out_f, 6 rem_f, 7 ones.
+fn rope_first_terms(g: Ef, shift: u32) -> Vec<(Ef, Vec<usize>)> {
+    let two = ef_u64(1u64 << shift);
+    let half = ef_u64(1u64 << (shift - 1));
+    vec![
+        (g, vec![0usize, 1usize, 2usize]),
+        (-g, vec![0usize, 3usize, 4usize]),
+        (-g * two, vec![0usize, 5usize]),
+        (-g, vec![0usize, 6usize]),
+        (g * half, vec![0usize, 7usize]),
+    ]
+}
+
+/// raw_s = x_s*cos + x_f*sin.
+fn rope_second_terms(g: Ef, shift: u32) -> Vec<(Ef, Vec<usize>)> {
+    let two = ef_u64(1u64 << shift);
+    let half = ef_u64(1u64 << (shift - 1));
+    vec![
+        (g, vec![0usize, 1usize, 2usize]),
+        (g, vec![0usize, 3usize, 4usize]),
+        (-g * two, vec![0usize, 5usize]),
+        (-g, vec![0usize, 6usize]),
+        (g * half, vec![0usize, 7usize]),
+    ]
+}
+
+fn build_rope_witness(store: &Store, op: &Op, model: &TrustedModelManifest)
+    -> Option<RopeWitness>
+{
+    let (x, cos, sin, out, range_table, m, d, shift) = rope_dims(op)?;
+    let heads = rope_heads(store, op)?;
+    let half = d / 2;
+    let n = m.checked_mul(heads)?.checked_mul(half)?;
+    let range_len = *model.lookup_lengths.get(&range_table)?;
+    if range_len != (1usize << shift) { return None; }
+    let (fwd_out, rem_f, rem_s) = crate::rope::rope_forward(
+        store.get(x), store.get(cos), store.get(sin), m, d, shift);
+    if fwd_out.as_slice() != store.get(out) || rem_f.len() != n || rem_s.len() != n {
+        return None;
+    }
+    let mut mult_f = vec![Goldilocks::ZERO; range_len];
+    let mut mult_s = vec![Goldilocks::ZERO; range_len];
+    for i in 0..n {
+        let a = to_i64(rem_f[i]);
+        let b = to_i64(rem_s[i]);
+        if a < 0 || (a as u64) >= range_len as u64
+            || b < 0 || (b as u64) >= range_len as u64 { return None; }
+        mult_f[a as usize] += Goldilocks::ONE;
+        mult_s[b as usize] += Goldilocks::ONE;
+    }
+    Some(RopeWitness { rem_f, rem_s, mult_f, mult_s })
+}
+
+struct RopeAux {
+    rem_f: PreparedAux,
+    rem_s: PreparedAux,
+    mult_f: PreparedAux,
+    mult_s: PreparedAux,
+}
+
+#[derive(Clone, Copy)]
+struct RopeAuxRefs<'a> {
+    rem_f: &'a AuxDescriptor,
+    rem_s: &'a AuxDescriptor,
+    mult_f: &'a AuxDescriptor,
+    mult_s: &'a AuxDescriptor,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseRopeProof {
+    first: EfVirtualProof,
+    second: EfVirtualProof,
+    bind: EfSamePolyProof,
+    v0: Ef,
+    v1: Ef,
+    rem_f: InternalLookupProof,
+    rem_s: InternalLookupProof,
+}
+
+fn prove_reverse_rope(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    aux: RopeAux, model: &TrustedModelManifest, transcript: &mut Transcript)
+    -> Option<(ReverseRopeProof, Vec<EfClaim>)>
+{
+    let (x, cos, sin, out, range_table, m, d, shift) = rope_dims(op)?;
+    let heads = rope_heads(store, op)?;
+    let half = d / 2;
+    let head_log = heads.trailing_zeros() as usize;
+    let half_log = half.trailing_zeros() as usize;
+    let n = m.checked_mul(heads)?.checked_mul(half)?;
+    let lg_n = rope_half_arity(m, heads, d)?;
+    let range_len = *model.lookup_lengths.get(&range_table)?;
+    let range_ar = table_pad_arity(range_len)?;
+    let mult_len = 1usize << range_ar;
+    if point.len() != lg_n + 1 || range_len != (1usize << shift)
+        || aux.rem_f.descriptor.role != AuxRole::RopeRemF
+        || aux.rem_f.descriptor.len != n || aux.rem_f.descriptor.arity != lg_n
+        || aux.rem_f.descriptor.columns != 2 || aux.rem_f.columns.len() != 2
+        || aux.rem_f.columns.iter().any(|c| c.len() != (1usize << lg_n))
+        || aux.rem_s.descriptor.role != AuxRole::RopeRemS
+        || aux.rem_s.descriptor.len != n || aux.rem_s.descriptor.arity != lg_n
+        || aux.rem_s.descriptor.columns != 2 || aux.rem_s.columns.len() != 2
+        || aux.rem_s.columns.iter().any(|c| c.len() != (1usize << lg_n))
+        || aux.mult_f.descriptor.role != AuxRole::RopeRemFMultiplicity
+        || aux.mult_f.descriptor.len != range_len || aux.mult_f.descriptor.arity != range_ar
+        || aux.mult_f.descriptor.columns != 1 || aux.mult_f.columns.len() != 1
+        || aux.mult_f.columns[0].len() != mult_len
+        || aux.mult_s.descriptor.role != AuxRole::RopeRemSMultiplicity
+        || aux.mult_s.descriptor.len != range_len || aux.mult_s.descriptor.arity != range_ar
+        || aux.mult_s.descriptor.columns != 1 || aux.mult_s.columns.len() != 1
+        || aux.mult_s.columns[0].len() != mult_len
+    { return None; }
+    let expected = build_rope_witness(store, op, model)?;
+    if aux.rem_f.columns != vec![expected.rem_f.clone(), expected.rem_f.clone()]
+        || aux.rem_s.columns != vec![expected.rem_s.clone(), expected.rem_s.clone()]
+        || !rms_mult_matches(&aux.mult_f.columns, &expected.mult_f)
+        || !rms_mult_matches(&aux.mult_s.columns, &expected.mult_s)
+    { return None; }
+
+    let x_f = rope_extract(store.get(x), m, heads, d, false)?;
+    let x_s = rope_extract(store.get(x), m, heads, d, true)?;
+    let cos_b = rope_broadcast_pair(store.get(cos), m, heads, d)?;
+    let sin_b = rope_broadcast_pair(store.get(sin), m, heads, d)?;
+    let out_f = rope_extract(store.get(out), m, heads, d, false)?;
+    let out_s = rope_extract(store.get(out), m, heads, d, true)?;
+    let out_ef = ef_lift(store.get(out));
+    let ones = vec![Ef::ONE; n];
+    let x_f_ef = ef_lift(&x_f);
+    let x_s_ef = ef_lift(&x_s);
+    let cos_ef = ef_lift(&cos_b);
+    let sin_ef = ef_lift(&sin_b);
+    let out_f_ef = ef_lift(&out_f);
+    let out_s_ef = ef_lift(&out_s);
+    let rem_f_ef = ef_lift(&aux.rem_f.columns[0]);
+    let rem_s_ef = ef_lift(&aux.rem_s.columns[0]);
+
+    transcript.absorb(b"zkie-rope-v1");
+    transcript.absorb_u64(m as u64);
+    transcript.absorb_u64(heads as u64);
+    transcript.absorb_u64(d as u64);
+    transcript.absorb_u64(shift as u64);
+    transcript.absorb_u64(range_len as u64);
+    let q_f = transcript.ef_field_vec(lg_n);
+    let g_f = transcript.ef_field();
+    let eq_f = efo::eq_evals(&q_f);
+    let first_terms = rope_first_terms(g_f, shift);
+    let (first, z_f) = efo::prove_virtual(
+        &[&eq_f, &x_f_ef, &cos_ef, &x_s_ef, &sin_ef, &out_f_ef, &rem_f_ef, &ones],
+        &first_terms, Ef::ZERO, transcript);
+    if z_f.len() != lg_n || first.final_evals.len() != 8 { return None; }
+
+    let q_s = transcript.ef_field_vec(lg_n);
+    let g_s = transcript.ef_field();
+    let eq_s = efo::eq_evals(&q_s);
+    let second_terms = rope_second_terms(g_s, shift);
+    let (second, z_s) = efo::prove_virtual(
+        &[&eq_s, &x_s_ef, &cos_ef, &x_f_ef, &sin_ef, &out_s_ef, &rem_s_ef, &ones],
+        &second_terms, Ef::ZERO, transcript);
+    if z_s.len() != lg_n || second.final_evals.len() != 8 { return None; }
+
+    // Caller-claim interleaving around the half-selector bit.
+    let p_half = rope_remove_bit(point, half_log)?;
+    let r_k = point[half_log];
+    let p0 = rope_insert_bit(&p_half, half_log, Ef::ZERO);
+    let p1 = rope_insert_bit(&p_half, half_log, Ef::ONE);
+    let v0 = ef_eval(store.get(out), &p0);
+    let v1 = ef_eval(store.get(out), &p1);
+    let q0 = rope_insert_bit(&z_f, half_log, Ef::ZERO);
+    let q1 = rope_insert_bit(&z_s, half_log, Ef::ONE);
+    let w_f = first.final_evals[5];
+    let w_s = second.final_evals[5];
+    let (bind, _) = efo::prove_same_poly_ef(&out_ef, &[
+        (point.to_vec(), value), (p0, v0), (p1, v1), (q0, w_f), (q1, w_s),
+    ], transcript);
+    let _ = r_k;
+
+    let RopeAux { rem_f, rem_s, mult_f, mult_s } = aux;
+    let rf_xs: Vec<u32> = rem_f.columns[0].iter().map(|&v| to_i64(v) as u32).collect();
+    let rf_ys: Vec<Goldilocks> = rem_f.columns[0].clone();
+    let rem_f_proof = internal_lookup_prove(store, range_table, rem_f, mult_f, 0, 0,
+        &rf_xs, &rf_ys, &z_f, first.final_evals[6], model, transcript)?;
+    let rs_xs: Vec<u32> = rem_s.columns[0].iter().map(|&v| to_i64(v) as u32).collect();
+    let rs_ys: Vec<Goldilocks> = rem_s.columns[0].clone();
+    let rem_s_proof = internal_lookup_prove(store, range_table, rem_s, mult_s, 0, 0,
+        &rs_xs, &rs_ys, &z_s, second.final_evals[6], model, transcript)?;
+
+    let table_p_f = rope_table_point(&z_f, half_log, head_log)?;
+    let table_p_s = rope_table_point(&z_s, half_log, head_log)?;
+    let mut claims = Vec::new();
+    for (bit, z, val) in [
+        (Ef::ZERO, &z_f, first.final_evals[1]), (Ef::ONE, &z_f, first.final_evals[3]),
+        (Ef::ZERO, &z_s, second.final_evals[3]), (Ef::ONE, &z_s, second.final_evals[1]),
+    ] {
+        claims.push(EfClaim { tensor_id: x, point: rope_insert_bit(z, half_log, bit), value: val });
+    }
+    claims.push(EfClaim { tensor_id: cos, point: table_p_f.clone(), value: first.final_evals[2] });
+    claims.push(EfClaim { tensor_id: sin, point: table_p_f, value: first.final_evals[4] });
+    claims.push(EfClaim { tensor_id: cos, point: table_p_s.clone(), value: second.final_evals[2] });
+    claims.push(EfClaim { tensor_id: sin, point: table_p_s, value: second.final_evals[4] });
+    Some((ReverseRopeProof { first, second, bind, v0, v1,
+        rem_f: rem_f_proof, rem_s: rem_s_proof }, claims))
+}
+
+fn verify_reverse_rope(op: &Op, point: &[Ef], value: Ef,
+    aux: RopeAuxRefs<'_>, model: &TrustedModelManifest,
+    proof: &ReverseRopeProof, transcript: &mut Transcript) -> Option<Vec<EfClaim>>
+{
+    let (x, cos, sin, _out, range_table, m, d, shift) = rope_dims(op)?;
+    // heads is not in the op; derive it from the trusted manifest shape.
+    let x_key = TensorKey::Field(x).encoded()?;
+    let x_len = *model.tensor_lengths.get(&x_key)?;
+    if m.checked_mul(d)? == 0 || x_len % (m * d) != 0 { return None; }
+    let heads = x_len / (m * d);
+    if heads == 0 || !heads.is_power_of_two() { return None; }
+    let half = d / 2;
+    let head_log = heads.trailing_zeros() as usize;
+    let half_log = half.trailing_zeros() as usize;
+    let n = m.checked_mul(heads)?.checked_mul(half)?;
+    let lg_n = rope_half_arity(m, heads, d)?;
+    let range_len = *model.lookup_lengths.get(&range_table)?;
+    let range_ar = table_pad_arity(range_len)?;
+    if point.len() != lg_n + 1 || range_len != (1usize << shift)
+        || aux.rem_f.role != AuxRole::RopeRemF || aux.rem_f.len != n
+        || aux.rem_f.arity != lg_n || aux.rem_f.columns != 2
+        || aux.rem_s.role != AuxRole::RopeRemS || aux.rem_s.len != n
+        || aux.rem_s.arity != lg_n || aux.rem_s.columns != 2
+        || aux.mult_f.role != AuxRole::RopeRemFMultiplicity
+        || aux.mult_f.len != range_len || aux.mult_f.arity != range_ar
+        || aux.mult_f.columns != 1
+        || aux.mult_s.role != AuxRole::RopeRemSMultiplicity
+        || aux.mult_s.len != range_len || aux.mult_s.arity != range_ar
+        || aux.mult_s.columns != 1
+        || proof.first.final_evals.len() != 8 || proof.second.final_evals.len() != 8
+    { return None; }
+    transcript.absorb(b"zkie-rope-v1");
+    transcript.absorb_u64(m as u64);
+    transcript.absorb_u64(heads as u64);
+    transcript.absorb_u64(d as u64);
+    transcript.absorb_u64(shift as u64);
+    transcript.absorb_u64(range_len as u64);
+    let q_f = transcript.ef_field_vec(lg_n);
+    let g_f = transcript.ef_field();
+    let first_terms = rope_first_terms(g_f, shift);
+    let (okf, z_f, fcf) = efo::verify_virtual(&proof.first, &first_terms, Ef::ZERO, lg_n, transcript);
+    if !okf || z_f.len() != lg_n { return None; }
+    let ff = &proof.first.final_evals;
+    if ff[0] != ef_eq_poly(&q_f, &z_f) || ff[7] != Ef::ONE
+        || fcf != efo::virtual_eval(&first_terms, ff) { return None; }
+
+    let q_s = transcript.ef_field_vec(lg_n);
+    let g_s = transcript.ef_field();
+    let second_terms = rope_second_terms(g_s, shift);
+    let (oks, z_s, fcs) = efo::verify_virtual(&proof.second, &second_terms, Ef::ZERO, lg_n, transcript);
+    if !oks || z_s.len() != lg_n { return None; }
+    let fs = &proof.second.final_evals;
+    if fs[0] != ef_eq_poly(&q_s, &z_s) || fs[7] != Ef::ONE
+        || fcs != efo::virtual_eval(&second_terms, fs) { return None; }
+
+    let p_half = rope_remove_bit(point, half_log)?;
+    let r_k = point[half_log];
+    let p0 = rope_insert_bit(&p_half, half_log, Ef::ZERO);
+    let p1 = rope_insert_bit(&p_half, half_log, Ef::ONE);
+    let q0 = rope_insert_bit(&z_f, half_log, Ef::ZERO);
+    let q1 = rope_insert_bit(&z_s, half_log, Ef::ONE);
+    if value != (Ef::ONE - r_k) * proof.v0 + r_k * proof.v1 { return None; }
+    if efo::verify_same_poly(&proof.bind, &[
+        (point.to_vec(), value), (p0, proof.v0), (p1, proof.v1),
+        (q0, ff[5]), (q1, fs[5]),
+    ], transcript).is_none() { return None; }
+
+    internal_lookup_verify(range_table, aux.rem_f, aux.mult_f, 0, 0, &z_f,
+        ff[6], model, &proof.rem_f, transcript)?;
+    internal_lookup_verify(range_table, aux.rem_s, aux.mult_s, 0, 0, &z_s,
+        fs[6], model, &proof.rem_s, transcript)?;
+
+    let table_p_f = rope_table_point(&z_f, half_log, head_log)?;
+    let table_p_s = rope_table_point(&z_s, half_log, head_log)?;
+    let mut claims = Vec::new();
+    for (bit, z, val) in [
+        (Ef::ZERO, &z_f, ff[1]), (Ef::ONE, &z_f, ff[3]),
+        (Ef::ZERO, &z_s, fs[3]), (Ef::ONE, &z_s, fs[1]),
+    ] {
+        claims.push(EfClaim { tensor_id: x, point: rope_insert_bit(z, half_log, bit), value: val });
+    }
+    claims.push(EfClaim { tensor_id: cos, point: table_p_f.clone(), value: ff[2] });
+    claims.push(EfClaim { tensor_id: sin, point: table_p_f, value: ff[4] });
+    claims.push(EfClaim { tensor_id: cos, point: table_p_s.clone(), value: fs[2] });
+    claims.push(EfClaim { tensor_id: sin, point: table_p_s, value: fs[4] });
+    Some(claims)
 }
 
 // S7c Scatter reverse reduction: the routing arrays token_id/expert_of are
@@ -4536,6 +4936,8 @@ enum ReverseReduction {
     StableSoftmaxIndex { proof: ReverseStableSoftmaxIndexProof },
     /// PR#45 B1: RMSNorm (mean-square / rsqrt lookup / rounding).
     RmsNorm { proof: ReverseRmsNormProof },
+    /// PR#45 B1: rotary position embedding (two half rounding identities).
+    RoPE { proof: ReverseRopeProof },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -5529,7 +5931,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecRemainder, ScaleGateRemainder, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -5607,7 +6009,7 @@ struct ReverseStableSoftmaxIndexProof {
 /// lookup path: witness fraction, table fraction, padding-zero virtual and
 /// the pair/multiplicity/table openings.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct RmsInternalLookupProof {
+struct InternalLookupProof {
     witness: EfFractionalProof,
     table: EfFractionalProof,
     output_index: Ef,
@@ -5629,9 +6031,9 @@ struct ReverseRmsNormProof {
     ms: EfVirtualProof,
     out: EfVirtualProof,
     bind: EfSamePolyProof,
-    rsqrt: RmsInternalLookupProof,
-    limb_lo: RmsInternalLookupProof,
-    limb_hi: RmsInternalLookupProof,
+    rsqrt: InternalLookupProof,
+    limb_lo: InternalLookupProof,
+    limb_hi: InternalLookupProof,
     row_opening: EfBatchOpeningProof,
     out_opening: EfBatchOpeningProof,
 }
@@ -6114,6 +6516,67 @@ fn prepare_rms_norm_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
         if columns.len() != cols { return None; }
         for c in &mut columns { c.resize(padded, Goldilocks::ZERO); }
         if columns.iter().any(|c| c.len() != padded) { return None; }
+        let vars = cols.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        prepared.push(PreparedAux {
+            descriptor: AuxDescriptor { op_index, role, len, arity, columns: cols, commitment },
+            columns, prover_data, protocol, whir,
+        });
+    }
+    Some(prepared)
+}
+
+fn rope_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, AuxRole, usize, usize, usize)>>
+{
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::RoPE { x, range_table, m, d, shift, .. } = op {
+            let x_len = *model.tensor_lengths.get(&TensorKey::Field(*x).encoded()?)?;
+            if m.checked_mul(*d)? == 0 || x_len % (m * d) != 0 { return None; }
+            let heads = x_len / (m * d);
+            if heads == 0 || !heads.is_power_of_two() { return None; }
+            let half = d / 2;
+            let n = m.checked_mul(heads)?.checked_mul(half)?;
+            let lg_n = rope_half_arity(*m, heads, *d)?;
+            let range_len = *model.lookup_lengths.get(range_table)?;
+            if range_len != (1usize << shift) { return None; }
+            let range_ar = table_pad_arity(range_len)?;
+            specs.push((i, AuxRole::RopeRemF, n, lg_n, 2));
+            specs.push((i, AuxRole::RopeRemS, n, lg_n, 2));
+            specs.push((i, AuxRole::RopeRemFMultiplicity, range_len, range_ar, 1));
+            specs.push((i, AuxRole::RopeRemSMultiplicity, range_len, range_ar, 1));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_rope_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<PreparedAux>>
+{
+    let specs = rope_aux_specs(ops, model)?;
+    let mut witnesses: std::collections::BTreeMap<usize, RopeWitness> = Default::default();
+    for (i, op) in ops.iter().enumerate() {
+        if matches!(op, Op::RoPE { .. }) {
+            witnesses.insert(i, build_rope_witness(store, op, model)?);
+        }
+    }
+    let mut prepared = Vec::new();
+    for (op_index, role, len, arity, cols) in specs {
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let w = witnesses.get(&op_index)?;
+        let mut columns: Vec<Vec<Goldilocks>> = match role {
+            AuxRole::RopeRemF => vec![w.rem_f.clone(), w.rem_f.clone()],
+            AuxRole::RopeRemS => vec![w.rem_s.clone(), w.rem_s.clone()],
+            AuxRole::RopeRemFMultiplicity => vec![w.mult_f.clone()],
+            AuxRole::RopeRemSMultiplicity => vec![w.mult_s.clone()],
+            _ => return None,
+        };
+        if columns.len() != cols { return None; }
+        for c in &mut columns { c.resize(padded, Goldilocks::ZERO); }
         let vars = cols.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
         let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
         let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
@@ -6620,6 +7083,10 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         Some(v) => all.extend(v),
         None => return false,
     };
+    match rope_aux_specs(ops, model) {
+        Some(v) => all.extend(v),
+        None => return false,
+    };
     match softmax_aux_specs(ops, model) {
         Some((sums, rems)) => {
             all.extend(sums.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::SoftmaxSum, len, arity, cols)));
@@ -6644,7 +7111,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -7733,6 +8200,22 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 }
                 ReverseReduction::RmsNorm { proof }
             }
+            Op::RoPE { .. } => {
+                let mut take = |role: AuxRole| aux.remove(&(op_index, role));
+                let auxp = RopeAux {
+                    rem_f: take(AuxRole::RopeRemF)?,
+                    rem_s: take(AuxRole::RopeRemS)?,
+                    mult_f: take(AuxRole::RopeRemFMultiplicity)?,
+                    mult_s: take(AuxRole::RopeRemSMultiplicity)?,
+                };
+                let (proof, incoming) = prove_reverse_rope(
+                    store, op, &point, value, auxp, model?, transcript)?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::RoPE { proof }
+            }
             Op::CombineIdx { a, b, scale, out: out_t, .. } => {
                 // S5 (reverse): out = scale*a + b at the claim point. When the
                 // verifier can replay the output (and inputs) from public
@@ -8108,6 +8591,19 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                     limb_hi_mult: find(AuxRole::RmsNormLimbHiMultiplicity)?,
                 };
                 for c in verify_reverse_rms_norm(op, &point, value, refs, model?, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+            }
+            (Op::RoPE { .. }, ReverseReduction::RoPE { proof }) => {
+                let find = |role: AuxRole| aux.iter().find(|a| a.op_index == op_index && a.role == role);
+                let refs = RopeAuxRefs {
+                    rem_f: find(AuxRole::RopeRemF)?,
+                    rem_s: find(AuxRole::RopeRemS)?,
+                    mult_f: find(AuxRole::RopeRemFMultiplicity)?,
+                    mult_s: find(AuxRole::RopeRemSMultiplicity)?,
+                };
+                for c in verify_reverse_rope(op, &point, value, refs, model?, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -14789,6 +15285,7 @@ pub fn prove_committed_shard_dag_bound(
     prepared.extend(prepare_softmax_aux(store, ops, model)?);
     prepared.extend(prepare_stable_softmax_index_aux(store, ops, model)?);
     prepared.extend(prepare_rms_norm_aux(store, ops, model)?);
+    prepared.extend(prepare_rope_aux(store, ops, model)?);
     prepared.extend(prepare_argmax_aux(store, ops)?);
     prepared.extend(prepare_expert_routing_aux(store, ops)?);
     prepared.extend(prepare_gather_routing_aux(store, ops, model)?);
@@ -15239,6 +15736,19 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 }
                 b.opening(&proof.row_opening, rms_row_claims)?;
                 b.opening(&proof.out_opening, 2)?;
+            }
+            ReverseReduction::RoPE { proof } => {
+                b.virtual_proof(&proof.first, 3)?;
+                b.virtual_proof(&proof.second, 3)?;
+                b.same_poly(&proof.bind)?;
+                for l in [&proof.rem_f, &proof.rem_s] {
+                    b.fractional(&l.witness)?;
+                    b.fractional(&l.table)?;
+                    b.virtual_proof(&l.padding, 3)?;
+                    b.opening(&l.pairs_opening, 4)?;
+                    b.opening(&l.multiplicity_opening, 2)?;
+                    if l.table_opening.is_some() { b.base_opening()?; }
+                }
             }
             ReverseReduction::LookupGroups { groups } => {
                 for g in groups {
@@ -24918,6 +25428,114 @@ mod tests {
             assert!(!verify_committed_shard_dag_bound_bytes(
                 &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &e),
                 "tampered RmsNorm execution {bad} must be rejected");
+        }
+    }
+
+    /// PR#45 B1: RoPE reverse roundtrip and tamper rejection (direct and
+    /// bound bytes entry). Two half-domain rounding identities plus the
+    /// half-selector interleaving of the full out claim.
+    #[test]
+    fn b1_rope_reverse_roundtrip_and_tamper() {
+        let mut store = Store::new();
+        let (m, heads, d, shift) = (4usize, 2usize, 8usize, 16u32);
+        let half = d / 2;
+        let len = m * heads * d;
+        let n = m * heads * half;
+        let xv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 7) % 23) - 11)).collect();
+        let cosv: Vec<Goldilocks> = (0..m * half)
+            .map(|i| from_i64(20000 + ((i as i64 * 3) % 7))).collect();
+        let sinv: Vec<Goldilocks> = (0..m * half)
+            .map(|i| from_i64(-3000 + ((i as i64 * 5) % 11))).collect();
+        let x = store.push(xv.clone());
+        let cos = store.push(cosv.clone());
+        let sin = store.push(sinv.clone());
+        let out = store.push(vec![Goldilocks::ZERO; len]);
+        let range_t = store.push((0..65536).map(|i| from_i64(i as i64)).collect());
+        let ops = vec![Op::RoPE { x, cos, sin, out, range_table: range_t,
+            m, d, shift }];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops);
+        let mut auxv = prepare_rope_aux(&store, &ops, &model).expect("rope aux");
+        let take = |v: &mut Vec<PreparedAux>, role: AuxRole| {
+            let pos = v.iter().position(|p| p.descriptor.role == role).unwrap();
+            v.remove(pos)
+        };
+        let descs = [
+            take(&mut auxv, AuxRole::RopeRemF).descriptor.clone(),
+            take(&mut auxv, AuxRole::RopeRemS).descriptor.clone(),
+            take(&mut auxv, AuxRole::RopeRemFMultiplicity).descriptor.clone(),
+            take(&mut auxv, AuxRole::RopeRemSMultiplicity).descriptor.clone(),
+        ];
+        let point: Vec<Ef> = (0..n.trailing_zeros() + 1)
+            .map(|b| ef_u64(2 + b as u64)).collect();
+        let value = ef_eval(store.get(out), &point);
+        let mut auxall = prepare_rope_aux(&store, &ops, &model).expect("rope aux2");
+        let auxp = RopeAux {
+            rem_f: take(&mut auxall, AuxRole::RopeRemF),
+            rem_s: take(&mut auxall, AuxRole::RopeRemS),
+            mult_f: take(&mut auxall, AuxRole::RopeRemFMultiplicity),
+            mult_s: take(&mut auxall, AuxRole::RopeRemSMultiplicity),
+        };
+        let mut tp = Transcript::new(b"b1-rope");
+        let (proof, claims) = prove_reverse_rope(
+            &store, &ops[0], &point, value, auxp, &model, &mut tp).expect("rope proof");
+        assert_eq!(claims.len(), 8);
+        let refs = RopeAuxRefs { rem_f: &descs[0], rem_s: &descs[1],
+            mult_f: &descs[2], mult_s: &descs[3] };
+        let mut tv = Transcript::new(b"b1-rope");
+        assert!(verify_reverse_rope(&ops[0], &point, value, refs, &model,
+            &proof, &mut tv).is_some(), "honest RoPE must verify");
+
+        let mut tv = Transcript::new(b"b1-rope");
+        assert!(verify_reverse_rope(&ops[0], &point, value + Ef::ONE, refs, &model,
+            &proof, &mut tv).is_none());
+        for which in 0..3usize {
+            let mut bad: ReverseRopeProof =
+                bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
+            match which {
+                0 => bad.first.final_evals[5] += Ef::ONE,
+                1 => bad.second.final_evals[6] += Ef::ONE,
+                _ => bad.rem_f.table_value += Ef::ONE,
+            }
+            let refs = RopeAuxRefs { rem_f: &descs[0], rem_s: &descs[1],
+                mult_f: &descs[2], mult_s: &descs[3] };
+            let mut tv = Transcript::new(b"b1-rope");
+            assert!(verify_reverse_rope(&ops[0], &point, value, refs, &model,
+                &bad, &mut tv).is_none(), "tampered RoPE field {which}");
+        }
+        let mut wrong = descs[0].clone();
+        wrong.columns += 1;
+        let refs = RopeAuxRefs { rem_f: &wrong, rem_s: &descs[1],
+            mult_f: &descs[2], mult_s: &descs[3] };
+        let mut tv = Transcript::new(b"b1-rope");
+        assert!(verify_reverse_rope(&ops[0], &point, value, refs, &model,
+            &proof, &mut tv).is_none());
+
+        // Bound bytes entry: x/cos/sin are execution inputs, out the output.
+        let execution = TrustedExecution {
+            inputs: [(x, xv), (cos, cosv), (sin, sinv)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 0);
+        let proof2 = prove_committed_shard_dag_bound(
+            &mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("RoPE bound proof");
+        assert!(proof2.aux.iter().any(|a| a.role == AuxRole::RopeRemF));
+        let bytes = bincode::serialize(&proof2).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        for bad in 0..3usize {
+            let mut e = execution.clone();
+            match bad {
+                0 => e.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE,
+                1 => e.inputs.get_mut(&cos).unwrap()[1] += Goldilocks::ONE,
+                _ => e.outputs.get_mut(&out).unwrap()[2] += Goldilocks::ONE,
+            }
+            assert!(!verify_committed_shard_dag_bound_bytes(
+                &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &e),
+                "tampered RoPE execution {bad} must be rejected");
         }
     }
 
