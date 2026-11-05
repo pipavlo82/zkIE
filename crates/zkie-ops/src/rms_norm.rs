@@ -65,7 +65,10 @@ pub fn rms_norm_forward(
         })
         .collect();
     let s_index: Vec<u32> = ms.iter().map(|&v| rsqrt_index(to_i64(v))).collect();
-    check_rsqrt_table(rsqrt_table, s_index.iter().copied().max().unwrap_or(0));
+    if check_rsqrt_table(rsqrt_table, s_index.iter().copied().max().unwrap_or(0)).is_none() {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+                Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
     let rstd: Vec<Goldilocks> = s_index.iter().map(|&i| rsqrt_table[i as usize]).collect();
     let raw: Vec<Goldilocks> = (0..m * d).map(|ij| x[ij] * rstd[ij / d] * w[ij]).collect();
     let out: Vec<Goldilocks> = (0..m * d)
@@ -102,6 +105,15 @@ pub fn prove_rms_norm(
 ) -> (RmsNormProof, Vec<u32>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>) {
     let (ms, s_index, rstd, out, rem_out, rem_lo, rem_hi, sum_sq, rem_s) =
         rms_norm_forward(x, w, rsqrt_table, m, d, n_real);
+    if ms.len() != m || rstd.len() != m || sum_sq.len() != m || rem_s.len() != m
+        || out.len() != m.checked_mul(d).unwrap_or(0) {
+        // Invalid (short) rsqrt table: fail closed without panicking.
+        let empty = VirtualProof { rounds: Vec::new(), final_evals: Vec::new() };
+        return (RmsNormProof {
+            trunc: empty.clone(), out: empty.clone(), rem_split: empty,
+            trunc_ch: Vec::new(), r_out: Vec::new(), rem_split_ch: Vec::new(),
+        }, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
 
     let d_f = Goldilocks::from_u64(n_real as u64);
     let half_d = Goldilocks::from_u64((n_real / 2) as u64);

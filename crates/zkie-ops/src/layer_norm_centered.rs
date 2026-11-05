@@ -79,7 +79,10 @@ pub fn layer_norm_forward(
         })
         .collect();
     let s_index: Vec<u32> = var.iter().map(|&v| rsqrt_index(to_i64(v))).collect();
-    check_rsqrt_table(rsqrt_table, s_index.iter().copied().max().unwrap_or(0));
+    if check_rsqrt_table(rsqrt_table, s_index.iter().copied().max().unwrap_or(0)).is_none() {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+                Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
     let rstd: Vec<Goldilocks> = s_index.iter().map(|&i| rsqrt_table[i as usize]).collect();
     let raw: Vec<Goldilocks> = (0..m * d)
         .map(|ij| centered[ij] * rstd[ij / d] * w[ij])

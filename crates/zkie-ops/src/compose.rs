@@ -3482,12 +3482,16 @@ fn table_pad_arity(len: usize) -> Option<usize> {
 
 struct RmsWitness {
     row: Vec<Vec<Goldilocks>>,
+    /// [out, rem_lo, rem_hi, out_lo, out_hi]; out_lo/out_hi are the 16-bit
+    /// limbs of out + 2^31 (signed 32-bit range pin for F2).
     out: Vec<Vec<Goldilocks>>,
     rsqrt_pairs: Vec<Vec<Goldilocks>>,
     limb_pairs: Vec<Vec<Goldilocks>>,
     rsqrt_mult: Vec<Goldilocks>,
     limb_lo_mult: Vec<Goldilocks>,
     limb_hi_mult: Vec<Goldilocks>,
+    out_limb_lo_mult: Vec<Goldilocks>,
+    out_limb_hi_mult: Vec<Goldilocks>,
 }
 
 /// Recompute the complete RmsNorm witness from the forward tensors. Shared by
@@ -3507,6 +3511,12 @@ fn build_rms_witness(store: &Store, op: &Op, model: &TrustedModelManifest)
     if rsqrt_values.len() != rsqrt_len { return None; }
     let limb_values = store.get(limb_table);
     if limb_values.len() != limb_len { return None; }
+    // F2 contract: the limb table is the 2^16 identity table. Without this,
+    // the out-limb "range" checks would not pin the integer value.
+    if limb_len != 65536 || model.identity_tables.get(&limb_table) != Some(&limb_len)
+        || limb_values.iter().enumerate().any(|(i, &v)| v != from_i64(i as i64)) {
+        return None;
+    }
     let (ms, s_index, rstd, fwd_out, _rem_out, rem_lo, rem_hi, sum_sq, rem_s) =
         rms_norm_forward(store.get(_x), store.get(_w), rsqrt_values, m, d, n_real);
     if fwd_out.as_slice() != store.get(out) || ms.len() != m || rstd.len() != m
@@ -3521,17 +3531,31 @@ fn build_rms_witness(store: &Store, op: &Op, model: &TrustedModelManifest)
         rms_row_witness(0, 0, (n_real / 2) as i64, table0, 0, n_real,
             &lay, &mut row, r)?;
     }
-    let mut out_cols = vec![vec![Goldilocks::ZERO; len]; 2];
+    let out_values = store.get(out);
+    let mut out_cols = vec![vec![Goldilocks::ZERO; len]; 5];
+    let mut out_limb_lo_mult = vec![Goldilocks::ZERO; limb_len];
+    let mut out_limb_hi_mult = vec![Goldilocks::ZERO; limb_len];
     for i in 0..len {
-        out_cols[0][i] = rem_lo[i];
-        out_cols[1][i] = rem_hi[i];
+        // Signed 32-bit pin: out_b = out + 2^31 is decomposed into two
+        // 16-bit limbs and range-checked through the identity limb table.
+        let out_b = to_i64(out_values[i]).checked_add(1i64 << 31)?;
+        if !(0..(1i64 << 32)).contains(&out_b) { return None; }
+        let lo = out_b & 0xFFFF;
+        let hi = out_b >> 16;
+        out_cols[0][i] = out_values[i];
+        out_cols[1][i] = rem_lo[i];
+        out_cols[2][i] = rem_hi[i];
+        out_cols[3][i] = from_i64(lo);
+        out_cols[4][i] = from_i64(hi);
+        out_limb_lo_mult[lo as usize] += Goldilocks::ONE;
+        out_limb_hi_mult[hi as usize] += Goldilocks::ONE;
     }
     let mut rsqrt_pairs = vec![vec![Goldilocks::ZERO; padded_rows]; 2];
     for r in 0..m {
         rsqrt_pairs[0][r] = Goldilocks::from_u64(s_index[r] as u64);
         rsqrt_pairs[1][r] = rstd[r];
     }
-    let limb_pairs = out_cols.clone();
+    let limb_pairs = vec![out_cols[1].clone(), out_cols[2].clone()];
     let mut rsqrt_mult = vec![Goldilocks::ZERO; rsqrt_len];
     for r in 0..m { rsqrt_mult[s_index[r] as usize] += Goldilocks::ONE; }
     let mut limb_lo_mult = vec![Goldilocks::ZERO; limb_len];
@@ -3547,7 +3571,8 @@ fn build_rms_witness(store: &Store, op: &Op, model: &TrustedModelManifest)
     }
     let _ = limb_values;
     Some(RmsWitness { row, out: out_cols, rsqrt_pairs, limb_pairs,
-        rsqrt_mult, limb_lo_mult, limb_hi_mult })
+        rsqrt_mult, limb_lo_mult, limb_hi_mult,
+        out_limb_lo_mult, out_limb_hi_mult })
 }
 
 struct RmsAux {
@@ -3559,6 +3584,10 @@ struct RmsAux {
     limb_lo_mult: PreparedAux,
     limb_hi_pairs: PreparedAux,
     limb_hi_mult: PreparedAux,
+    out_limb_lo_pairs: PreparedAux,
+    out_limb_lo_mult: PreparedAux,
+    out_limb_hi_pairs: PreparedAux,
+    out_limb_hi_mult: PreparedAux,
 }
 
 #[derive(Clone, Copy)]
@@ -3571,6 +3600,10 @@ struct RmsAuxRefs<'a> {
     limb_lo_mult: &'a AuxDescriptor,
     limb_hi_pairs: &'a AuxDescriptor,
     limb_hi_mult: &'a AuxDescriptor,
+    out_limb_lo_pairs: &'a AuxDescriptor,
+    out_limb_lo_mult: &'a AuxDescriptor,
+    out_limb_hi_pairs: &'a AuxDescriptor,
+    out_limb_hi_mult: &'a AuxDescriptor,
 }
 
 /// Aux-only static-table lookup: the index/value pair columns live in
@@ -3766,7 +3799,7 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
         || aux.row.columns.iter().any(|c| c.len() != padded_rows)
         || aux.out.descriptor.role != AuxRole::RmsNormOutWitness
         || aux.out.descriptor.len != len || aux.out.descriptor.arity != lg_len
-        || aux.out.descriptor.columns != 2 || aux.out.columns.len() != 2
+        || aux.out.descriptor.columns != 5 || aux.out.columns.len() != 5
         || aux.out.columns.iter().any(|c| c.len() != len)
         || aux.rsqrt_pairs.descriptor.role != AuxRole::RmsNormRsqrtPairs
         || aux.rsqrt_pairs.descriptor.len != m || aux.rsqrt_pairs.descriptor.arity != arity
@@ -3795,6 +3828,26 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
         || aux.limb_hi_mult.descriptor.arity != limb_ar
         || aux.limb_hi_mult.descriptor.columns != 1
         || aux.limb_hi_mult.columns.len() != 1 || aux.limb_hi_mult.columns[0].len() != lmult
+        || aux.out_limb_lo_pairs.descriptor.role != AuxRole::RmsNormOutLimbLoPairs
+        || aux.out_limb_lo_pairs.descriptor.len != len || aux.out_limb_lo_pairs.descriptor.arity != lg_len
+        || aux.out_limb_lo_pairs.descriptor.columns != 2
+        || aux.out_limb_lo_pairs.columns.len() != 2
+        || aux.out_limb_lo_pairs.columns.iter().any(|c| c.len() != len)
+        || aux.out_limb_hi_pairs.descriptor.role != AuxRole::RmsNormOutLimbHiPairs
+        || aux.out_limb_hi_pairs.descriptor.len != len || aux.out_limb_hi_pairs.descriptor.arity != lg_len
+        || aux.out_limb_hi_pairs.descriptor.columns != 2
+        || aux.out_limb_hi_pairs.columns.len() != 2
+        || aux.out_limb_hi_pairs.columns.iter().any(|c| c.len() != len)
+        || aux.out_limb_lo_mult.descriptor.role != AuxRole::RmsNormOutLimbLoMultiplicity
+        || aux.out_limb_lo_mult.descriptor.len != limb_len
+        || aux.out_limb_lo_mult.descriptor.arity != limb_ar
+        || aux.out_limb_lo_mult.descriptor.columns != 1
+        || aux.out_limb_lo_mult.columns.len() != 1 || aux.out_limb_lo_mult.columns[0].len() != lmult
+        || aux.out_limb_hi_mult.descriptor.role != AuxRole::RmsNormOutLimbHiMultiplicity
+        || aux.out_limb_hi_mult.descriptor.len != limb_len
+        || aux.out_limb_hi_mult.descriptor.arity != limb_ar
+        || aux.out_limb_hi_mult.descriptor.columns != 1
+        || aux.out_limb_hi_mult.columns.len() != 1 || aux.out_limb_hi_mult.columns[0].len() != lmult
     { return None; }
     let expected = build_rms_witness(store, op, model)?;
     if aux.row.columns != expected.row || aux.out.columns != expected.out
@@ -3804,8 +3857,13 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
         || !rms_mult_matches(&aux.rsqrt_mult.columns, &expected.rsqrt_mult)
         || !rms_mult_matches(&aux.limb_lo_mult.columns, &expected.limb_lo_mult)
         || !rms_mult_matches(&aux.limb_hi_mult.columns, &expected.limb_hi_mult)
+        || aux.out_limb_lo_pairs.columns != vec![expected.out[3].clone(), expected.out[4].clone()]
+        || aux.out_limb_hi_pairs.columns != vec![expected.out[3].clone(), expected.out[4].clone()]
+        || !rms_mult_matches(&aux.out_limb_lo_mult.columns, &expected.out_limb_lo_mult)
+        || !rms_mult_matches(&aux.out_limb_hi_mult.columns, &expected.out_limb_hi_mult)
     { return None; }
 
+    transcript.absorb(&bincode::serialize(&aux.out.descriptor.commitment).ok()?);
     transcript.absorb(b"zkie-rmsnorm-v1");
     transcript.absorb_u64(m as u64);
     transcript.absorb_u64(d as u64);
@@ -3854,9 +3912,12 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
 
     let q_out = transcript.ef_field_vec(lg_len);
     let g_out = transcript.ef_field();
+    let g_out2 = transcript.ef_field();
     let eq_out = efo::eq_evals(&q_out);
-    let rem_lo_ef = ef_lift(&aux.out.columns[0]);
-    let rem_hi_ef = ef_lift(&aux.out.columns[1]);
+    let rem_lo_ef = ef_lift(&aux.out.columns[1]);
+    let rem_hi_ef = ef_lift(&aux.out.columns[2]);
+    let out_lo_ef = ef_lift(&aux.out.columns[3]);
+    let out_hi_ef = ef_lift(&aux.out.columns[4]);
     let ones = vec![Ef::ONE; len];
     let two32 = ef_u64(1u64 << 32);
     let half32 = ef_u64(1u64 << 31);
@@ -3866,12 +3927,17 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
         (-g_out, vec![0usize, 5usize]),
         (-g_out * ef_u64(1u64 << 16), vec![0usize, 6usize]),
         (g_out * half32, vec![0usize, 7usize]),
+        (g_out2, vec![0usize, 4usize]),
+        (g_out2 * half32, vec![0usize]),
+        (-g_out2, vec![0usize, 8usize]),
+        (-g_out2 * ef_u64(1u64 << 16), vec![0usize, 9usize]),
     ];
     let (out_vp, z_out) = efo::prove_virtual(
-        &[&eq_out, &x_ef, &w_ef, &rstd_b, &out_ef, &rem_lo_ef, &rem_hi_ef, &ones],
+        &[&eq_out, &x_ef, &w_ef, &rstd_b, &out_ef, &rem_lo_ef, &rem_hi_ef, &ones,
+          &out_lo_ef, &out_hi_ef],
         &out_terms, Ef::ZERO, transcript);
-    if z_out.len() != lg_len || out_vp.final_evals.len() != 8 { return None; }
-    let (bind, _) = efo::prove_same_poly_ef(&out_ef,
+    if z_out.len() != lg_len || out_vp.final_evals.len() != 10 { return None; }
+    let (bind, merged) = efo::prove_same_poly_ef(&out_ef,
         &[(point.to_vec(), value), (z_out.clone(), out_vp.final_evals[4])], transcript);
 
     let mut p_sq = z_ms[lg_d..].to_vec();
@@ -3880,7 +3946,8 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
     p_rstd.resize(arity, Ef::ZERO);
 
     let RmsAux { row, out: out_aux, rsqrt_pairs, rsqrt_mult, limb_lo_pairs,
-        limb_lo_mult, limb_hi_pairs, limb_hi_mult } = aux;
+        limb_lo_mult, limb_hi_pairs, limb_hi_mult, out_limb_lo_pairs,
+        out_limb_lo_mult, out_limb_hi_pairs, out_limb_hi_mult } = aux;
     let rsqrt_xs: Vec<u32> = (0..m)
         .map(|r| to_i64(rsqrt_pairs.columns[0][r]) as u32).collect();
     let rsqrt_ys: Vec<Goldilocks> = (0..m).map(|r| rsqrt_pairs.columns[1][r]).collect();
@@ -3896,6 +3963,18 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let hi_ys: Vec<Goldilocks> = limb_hi_pairs.columns[1].clone();
     let limb_hi = internal_lookup_prove(store, limb_id, limb_hi_pairs, limb_hi_mult, 1, 1,
         &hi_xs, &hi_ys, &z_out, out_vp.final_evals[6], model, transcript)?;
+    let olo_xs: Vec<u32> = out_limb_lo_pairs.columns[0].iter()
+        .map(|&v| to_i64(v) as u32).collect();
+    let olo_ys: Vec<Goldilocks> = out_limb_lo_pairs.columns[0].clone();
+    let out_limb_lo = internal_lookup_prove(store, limb_id, out_limb_lo_pairs,
+        out_limb_lo_mult, 0, 0, &olo_xs, &olo_ys, &z_out, out_vp.final_evals[8],
+        model, transcript)?;
+    let ohi_xs: Vec<u32> = out_limb_hi_pairs.columns[1].iter()
+        .map(|&v| to_i64(v) as u32).collect();
+    let ohi_ys: Vec<Goldilocks> = out_limb_hi_pairs.columns[1].clone();
+    let out_limb_hi = internal_lookup_prove(store, limb_id, out_limb_hi_pairs,
+        out_limb_hi_mult, 1, 1, &ohi_xs, &ohi_ys, &z_out, out_vp.final_evals[9],
+        model, transcript)?;
 
     let mut ridx = Vec::new();
     let mut rpoints = Vec::new();
@@ -3907,14 +3986,17 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
     ridx.push(RMS_RSTD); rpoints.push(p_rstd.clone()); rvalues.push(out_vp.final_evals[3]);
     ridx.push(RMS_SIDX); rpoints.push(p_rstd); rvalues.push(rsqrt.output_index);
     let row_opening = open_aux(row, &ridx, &rpoints, &rvalues)?;
-    let out_opening = open_aux(out_aux, &[0, 1],
-        &[z_out.clone(), z_out.clone()],
-        &[out_vp.final_evals[5], out_vp.final_evals[6]])?;
+    let mut r_pad = bind.merged_point.clone();
+    r_pad.resize(out_aux.descriptor.arity, Ef::ZERO);
+    let out_opening = open_aux(out_aux, &[0, 1, 2, 3, 4, 0],
+        &[z_out.clone(), z_out.clone(), z_out.clone(), z_out.clone(), z_out.clone(), r_pad],
+        &[out_vp.final_evals[4], out_vp.final_evals[5], out_vp.final_evals[6],
+          out_vp.final_evals[8], out_vp.final_evals[9], merged])?;
     let x_ms = ms_vp.final_evals[2];
     let x_out = out_vp.final_evals[1];
     let w_out = out_vp.final_evals[2];
     Some((ReverseRmsNormProof { row: row_vp, ms: ms_vp, out: out_vp, bind,
-        rsqrt, limb_lo, limb_hi, row_opening, out_opening },
+        rsqrt, limb_lo, limb_hi, out_limb_lo, out_limb_hi, row_opening, out_opening },
         vec![
             EfClaim { tensor_id: x, point: z_ms, value: x_ms },
             EfClaim { tensor_id: x, point: z_out.clone(), value: x_out },
@@ -3941,7 +4023,7 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
         || aux.row.role != AuxRole::RmsNormRowWitness || aux.row.len != m
         || aux.row.arity != arity || aux.row.columns != lay.columns
         || aux.out.role != AuxRole::RmsNormOutWitness || aux.out.len != len
-        || aux.out.arity != lg_len || aux.out.columns != 2
+        || aux.out.arity != lg_len || aux.out.columns != 5
         || aux.rsqrt_pairs.role != AuxRole::RmsNormRsqrtPairs
         || aux.rsqrt_pairs.len != m || aux.rsqrt_pairs.arity != arity
         || aux.rsqrt_pairs.columns != 2
@@ -3960,9 +4042,22 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
         || aux.limb_hi_mult.role != AuxRole::RmsNormLimbHiMultiplicity
         || aux.limb_hi_mult.len != limb_len || aux.limb_hi_mult.arity != limb_ar
         || aux.limb_hi_mult.columns != 1
+        || aux.out_limb_lo_pairs.role != AuxRole::RmsNormOutLimbLoPairs
+        || aux.out_limb_lo_pairs.len != len || aux.out_limb_lo_pairs.arity != lg_len
+        || aux.out_limb_lo_pairs.columns != 2
+        || aux.out_limb_hi_pairs.role != AuxRole::RmsNormOutLimbHiPairs
+        || aux.out_limb_hi_pairs.len != len || aux.out_limb_hi_pairs.arity != lg_len
+        || aux.out_limb_hi_pairs.columns != 2
+        || aux.out_limb_lo_mult.role != AuxRole::RmsNormOutLimbLoMultiplicity
+        || aux.out_limb_lo_mult.len != limb_len || aux.out_limb_lo_mult.arity != limb_ar
+        || aux.out_limb_lo_mult.columns != 1
+        || aux.out_limb_hi_mult.role != AuxRole::RmsNormOutLimbHiMultiplicity
+        || aux.out_limb_hi_mult.len != limb_len || aux.out_limb_hi_mult.arity != limb_ar
+        || aux.out_limb_hi_mult.columns != 1
         || proof.row.final_evals.len() != 1 + lay.columns
-        || proof.ms.final_evals.len() != 4 || proof.out.final_evals.len() != 8
+        || proof.ms.final_evals.len() != 4 || proof.out.final_evals.len() != 10
     { return None; }
+    transcript.absorb(&bincode::serialize(&aux.out.commitment).ok()?);
     transcript.absorb(b"zkie-rmsnorm-v1");
     transcript.absorb_u64(m as u64);
     transcript.absorb_u64(d as u64);
@@ -3997,6 +4092,7 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
 
     let q_out = transcript.ef_field_vec(lg_len);
     let g_out = transcript.ef_field();
+    let g_out2 = transcript.ef_field();
     let two32 = ef_u64(1u64 << 32);
     let half32 = ef_u64(1u64 << 31);
     let out_terms = vec![
@@ -4005,16 +4101,25 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
         (-g_out, vec![0usize, 5usize]),
         (-g_out * ef_u64(1u64 << 16), vec![0usize, 6usize]),
         (g_out * half32, vec![0usize, 7usize]),
+        (g_out2, vec![0usize, 4usize]),
+        (g_out2 * half32, vec![0usize]),
+        (-g_out2, vec![0usize, 8usize]),
+        (-g_out2 * ef_u64(1u64 << 16), vec![0usize, 9usize]),
     ];
     let (oko, z_out, fco) = efo::verify_virtual(&proof.out, &out_terms, Ef::ZERO, lg_len, transcript);
     if !oko || z_out.len() != lg_len { return None; }
     let fo = &proof.out.final_evals;
     if fo[0] != ef_eq_poly(&q_out, &z_out) || fo[7] != Ef::ONE
         || fco != efo::virtual_eval(&out_terms, fo) { return None; }
-    if efo::verify_same_poly(&proof.bind,
-        &[(point.to_vec(), value), (z_out.clone(), fo[4])], transcript).is_none() {
-        return None;
-    }
+    let fo4 = fo[4]; let fo5 = fo[5]; let fo6 = fo[6];
+    let fo8 = fo[8]; let fo9 = fo[9];
+    let (merged_point, merged) = efo::verify_same_poly(&proof.bind,
+        &[(point.to_vec(), value), (z_out.clone(), fo4)], transcript)?;
+    let mut r_pad = merged_point;
+    r_pad.resize(aux.out.arity, Ef::ZERO);
+    if !verify_aux_open(aux.out, &[0, 1, 2, 3, 4, 0],
+        &[z_out.clone(), z_out.clone(), z_out.clone(), z_out.clone(), z_out.clone(), r_pad],
+        &[fo4, fo5, fo6, fo8, fo9, merged], &proof.out_opening) { return None; }
     let mut p_sq = z_ms[lg_d..].to_vec();
     p_sq.resize(arity, Ef::ZERO);
     let mut p_rstd = z_out[lg_d..].to_vec();
@@ -4026,6 +4131,10 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
         fo[5], model, &proof.limb_lo, transcript)?;
     internal_lookup_verify(limb_id, aux.limb_hi_pairs, aux.limb_hi_mult, 1, 1, &z_out,
         fo[6], model, &proof.limb_hi, transcript)?;
+    internal_lookup_verify(limb_id, aux.out_limb_lo_pairs, aux.out_limb_lo_mult, 0, 0, &z_out,
+        fo[8], model, &proof.out_limb_lo, transcript)?;
+    internal_lookup_verify(limb_id, aux.out_limb_hi_pairs, aux.out_limb_hi_mult, 1, 1, &z_out,
+        fo[9], model, &proof.out_limb_hi, transcript)?;
 
     let mut ridx = Vec::new();
     let mut rpoints = Vec::new();
@@ -4039,8 +4148,6 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
     if !verify_aux_open(aux.row, &ridx, &rpoints, &rvalues, &proof.row_opening) {
         return None;
     }
-    if !verify_aux_open(aux.out, &[0, 1], &[z_out.clone(), z_out.clone()],
-        &[fo[5], fo[6]], &proof.out_opening) { return None; }
     Some(vec![
         EfClaim { tensor_id: x, point: z_ms, value: fm[2] },
         EfClaim { tensor_id: x, point: z_out.clone(), value: fo[1] },
@@ -6097,7 +6204,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecOut, BroadcastScaleOut, ScaleGateOut, ScaleVecRemainder, ScaleGateRemainder, SoftmaxOut, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RopeOut, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecOut, BroadcastScaleOut, ScaleGateOut, ScaleVecRemainder, ScaleGateRemainder, SoftmaxOut, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RmsNormOutLimbLoPairs, RmsNormOutLimbHiPairs, RmsNormOutLimbLoMultiplicity, RmsNormOutLimbHiMultiplicity, RopeOut, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -6201,6 +6308,8 @@ struct ReverseRmsNormProof {
     rsqrt: InternalLookupProof,
     limb_lo: InternalLookupProof,
     limb_hi: InternalLookupProof,
+    out_limb_lo: InternalLookupProof,
+    out_limb_hi: InternalLookupProof,
     row_opening: EfBatchOpeningProof,
     out_opening: EfBatchOpeningProof,
 }
@@ -6790,13 +6899,17 @@ fn rms_norm_aux_specs(ops: &[Op], model: &TrustedModelManifest)
             let rsqrt_ar = table_pad_arity(rsqrt_len)?;
             let limb_ar = table_pad_arity(limb_len)?;
             specs.push((i, AuxRole::RmsNormRowWitness, m, arity, lay.columns));
-            specs.push((i, AuxRole::RmsNormOutWitness, len, lg_len, 2));
+            specs.push((i, AuxRole::RmsNormOutWitness, len, lg_len, 5));
             specs.push((i, AuxRole::RmsNormRsqrtPairs, m, arity, 2));
             specs.push((i, AuxRole::RmsNormRsqrtMultiplicity, rsqrt_len, rsqrt_ar, 1));
             specs.push((i, AuxRole::RmsNormLimbLoPairs, len, lg_len, 2));
             specs.push((i, AuxRole::RmsNormLimbLoMultiplicity, limb_len, limb_ar, 1));
             specs.push((i, AuxRole::RmsNormLimbHiPairs, len, lg_len, 2));
             specs.push((i, AuxRole::RmsNormLimbHiMultiplicity, limb_len, limb_ar, 1));
+            specs.push((i, AuxRole::RmsNormOutLimbLoPairs, len, lg_len, 2));
+            specs.push((i, AuxRole::RmsNormOutLimbHiPairs, len, lg_len, 2));
+            specs.push((i, AuxRole::RmsNormOutLimbLoMultiplicity, limb_len, limb_ar, 1));
+            specs.push((i, AuxRole::RmsNormOutLimbHiMultiplicity, limb_len, limb_ar, 1));
         }
     }
     Some(specs)
@@ -6821,9 +6934,14 @@ fn prepare_rms_norm_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
             AuxRole::RmsNormOutWitness => w.out.clone(),
             AuxRole::RmsNormRsqrtPairs => w.rsqrt_pairs.clone(),
             AuxRole::RmsNormLimbLoPairs | AuxRole::RmsNormLimbHiPairs => w.limb_pairs.clone(),
+            AuxRole::RmsNormOutLimbLoPairs | AuxRole::RmsNormOutLimbHiPairs => {
+                vec![w.out[3].clone(), w.out[4].clone()]
+            }
             AuxRole::RmsNormRsqrtMultiplicity => vec![w.rsqrt_mult.clone()],
             AuxRole::RmsNormLimbLoMultiplicity => vec![w.limb_lo_mult.clone()],
             AuxRole::RmsNormLimbHiMultiplicity => vec![w.limb_hi_mult.clone()],
+            AuxRole::RmsNormOutLimbLoMultiplicity => vec![w.out_limb_lo_mult.clone()],
+            AuxRole::RmsNormOutLimbHiMultiplicity => vec![w.out_limb_hi_mult.clone()],
             _ => return None,
         };
         if columns.len() != cols { return None; }
@@ -7536,7 +7654,7 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
     match topk_thr_range_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match topk_tie_aux_specs(ops) { Some(v) => all.extend(v), None => return false };
     match scatter_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::BroadcastScaleOut => 34, AuxRole::ScaleGateOut => 15, AuxRole::SoftmaxOut => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::RopeOut => 28, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }));
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::BroadcastScaleOut => 34, AuxRole::ScaleGateOut => 15, AuxRole::SoftmaxOut => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::RopeOut => 28, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RmsNormOutLimbLoPairs => 36, AuxRole::RmsNormOutLimbHiPairs => 37, AuxRole::RmsNormOutLimbLoMultiplicity => 38, AuxRole::RmsNormOutLimbHiMultiplicity => 39, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -8620,6 +8738,10 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                     limb_lo_mult: take(AuxRole::RmsNormLimbLoMultiplicity)?,
                     limb_hi_pairs: take(AuxRole::RmsNormLimbHiPairs)?,
                     limb_hi_mult: take(AuxRole::RmsNormLimbHiMultiplicity)?,
+                    out_limb_lo_pairs: take(AuxRole::RmsNormOutLimbLoPairs)?,
+                    out_limb_lo_mult: take(AuxRole::RmsNormOutLimbLoMultiplicity)?,
+                    out_limb_hi_pairs: take(AuxRole::RmsNormOutLimbHiPairs)?,
+                    out_limb_hi_mult: take(AuxRole::RmsNormOutLimbHiMultiplicity)?,
                 };
                 let (proof, incoming) = prove_reverse_rms_norm(
                     store, op, &point, value, auxp, model?, transcript)?;
@@ -9027,6 +9149,10 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                     limb_lo_mult: find(AuxRole::RmsNormLimbLoMultiplicity)?,
                     limb_hi_pairs: find(AuxRole::RmsNormLimbHiPairs)?,
                     limb_hi_mult: find(AuxRole::RmsNormLimbHiMultiplicity)?,
+                    out_limb_lo_pairs: find(AuxRole::RmsNormOutLimbLoPairs)?,
+                    out_limb_lo_mult: find(AuxRole::RmsNormOutLimbLoMultiplicity)?,
+                    out_limb_hi_pairs: find(AuxRole::RmsNormOutLimbHiPairs)?,
+                    out_limb_hi_mult: find(AuxRole::RmsNormOutLimbHiMultiplicity)?,
                 };
                 for c in verify_reverse_rms_norm(op, &point, value, refs, model?, proof, transcript)? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
@@ -10194,18 +10320,11 @@ pub const RSQRT_MAX_VARIANCE: f64 = 8454204.0;
 /// live mistake rather than a hypothetical one: two generators exist, and the
 /// superseded `scripts/extract_rsqrt_table.py` emits 2^19 uniform entries, so
 /// running the wrong one produces a file that looks perfectly normal.
-pub fn check_rsqrt_table(table: &[Goldilocks], max_index: u32) {
-    assert!(
-        (max_index as usize) < table.len(),
-        "rsqrt table has {} entries but the forward pass needs index {}. \
-         Regenerate with scripts/extract_rsqrt_piecewise.py ({} entries, covering \
-         variance up to {:.6}) - NOT extract_rsqrt_table.py, which is superseded and \
-         emits 2^19 uniform entries.",
-        table.len(),
-        max_index,
-        RSQRT_TABLE_LEN,
-        RSQRT_MAX_VARIANCE
-    );
+pub fn check_rsqrt_table(table: &[Goldilocks], max_index: u32) -> Option<()> {
+    // Fail closed instead of panicking: a short table is a prover-side DoS
+    // vector (and a superseded generator emits the wrong length).
+    if (max_index as usize) >= table.len() { return None; }
+    Some(())
 }
 
 pub fn rsqrt_index(var: i64) -> u32 {
@@ -16175,7 +16294,8 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.virtual_proof(&proof.ms, 4)?;
                 b.virtual_proof(&proof.out, 4)?;
                 b.same_poly(&proof.bind)?;
-                for l in [&proof.rsqrt, &proof.limb_lo, &proof.limb_hi] {
+                for l in [&proof.rsqrt, &proof.limb_lo, &proof.limb_hi,
+                          &proof.out_limb_lo, &proof.out_limb_hi] {
                     b.fractional(&l.witness)?;
                     b.fractional(&l.table)?;
                     b.virtual_proof(&l.padding, 3)?;
@@ -16184,7 +16304,7 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                     if l.table_opening.is_some() { b.base_opening()?; }
                 }
                 b.opening(&proof.row_opening, rms_row_claims)?;
-                b.opening(&proof.out_opening, 2)?;
+                b.opening(&proof.out_opening, 6)?;
             }
             ReverseReduction::RoPE { proof } => {
                 b.virtual_proof(&proof.first, 3)?;
@@ -25361,12 +25481,11 @@ mod tests {
         );
     }
 
-    /// Prove the guard can actually fail.
+    /// Prove the guard can actually fail (fail-closed, no panic).
     #[test]
-    #[should_panic(expected = "rsqrt table has")]
     fn check_rsqrt_table_rejects_the_superseded_uniform_table() {
         let superseded = vec![Goldilocks::ZERO; 1 << 19];
-        check_rsqrt_table(&superseded, 1 << 20);
+        assert!(check_rsqrt_table(&superseded, 1 << 20).is_none());
     }
 
     fn rsqrt_index_piecewise() {
@@ -25906,6 +26025,148 @@ mod tests {
             "AUDIT FAILURE: forged StableSoftmaxIndex output claim was ACCEPTED");
     }
 
+    /// RmsNorm LOW-item coverage: m >= 32 with n_real == d (honest
+    /// roundtrip), non-identity limb table, out-of-range out limb, and a
+    /// negative committed ms.
+    #[test]
+    fn b1_rms_norm_low_items() {
+        let take = |v: &mut Vec<PreparedAux>, role: AuxRole| {
+            let pos = v.iter().position(|p| p.descriptor.role == role).unwrap();
+            v.remove(pos)
+        };
+        let build_aux = |auxv: &mut Vec<PreparedAux>| RmsAux {
+            row: take(auxv, AuxRole::RmsNormRowWitness),
+            out: take(auxv, AuxRole::RmsNormOutWitness),
+            rsqrt_pairs: take(auxv, AuxRole::RmsNormRsqrtPairs),
+            rsqrt_mult: take(auxv, AuxRole::RmsNormRsqrtMultiplicity),
+            limb_lo_pairs: take(auxv, AuxRole::RmsNormLimbLoPairs),
+            limb_lo_mult: take(auxv, AuxRole::RmsNormLimbLoMultiplicity),
+            limb_hi_pairs: take(auxv, AuxRole::RmsNormLimbHiPairs),
+            limb_hi_mult: take(auxv, AuxRole::RmsNormLimbHiMultiplicity),
+            out_limb_lo_pairs: take(auxv, AuxRole::RmsNormOutLimbLoPairs),
+            out_limb_lo_mult: take(auxv, AuxRole::RmsNormOutLimbLoMultiplicity),
+            out_limb_hi_pairs: take(auxv, AuxRole::RmsNormOutLimbHiPairs),
+            out_limb_hi_mult: take(auxv, AuxRole::RmsNormOutLimbHiMultiplicity),
+        };
+        let make = |m: usize, d: usize, n_real: usize, identity: bool|
+            -> Option<(Store, T, T, T, TrustedModelManifest)> {
+            let mut st = Store::new();
+            let len = m * d;
+            let xv: Vec<Goldilocks> = (0..len)
+                .map(|i| from_i64(((i as i64 * 11) % 19) - 9)).collect();
+            let wv: Vec<Goldilocks> = (0..len)
+                .map(|i| from_i64(((i as i64 * 3) % 7) + 1)).collect();
+            let x = st.push(xv);
+            let w = st.push(wv);
+            let out = st.push(vec![Goldilocks::ZERO; len]);
+            let rsqrt_t = st.push((0..32).map(|i| from_i64(1000 + i as i64)).collect());
+            let limb_v: Vec<Goldilocks> = if identity {
+                (0..65536).map(|i| from_i64(i as i64)).collect()
+            } else {
+                (0..65536).map(|i| from_i64((65535 - i) as i64)).collect()
+            };
+            let limb_t = st.push(limb_v);
+            let ops = vec![Op::RmsNorm { x, w, out, rsqrt_table: rsqrt_t,
+                limb_table: limb_t, m, d, n_real }];
+            forward_ops(&mut st, &ops);
+            let model = TrustedModelManifest::from_offline_commitment(
+                &[], &st.owned_slices(), &ops);
+            Some((st, x, w, out, model))
+        };
+
+        // m >= 32 and n_real == d.
+        let (st, _x, _w, out, model) = make(32, 8, 8, true).unwrap();
+        let ops = vec![Op::RmsNorm { x: _x, w: _w, out,
+            rsqrt_table: 0, limb_table: 0, m: 32, d: 8, n_real: 8 }];
+        // Rebuild the op with the real table ids from the store layout.
+        // (The forward already ran; take the ids from the fixture.)
+        let (x_id, w_id) = (_x, _w);
+        let (rsqrt_id, limb_id) = {
+            let mut ids = (0, 0);
+            for (i, t) in st.v.iter().enumerate() {
+                if let TensorData::Owned(v) = t {
+                    if v.len() == 32 { ids.0 = i; }
+                    if v.len() == 65536 { ids.1 = i; }
+                }
+            }
+            ids
+        };
+        let ops = vec![Op::RmsNorm { x: x_id, w: w_id, out, rsqrt_table: rsqrt_id,
+            limb_table: limb_id, m: 32, d: 8, n_real: 8 }];
+        let mut auxv = prepare_rms_norm_aux(&st, &ops, &model).expect("m32 aux");
+        let point: Vec<Ef> = (0..(32usize * 8).trailing_zeros())
+            .map(|b| ef_u64(3 + b as u64)).collect();
+        let value = ef_eval(st.get(out), &point);
+        let auxp = build_aux(&mut auxv);
+        let (proof, claims) = prove_reverse_rms_norm(
+            &st, &ops[0], &point, value, auxp, &model,
+            &mut Transcript::new(b"rms-low-m32")).expect("m32 proof");
+        assert_eq!(claims.len(), 3);
+        let mut auxv2 = prepare_rms_norm_aux(&st, &ops, &model).unwrap();
+        let fill = |v: &mut Vec<PreparedAux>| {
+            let mut a = Vec::new();
+            for role in [AuxRole::RmsNormRowWitness, AuxRole::RmsNormOutWitness,
+                AuxRole::RmsNormRsqrtPairs, AuxRole::RmsNormRsqrtMultiplicity,
+                AuxRole::RmsNormLimbLoPairs, AuxRole::RmsNormLimbLoMultiplicity,
+                AuxRole::RmsNormLimbHiPairs, AuxRole::RmsNormLimbHiMultiplicity,
+                AuxRole::RmsNormOutLimbLoPairs, AuxRole::RmsNormOutLimbLoMultiplicity,
+                AuxRole::RmsNormOutLimbHiPairs, AuxRole::RmsNormOutLimbHiMultiplicity] {
+                a.push(take(v, role).descriptor);
+            }
+            a
+        };
+        let dsc = fill(&mut auxv2);
+        let refs = RmsAuxRefs {
+            row: &dsc[0], out: &dsc[1], rsqrt_pairs: &dsc[2], rsqrt_mult: &dsc[3],
+            limb_lo_pairs: &dsc[4], limb_lo_mult: &dsc[5],
+            limb_hi_pairs: &dsc[6], limb_hi_mult: &dsc[7],
+            out_limb_lo_pairs: &dsc[8], out_limb_lo_mult: &dsc[9],
+            out_limb_hi_pairs: &dsc[10], out_limb_hi_mult: &dsc[11],
+        };
+        assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
+            &proof, &mut Transcript::new(b"rms-low-m32")).is_some());
+
+        // Non-identity limb table must fail closed at aux preparation.
+        let (st2, x2, w2, out2, model2) = make(4, 8, 5, false).unwrap();
+        let ops2 = vec![Op::RmsNorm { x: x2, w: w2, out: out2,
+            rsqrt_table: 2, limb_table: 3, m: 4, d: 8, n_real: 5 }];
+        assert!(prepare_rms_norm_aux(&st2, &ops2, &model2).is_none(),
+            "non-identity limb table must fail closed");
+
+        // Out-of-range out limb and negative ms must fail closed at prove.
+        let (st3, x3, w3, out3, model3) = make(4, 8, 5, true).unwrap();
+        let (rsqrt3, limb3) = {
+            let mut ids = (0, 0);
+            for (i, t) in st3.v.iter().enumerate() {
+                if let TensorData::Owned(v) = t {
+                    if v.len() == 32 { ids.0 = i; }
+                    if v.len() == 65536 { ids.1 = i; }
+                }
+            }
+            ids
+        };
+        let ops3 = vec![Op::RmsNorm { x: x3, w: w3, out: out3,
+            rsqrt_table: rsqrt3, limb_table: limb3, m: 4, d: 8, n_real: 5 }];
+        let p3: Vec<Ef> = (0..(4usize * 8).trailing_zeros()).map(|b| ef_u64(5 + b as u64)).collect();
+        let v3 = ef_eval(st3.get(out3), &p3);
+        let mut auxbad = prepare_rms_norm_aux(&st3, &ops3, &model3).unwrap();
+        {
+            let pos = auxbad.iter().position(|p| p.descriptor.role == AuxRole::RmsNormOutWitness).unwrap();
+            auxbad[pos].columns[3][0] += Goldilocks::from_u64(65536);
+        }
+        let badp = build_aux(&mut auxbad);
+        assert!(prove_reverse_rms_norm(&st3, &ops3[0], &p3, v3, badp, &model3,
+            &mut Transcript::new(b"rms-low-badlimb")).is_none());
+        let mut auxneg = prepare_rms_norm_aux(&st3, &ops3, &model3).unwrap();
+        {
+            let pos = auxneg.iter().position(|p| p.descriptor.role == AuxRole::RmsNormRowWitness).unwrap();
+            auxneg[pos].columns[RMS_MS][0] = from_i64(-1);
+        }
+        let negp = build_aux(&mut auxneg);
+        assert!(prove_reverse_rms_norm(&st3, &ops3[0], &p3, v3, negp, &model3,
+            &mut Transcript::new(b"rms-low-negms")).is_none());
+    }
+
     /// PR#45 B1: the RmsNorm row gadget must be pointwise zero for every
     /// rsqrt_index branch (fine / coarse / coarse2), and reject a wrong
     /// committed index. No commitments are involved.
@@ -26130,6 +26391,10 @@ mod tests {
             take(&mut auxv, AuxRole::RmsNormLimbLoMultiplicity).descriptor.clone(),
             take(&mut auxv, AuxRole::RmsNormLimbHiPairs).descriptor.clone(),
             take(&mut auxv, AuxRole::RmsNormLimbHiMultiplicity).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormOutLimbLoPairs).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormOutLimbLoMultiplicity).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormOutLimbHiPairs).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormOutLimbHiMultiplicity).descriptor.clone(),
         ];
         let point: Vec<Ef> = (0..len.trailing_zeros())
             .map(|b| ef_u64(2 + b as u64)).collect();
@@ -26144,6 +26409,10 @@ mod tests {
             limb_lo_mult: take(&mut auxall, AuxRole::RmsNormLimbLoMultiplicity),
             limb_hi_pairs: take(&mut auxall, AuxRole::RmsNormLimbHiPairs),
             limb_hi_mult: take(&mut auxall, AuxRole::RmsNormLimbHiMultiplicity),
+            out_limb_lo_pairs: take(&mut auxall, AuxRole::RmsNormOutLimbLoPairs),
+            out_limb_lo_mult: take(&mut auxall, AuxRole::RmsNormOutLimbLoMultiplicity),
+            out_limb_hi_pairs: take(&mut auxall, AuxRole::RmsNormOutLimbHiPairs),
+            out_limb_hi_mult: take(&mut auxall, AuxRole::RmsNormOutLimbHiMultiplicity),
         };
         let mut tp = Transcript::new(b"b1-rmsnorm");
         let (proof, claims) = prove_reverse_rms_norm(
@@ -26154,6 +26423,8 @@ mod tests {
             rsqrt_mult: &descs[3], limb_lo_pairs: &descs[4],
             limb_lo_mult: &descs[5], limb_hi_pairs: &descs[6],
             limb_hi_mult: &descs[7],
+            out_limb_lo_pairs: &descs[8], out_limb_lo_mult: &descs[9],
+            out_limb_hi_pairs: &descs[10], out_limb_hi_mult: &descs[11],
         };
         let mut tv = Transcript::new(b"b1-rmsnorm");
         assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
@@ -26169,7 +26440,9 @@ mod tests {
             bad.out.final_evals[idx] += Ef::ONE;
             let refs = RmsAuxRefs { row: &descs[0], out: &descs[1], rsqrt_pairs: &descs[2],
                 rsqrt_mult: &descs[3], limb_lo_pairs: &descs[4], limb_lo_mult: &descs[5],
-                limb_hi_pairs: &descs[6], limb_hi_mult: &descs[7] };
+                limb_hi_pairs: &descs[6], limb_hi_mult: &descs[7],
+                out_limb_lo_pairs: &descs[8], out_limb_lo_mult: &descs[9],
+                out_limb_hi_pairs: &descs[10], out_limb_hi_mult: &descs[11] };
             let mut tv = Transcript::new(b"b1-rmsnorm");
             assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
                 &bad, &mut tv).is_none(), "tampered out eval {idx}");
@@ -26179,7 +26452,9 @@ mod tests {
         bad.ms.final_evals[2] += Ef::ONE;
         let refs = RmsAuxRefs { row: &descs[0], out: &descs[1], rsqrt_pairs: &descs[2],
             rsqrt_mult: &descs[3], limb_lo_pairs: &descs[4], limb_lo_mult: &descs[5],
-            limb_hi_pairs: &descs[6], limb_hi_mult: &descs[7] };
+            limb_hi_pairs: &descs[6], limb_hi_mult: &descs[7],
+            out_limb_lo_pairs: &descs[8], out_limb_lo_mult: &descs[9],
+            out_limb_hi_pairs: &descs[10], out_limb_hi_mult: &descs[11] };
         let mut tv = Transcript::new(b"b1-rmsnorm");
         assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
             &bad, &mut tv).is_none(), "tampered x eval at the ms endpoint");
@@ -26188,7 +26463,9 @@ mod tests {
         bad.rsqrt.table_value += Ef::ONE;
         let refs = RmsAuxRefs { row: &descs[0], out: &descs[1], rsqrt_pairs: &descs[2],
             rsqrt_mult: &descs[3], limb_lo_pairs: &descs[4], limb_lo_mult: &descs[5],
-            limb_hi_pairs: &descs[6], limb_hi_mult: &descs[7] };
+            limb_hi_pairs: &descs[6], limb_hi_mult: &descs[7],
+            out_limb_lo_pairs: &descs[8], out_limb_lo_mult: &descs[9],
+            out_limb_hi_pairs: &descs[10], out_limb_hi_mult: &descs[11] };
         let mut tv = Transcript::new(b"b1-rmsnorm");
         assert!(verify_reverse_rms_norm(&ops[0], &point, value, refs, &model,
             &bad, &mut tv).is_none(), "tampered rsqrt table value");
@@ -26467,7 +26744,6 @@ mod tests {
     /// same_poly over an interpolating fake polynomial. Expected after the
     /// fix: rejection. Before the fix this test FAILS (attack accepted).
     #[test]
-    #[ignore = "AUDIT RED: forged output claim is accepted (same_poly output-binding gap); enable after fix"]
     fn audit_rms_norm_forged_output_claim_must_reject() {
         let mut store = Store::new();
         let (m, d, n_real) = (4usize, 8usize, 5usize);
@@ -26503,6 +26779,10 @@ mod tests {
             take(&mut auxv, AuxRole::RmsNormLimbLoMultiplicity).descriptor.clone(),
             take(&mut auxv, AuxRole::RmsNormLimbHiPairs).descriptor.clone(),
             take(&mut auxv, AuxRole::RmsNormLimbHiMultiplicity).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormOutLimbLoPairs).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormOutLimbLoMultiplicity).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormOutLimbHiPairs).descriptor.clone(),
+            take(&mut auxv, AuxRole::RmsNormOutLimbHiMultiplicity).descriptor.clone(),
         ];
         let point: Vec<Ef> = (0..len.trailing_zeros())
             .map(|b| ef_u64(2 + b as u64)).collect();
@@ -26518,6 +26798,10 @@ mod tests {
             limb_lo_mult: take(&mut auxall, AuxRole::RmsNormLimbLoMultiplicity),
             limb_hi_pairs: take(&mut auxall, AuxRole::RmsNormLimbHiPairs),
             limb_hi_mult: take(&mut auxall, AuxRole::RmsNormLimbHiMultiplicity),
+            out_limb_lo_pairs: take(&mut auxall, AuxRole::RmsNormOutLimbLoPairs),
+            out_limb_lo_mult: take(&mut auxall, AuxRole::RmsNormOutLimbLoMultiplicity),
+            out_limb_hi_pairs: take(&mut auxall, AuxRole::RmsNormOutLimbHiPairs),
+            out_limb_hi_mult: take(&mut auxall, AuxRole::RmsNormOutLimbHiMultiplicity),
         };
         let mut tp = Transcript::new(b"audit-rmsnorm");
         let (proof, _claims) = prove_reverse_rms_norm(
@@ -26533,6 +26817,7 @@ mod tests {
         let rsqrt_len = model.lookup_lengths[&rsqrt_id];
         let limb_len = model.lookup_lengths[&limb_id];
         let mut t = Transcript::new(b"audit-rmsnorm");
+        t.absorb(&bincode::serialize(&descs[1].commitment).unwrap());
         t.absorb(b"zkie-rmsnorm-v1");
         t.absorb_u64(mm as u64); t.absorb_u64(dd as u64);
         t.absorb_u64(nn as u64); t.absorb_u64(rsqrt_len as u64);
@@ -26553,6 +26838,7 @@ mod tests {
         assert!(ok);
         let q_out = t.ef_field_vec(lgl);
         let g_out = t.ef_field();
+        let g_out2 = t.ef_field();
         let two32 = ef_u64(1u64 << 32);
         let half32 = ef_u64(1u64 << 31);
         let out_terms = vec![
@@ -26561,6 +26847,10 @@ mod tests {
             (-g_out, vec![0usize, 5usize]),
             (-g_out * ef_u64(1u64 << 16), vec![0usize, 6usize]),
             (g_out * half32, vec![0usize, 7usize]),
+            (g_out2, vec![0usize, 4usize]),
+            (g_out2 * half32, vec![0usize]),
+            (-g_out2, vec![0usize, 8usize]),
+            (-g_out2 * ef_u64(1u64 << 16), vec![0usize, 9usize]),
         ];
         let (ok, z_out, _) = efo::verify_virtual(&proof.out, &out_terms, Ef::ZERO, lgl, &mut t);
         assert!(ok);
@@ -26626,6 +26916,8 @@ mod tests {
             rsqrt_mult: &descs[3], limb_lo_pairs: &descs[4],
             limb_lo_mult: &descs[5], limb_hi_pairs: &descs[6],
             limb_hi_mult: &descs[7],
+            out_limb_lo_pairs: &descs[8], out_limb_lo_mult: &descs[9],
+            out_limb_hi_pairs: &descs[10], out_limb_hi_mult: &descs[11],
         };
         let mut tv = Transcript::new(b"audit-rmsnorm");
         let got = verify_reverse_rms_norm(&ops[0], &point, forged, refs, &model,
