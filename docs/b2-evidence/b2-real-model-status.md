@@ -88,15 +88,34 @@ Rerun on `fix/soundness-repair` after the eight per-op out-witness fixes
   (`docs/lnc-reverse.md`), landing directly on the pooled aux wire. GPT-2 and
   TimesFM `public_execution` now accepts the op (the old exit-2 boundary is
   gone), and both full graphs pass the LNC path.
-- The B1 Softmax remainder window was widened from 16 to 17 bits (output
-  scale unchanged at 2^16). GPT-2 `op 12 row 2` S=86,741, the original
-  failure, now passes aux preparation.
-- Both real graphs now stop at the **next** Softmax row-sum boundary and fail
-  closed as designed: GPT-2 `op 12 row 8` S=227,312 and TimesFM `op 29 row 4`
-  S=164,266, both above 2^17 = 131,072. Widening to B=18 (S <= 262,144) would
-  cover both and needs a separate decision.
+- The B1 Softmax remainder window is being widened after a full real-graph
+  scan. The measured maxima are GPT-2 573,417 (op 142 row 15) and TimesFM
+  674,671 (op 328 row 15); `ceil(log2(max)) = 20`, so the applied
+  `SOFTMAX_REM_BITS` is 21 (one bit of margin), covering S <= 2^21.
+  The values 227,312 (GPT-2 op 12 row 8) and 164,266 (TimesFM op 29 row 4)
+  were the first 17-bit failures, not the maxima.
+- Caveat recorded in `docs/pr45-op-coverage.md`: the fixed window contains at
+  most `ceil(2^B/S)` candidate outputs; with B=21 the "at most two" threshold
+  is S >= 2^20, so very small row sums have looser uniqueness than under the
+  17-bit window. This is flagged for the TL.
 - B2 harness fixes needed to reach these boundaries: use the canonical
   16-token input for `m <= 16` and the real 3-token prompt length.
 - Real-weight LNC-only bound proofs over every LayerNormCentered op in the
   two models are run as separate evidence (`models/*/examples/lnc_real_check.rs`),
   so LNC coverage does not depend on the remaining Softmax window.
+
+- LNC audit fixes (TL review of b65eb9e): the verifier now pins the mean and
+  var virtual rho final evaluations (CRITICAL), the row witness decomposes
+  mean into a bounded signed raw/rem pair so E1 uniquely pins the rounded
+  mean (HIGH), and the var budget degree is charged as 4 (LOW). Regression
+  `audit_lnc_forged_rho_must_reject` is red with the rho gates disabled and
+  green with them enabled.
+
+- Full GPT-2 B2 with the 21-bit Softmax window now passes the Softmax aux
+  stage and stops at the pre-existing StableSoftmaxIndex range contract:
+  `op 11` has masked=-1,073,800,612, rmax=-7,380, w=-1,071,696,080 and
+  `tr_w=1,071,696,080 > 2^22`. TimesFM `op 52` likewise has
+  masked=-5,849,165, rmax=1,458,654, w=-5,210,667, tr_w=5,210,667 and
+  mdiff=7,307,819, both above 2^22. The mask magnitude exceeds the SSI
+  reduction's 22-bit `w/tr_w/diff` bound. This is the next boundary and is
+  not changed in this stage.

@@ -6944,11 +6944,12 @@ const SOFTMAX_SCALE_BITS: usize = 16;
 /// `rem = e*2^16 - out*S + 2^(B-1)`, with the rescale identity
 /// `out*S - 2^16*e - rem + 2^(B-1) = 0` and rem in [0,2^B). The true
 /// rounding error +-(S/2) therefore fits the half-offset window exactly when
-/// |S| <= 2^B. B=17 accepts row sums up to 131,072 (GPT-2's observed max is
-/// 86,741) and fails closed above it. The 17-bit Boolean decomposition stays
-/// canonical, and the window still contains at most two consecutive integers
-/// for `out`.
-const SOFTMAX_REM_BITS: usize = 17;
+/// |S| <= 2^B. A full real-graph scan measured max|S| = 674,671 (TimesFM
+/// op328 row15; GPT-2 max is 573,417 at op142 row15), ceil(log2) = 20.
+/// B = 21 (one bit of margin) accepts |S| <= 2^21 = 2,097,152 and fails
+/// closed above it. The 21-bit Boolean decomposition stays canonical, and the
+/// window still contains at most two consecutive integers for `out`.
+const SOFTMAX_REM_BITS: usize = 21;
 
 /// B1: Softmax aux. `SoftmaxSum` is the row sum S(i) broadcast over the
 /// (i,j) domain; `SoftmaxRemainder` holds the B = SOFTMAX_REM_BITS bits of
@@ -7166,9 +7167,17 @@ struct LncRowLayout {
     delta: usize,
     rem_bits: usize,
     delta_bits: usize,
+    /// Signed 16-bit quotient of mean via mean = 2^16*raw + rem - 2^15.
+    raw_mean: usize,
+    rem_raw_mean: usize,
+    raw_mean_bits: usize,
+    rem_raw_mean_bits: usize,
     bmean: usize,
     columns: usize,
 }
+
+const LNC_MEAN_RAW_BITS: usize = 16;
+const LNC_MEAN_REM_BITS: usize = 16;
 
 fn lnc_bits(n: usize) -> usize {
     if n <= 1 { 0 } else { (usize::BITS - (n - 1).leading_zeros()) as usize }
@@ -7183,8 +7192,13 @@ fn lnc_row_layout(n_real: usize) -> Option<LncRowLayout> {
     let delta = rem_mean.checked_add(1)?;
     let rem_bits = delta.checked_add(1)?;
     let delta_bits = rem_bits.checked_add(bmean)?;
-    let columns = delta_bits.checked_add(bmean)?;
+    let raw_mean = delta_bits.checked_add(bmean)?;
+    let rem_raw_mean = raw_mean.checked_add(1)?;
+    let raw_mean_bits = rem_raw_mean.checked_add(1)?;
+    let rem_raw_mean_bits = raw_mean_bits.checked_add(LNC_MEAN_RAW_BITS)?;
+    let columns = rem_raw_mean_bits.checked_add(LNC_MEAN_REM_BITS)?;
     Some(LncRowLayout { rms, mean, sum_x, rem_mean, delta, rem_bits, delta_bits,
+        raw_mean, rem_raw_mean, raw_mean_bits, rem_raw_mean_bits,
         bmean, columns })
 }
 
@@ -7220,6 +7234,24 @@ fn lnc_row_witness(mean: i64, sum_x: i64, rem_mean: i64,
     for j in 0..lay.bmean {
         cols[lay.rem_bits + j][row] = Goldilocks::from_u64(((rem_mean as u64) >> j) & 1);
         cols[lay.delta_bits + j][row] = Goldilocks::from_u64(((delta as u64) >> j) & 1);
+    }
+    // mean = 2^16*raw + rem - 2^15 with raw signed 16-bit and rem 16-bit.
+    let shifted = mean.checked_add(1i64 << 15)?;
+    let raw = shifted.div_euclid(1i64 << LNC_MEAN_RAW_BITS);
+    let rem = shifted.rem_euclid(1i64 << LNC_MEAN_RAW_BITS);
+    if raw < -(1i64 << 15) || raw >= (1i64 << 15)
+        || rem < 0 || ((rem as u64) >> LNC_MEAN_REM_BITS) != 0 {
+        return None;
+    }
+    cols[lay.raw_mean][row] = from_i64(raw);
+    cols[lay.rem_raw_mean][row] = from_i64(rem);
+    let raw_off = (raw + (1i64 << 15)) as u64;
+    for j in 0..LNC_MEAN_RAW_BITS {
+        cols[lay.raw_mean_bits + j][row] = Goldilocks::from_u64((raw_off >> j) & 1);
+    }
+    for j in 0..LNC_MEAN_REM_BITS {
+        cols[lay.rem_raw_mean_bits + j][row] =
+            Goldilocks::from_u64(((rem as u64) >> j) & 1);
     }
     Some(())
 }
@@ -7260,6 +7292,37 @@ fn lnc_row_terms(g_row: Ef, g_mean: Ef, n_real: usize, lay: &LncRowLayout)
         gp = gp * g_mean;
         t.push((gp, vec![0, ix(lay.delta_bits + j), ix(lay.delta_bits + j)]));
         t.push((-gp, vec![0, ix(lay.delta_bits + j)]));
+        gp = gp * g_mean;
+    }
+    // E5: mean - 2^16*raw - rem_raw + 2^15 = 0.
+    let mbase = 1i64 << LNC_MEAN_RAW_BITS;
+    t.push((gp, vec![0, ix(lay.mean)]));
+    t.push((-gp * ef_u64(mbase as u64), vec![0, ix(lay.raw_mean)]));
+    t.push((-gp, vec![0, ix(lay.rem_raw_mean)]));
+    t.push((gp * ef_u64(1u64 << 15), vec![0]));
+    gp = gp * g_mean;
+    // E6: raw + 2^15 = sum 2^j rawbit_j.
+    t.push((gp, vec![0, ix(lay.raw_mean)]));
+    t.push((gp * ef_u64(1u64 << 15), vec![0]));
+    for j in 0..LNC_MEAN_RAW_BITS {
+        t.push((-gp * ef_u64(1u64 << j), vec![0, ix(lay.raw_mean_bits + j)]));
+    }
+    gp = gp * g_mean;
+    // E7: rem_raw = sum 2^j rembit_j.
+    t.push((gp, vec![0, ix(lay.rem_raw_mean)]));
+    for j in 0..LNC_MEAN_REM_BITS {
+        t.push((-gp * ef_u64(1u64 << j), vec![0, ix(lay.rem_raw_mean_bits + j)]));
+    }
+    gp = gp * g_mean;
+    // Booleanity of the bounded mean decomposition.
+    for j in 0..LNC_MEAN_RAW_BITS {
+        t.push((gp, vec![0, ix(lay.raw_mean_bits + j), ix(lay.raw_mean_bits + j)]));
+        t.push((-gp, vec![0, ix(lay.raw_mean_bits + j)]));
+        gp = gp * g_mean;
+    }
+    for j in 0..LNC_MEAN_REM_BITS {
+        t.push((gp, vec![0, ix(lay.rem_raw_mean_bits + j), ix(lay.rem_raw_mean_bits + j)]));
+        t.push((-gp, vec![0, ix(lay.rem_raw_mean_bits + j)]));
         gp = gp * g_mean;
     }
     t
@@ -7520,9 +7583,59 @@ fn lnc_out_full_terms(g1: Ef, g2: Ef, g3: Ef) -> Vec<(Ef, Vec<usize>)> {
     t
 }
 
+/// Evaluate a virtual term pencil at every Boolean cube point and sum.
+/// Test-only attack helper (also used to derive the fake prefix selector).
+fn lnc_cube_term_sum(mles: &[&[Ef]], terms: &[(Ef, Vec<usize>)]) -> Ef {
+    let Some(first) = mles.first() else { return Ef::ZERO };
+    let len = first.len();
+    let mut total = Ef::ZERO;
+    for x in 0..len {
+        let mut v = Ef::ZERO;
+        for (c, ids) in terms {
+            let mut p = *c;
+            for &i in ids { p = p * mles[i][x]; }
+            v = v + p;
+        }
+        total = total + v;
+    }
+    total
+}
+
+/// Attack hook: replace the prefix selector rho by rho + c, choosing c so
+/// that the virtual sum is zero for the supplied (possibly forged) mles.
+/// A verifier that does not pin the rho final evaluation cannot tell.
+fn lnc_forge_rho(mles: &[&[Ef]], terms: &[(Ef, Vec<usize>)]) -> Option<Vec<Ef>> {
+    if mles.len() < 2 { return None; }
+    let len = mles[0].len();
+    if mles[1].len() != len { return None; }
+    let ones = vec![Ef::ONE; len];
+    let zeros = vec![Ef::ZERO; len];
+    let sum0 = lnc_cube_term_sum(mles, terms);
+    let mut shifted = mles.to_vec();
+    shifted[1] = &zeros;
+    let sum_zero = lnc_cube_term_sum(&shifted, terms);
+    shifted[1] = &ones;
+    let sum_one = lnc_cube_term_sum(&shifted, terms);
+    let slope = sum_one - sum_zero;
+    if slope == Ef::ZERO { return None; }
+    let c = -sum0 * slope.inverse();
+    let mut out = mles[1].to_vec();
+    for v in &mut out { *v = *v + c; }
+    Some(out)
+}
+
 fn prove_reverse_lnc(store: &Store, op: &Op, point: &[Ef], value: Ef,
     aux: LncAux, model: &TrustedModelManifest, transcript: &mut Transcript,
-    mut rec: Option<&mut AuxOpenRecorder>)
+    rec: Option<&mut AuxOpenRecorder>)
+    -> Option<(ReverseLncProof, Vec<EfClaim>)>
+{
+    prove_reverse_lnc_impl(store, op, point, value, aux, model, transcript,
+        rec, false, true)
+}
+
+fn prove_reverse_lnc_impl(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    aux: LncAux, model: &TrustedModelManifest, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>, forge_rho: bool, check_witness: bool)
     -> Option<(ReverseLncProof, Vec<EfClaim>)>
 {
     let (x, w, b, out, rsqrt_id, m, d, n_real) = lnc_dims(op)?;
@@ -7556,10 +7669,12 @@ fn prove_reverse_lnc(store: &Store, op: &Op, point: &[Ef], value: Ef,
         || aux.rsqrt_mult.descriptor.columns != 1
         || aux.rsqrt_mult.columns.len() != 1 || aux.rsqrt_mult.columns[0].len() != rmult
     { return None; }
-    let expected = build_lnc_witness(store, op, model)?;
-    if aux.row.columns != expected.row || aux.out.columns != expected.out
-        || aux.rsqrt_pairs.columns != expected.rsqrt_pairs
-        || !rms_mult_matches(&aux.rsqrt_mult.columns, &expected.rsqrt_mult) { return None; }
+    if check_witness {
+        let expected = build_lnc_witness(store, op, model)?;
+        if aux.row.columns != expected.row || aux.out.columns != expected.out
+            || aux.rsqrt_pairs.columns != expected.rsqrt_pairs
+            || !rms_mult_matches(&aux.rsqrt_mult.columns, &expected.rsqrt_mult) { return None; }
+    }
     transcript.absorb(&bincode::serialize(&aux.out.descriptor.commitment).ok()?);
     transcript.absorb(b"zkie-lnc-v1");
     transcript.absorb_u64(m as u64);
@@ -7599,16 +7714,27 @@ fn prove_reverse_lnc(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let eq_mean_row = efo::eq_evals(&u_mean);
     let eq_mean_b: Vec<Ef> = (0..len).map(|i| eq_mean_row[i / d]).collect();
     let mean_terms = lnc_mean_terms(d);
+    let mean_base: Vec<&[Ef]> = vec![&eq_mean_b, &rho, &x_ef, &sum_x_b];
+    let rho_mean_owned = if forge_rho {
+        Some(lnc_forge_rho(&mean_base, &mean_terms)?)
+    } else { None };
+    let rho_mean: &[Ef] = rho_mean_owned.as_deref().unwrap_or(&rho);
     let (mean_vp, z_mean) = efo::prove_virtual(
-        &[&eq_mean_b, &rho, &x_ef, &sum_x_b], &mean_terms, Ef::ZERO, transcript);
+        &[&eq_mean_b, rho_mean, &x_ef, &sum_x_b], &mean_terms, Ef::ZERO, transcript);
     if z_mean.len() != lg_len || mean_vp.final_evals.len() != 4 { return None; }
 
     let u_var = transcript.ef_field_vec(lg_m);
     let eq_var_row = efo::eq_evals(&u_var);
     let eq_var_b: Vec<Ef> = (0..len).map(|i| eq_var_row[i / d]).collect();
     let var_terms = lnc_var_terms(n_real);
+    let var_base: Vec<&[Ef]> =
+        vec![&eq_var_b, &rho, &x_ef, &mean_b, &var_b, &rem_var_b];
+    let rho_var_owned = if forge_rho {
+        Some(lnc_forge_rho(&var_base, &var_terms)?)
+    } else { None };
+    let rho_var: &[Ef] = rho_var_owned.as_deref().unwrap_or(&rho);
     let (var_vp, z_var) = efo::prove_virtual(
-        &[&eq_var_b, &rho, &x_ef, &mean_b, &var_b, &rem_var_b],
+        &[&eq_var_b, rho_var, &x_ef, &mean_b, &var_b, &rem_var_b],
         &var_terms, Ef::ZERO, transcript);
     if z_var.len() != lg_len || var_vp.final_evals.len() != 6 { return None; }
 
@@ -7745,6 +7871,13 @@ fn verify_reverse_lnc(op: &Op, point: &[Ef], value: Ef,
     if fm[0] != ef_eq_poly(&u_mean, &z_mean[lg_d..]) || fcm != efo::virtual_eval(&mean_terms, fm) {
         return None;
     }
+    // CRITICAL (TL audit): the mean virtual's rho column is prover-supplied.
+    // The verifier knows the public prefix selector and must pin its MLE.
+    let eq_mean_col = efo::eq_evals(&z_mean[..lg_d]);
+    if eq_mean_col.len() != d { return None; }
+    let rho_mean_eval = (0..n_real)
+        .fold(Ef::ZERO, |acc, j| acc + eq_mean_col[j]);
+    if fm[1] != rho_mean_eval { return None; }
     let u_var = transcript.ef_field_vec(lg_m);
     let var_terms = lnc_var_terms(n_real);
     let (okv, z_var, fcv) = efo::verify_virtual(&proof.var, &var_terms, Ef::ZERO, lg_len, transcript);
@@ -7753,6 +7886,11 @@ fn verify_reverse_lnc(op: &Op, point: &[Ef], value: Ef,
     if fv[0] != ef_eq_poly(&u_var, &z_var[lg_d..]) || fcv != efo::virtual_eval(&var_terms, fv) {
         return None;
     }
+    let eq_var_col = efo::eq_evals(&z_var[..lg_d]);
+    if eq_var_col.len() != d { return None; }
+    let rho_var_eval = (0..n_real)
+        .fold(Ef::ZERO, |acc, j| acc + eq_var_col[j]);
+    if fv[1] != rho_var_eval { return None; }
     let q_out = transcript.ef_field_vec(lg_len);
     let g1 = transcript.ef_field();
     let g2 = transcript.ef_field();
@@ -17562,7 +17700,8 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             ReverseReduction::Lnc { proof } => {
                 b.virtual_proof(&proof.row, 3)?;
                 b.virtual_proof(&proof.mean, 3)?;
-                b.virtual_proof(&proof.var, 3)?;
+                // The centered quadratic has max degree 4 (x*mean terms).
+                b.virtual_proof(&proof.var, 4)?;
                 b.virtual_proof(&proof.out, 4)?;
                 b.same_poly(&proof.bind)?;
                 b.fractional(&proof.rsqrt.witness)?;
@@ -26928,73 +27067,103 @@ mod tests {
         }
     }
 
-    /// Softmax remainder window: a real GPT-2 row sum (86,741 > 2^16) now
-    /// proves honestly with the 17-bit window, while a row sum just above
-    /// 2^17 whose rounding error leaves [0,2^17) fails closed at aux prep.
+    /// Softmax remainder window: the measured real-graph maximum row sum
+    /// (674,671) and the S=2^16 boundary prove with the B=21 window; a row
+    /// just above 2^21 whose rounding error leaves the window fails closed.
     #[test]
-    fn softmax_rowsum_window_2p17() {
-        // Positive: S = 5*10843 + 3*10842 = 86,741 (GPT-2 op12 row2 value).
-        let mut store = Store::new();
+    fn softmax_rowsum_window_measured() {
+        fn run_positive(table_vals: Vec<i64>, row_idx: Vec<u32>, m: usize, n: usize,
+            expect_s: i64) -> bool {
+            let mut store = Store::new();
+            let mut table = vec![Goldilocks::ZERO; 32];
+            for (i, v) in table_vals.iter().enumerate() { table[i] = from_i64(*v); }
+            let table = store.push(table);
+            let idx = store.push_idx((0..m).flat_map(|_| row_idx.iter().copied()).collect());
+            let e = store.push(vec![Goldilocks::ZERO; m * n]);
+            let out = store.push(vec![Goldilocks::ZERO; m * n]);
+            let ops = vec![Op::Softmax { idx, e, out, table, m, n }];
+            forward_ops(&mut store, &ops);
+            let s_val: i64 = (0..n).map(|j| to_i64(store.get(e)[j])).sum();
+            assert_eq!(s_val, expect_s, "unexpected row sum");
+            let model = TrustedModelManifest::from_offline_commitment(
+                &[], &store.owned_slices(), &ops)
+                .with_index_shapes(&[(idx, m * n)].into());
+            let lgl = (m * n).trailing_zeros() as usize;
+            let point: Vec<Ef> = (0..lgl).map(|b| ef_u64(2 + b as u64)).collect();
+            let value = ef_eval(store.get(out), &point);
+            let mut la = prepare_lookup_aux(&store, &ops, &model).unwrap();
+            let mut sa = prepare_softmax_aux(&store, &ops, &model).unwrap();
+            let take = |v: &mut Vec<PreparedAux>, role: AuxRole| {
+                let p = v.iter().position(|q| q.descriptor.role == role).unwrap();
+                v.remove(p)
+            };
+            let pairs = take(&mut la, AuxRole::LookupPairs);
+            let mult = take(&mut la, AuxRole::LookupMultiplicity);
+            let sum_aux = take(&mut sa, AuxRole::SoftmaxSum);
+            let rem_aux = take(&mut sa, AuxRole::SoftmaxRemainder);
+            let out_aux = prepare_softmax_out_aux(&store, &ops).unwrap().remove(0);
+            let descs = [pairs.descriptor.clone(), mult.descriptor.clone(),
+                sum_aux.descriptor.clone(), rem_aux.descriptor.clone(),
+                out_aux.descriptor.clone()];
+            let mut tp = Transcript::new(b"softmax-window-measured");
+            let (proof, _claims) = prove_reverse_softmax(
+                &store, &ops[0], &point, value, pairs, mult, sum_aux, rem_aux,
+                out_aux, &model, false, &mut tp, None).expect("window proof");
+            let mut tv = Transcript::new(b"softmax-window-measured");
+            let ok = verify_reverse_softmax(&ops[0], &point, value, &descs[0],
+                &descs[1], &descs[2], &descs[3], &descs[4], &model, false,
+                &proof, &mut tv, None).is_some();
+            if !ok { return false; }
+            // Forged caller value must still be rejected.
+            let mut tv = Transcript::new(b"softmax-window-measured");
+            verify_reverse_softmax(&ops[0], &point, value + Ef::ONE, &descs[0],
+                &descs[1], &descs[2], &descs[3], &descs[4], &model, false,
+                &proof, &mut tv, None).is_none()
+        }
         let (m, n) = (4usize, 8usize);
-        let table = store.push((0..32)
-            .map(|i| from_i64(10842 + (i % 2) as i64)).collect());
-        let row_idx: Vec<u32> = [1u32, 1, 1, 1, 1, 0, 0, 0].to_vec();
-        let idx = store.push_idx((0..m).flat_map(|_| row_idx.iter().copied()).collect());
-        let e = store.push(vec![Goldilocks::ZERO; 32]);
-        let out = store.push(vec![Goldilocks::ZERO; 32]);
-        let ops = vec![Op::Softmax { idx, e, out, table, m, n }];
-        forward_ops(&mut store, &ops);
-        let s_val: i64 = (0..n).map(|j| to_i64(store.get(e)[j])).sum();
-        assert_eq!(s_val, 86741);
-        let model = TrustedModelManifest::from_offline_commitment(
-            &[], &store.owned_slices(), &ops).with_index_shapes(&[(idx, 32usize)].into());
-        let point: Vec<Ef> = (0..5).map(|b| ef_u64(2 + b as u64)).collect();
-        let value = ef_eval(store.get(out), &point);
-        let mut la = prepare_lookup_aux(&store, &ops, &model).unwrap();
-        let mut sa = prepare_softmax_aux(&store, &ops, &model).unwrap();
-        let take = |v: &mut Vec<PreparedAux>, role: AuxRole| {
-            let p = v.iter().position(|q| q.descriptor.role == role).unwrap();
-            v.remove(p)
-        };
-        let pairs = take(&mut la, AuxRole::LookupPairs);
-        let mult = take(&mut la, AuxRole::LookupMultiplicity);
-        let sum_aux = take(&mut sa, AuxRole::SoftmaxSum);
-        let rem_aux = take(&mut sa, AuxRole::SoftmaxRemainder);
-        let out_aux = prepare_softmax_out_aux(&store, &ops).unwrap().remove(0);
-        let refs = [pairs.descriptor.clone(), mult.descriptor.clone(),
-            sum_aux.descriptor.clone(), rem_aux.descriptor.clone(),
-            out_aux.descriptor.clone()];
-        let mut tp = Transcript::new(b"softmax-window17");
-        let (proof, _claims) = prove_reverse_softmax(
-            &store, &ops[0], &point, value, pairs, mult, sum_aux, rem_aux, out_aux,
-            &model, false, &mut tp, None).expect("S=86741 must prove with a 17-bit window");
-        let mut tv = Transcript::new(b"softmax-window17");
-        assert!(verify_reverse_softmax(&ops[0], &point, value, &refs[0], &refs[1],
-            &refs[2], &refs[3], &refs[4], &model, false, &proof, &mut tv, None).is_some(),
-            "S=86741 must verify");
-        let mut tv = Transcript::new(b"softmax-window17");
-        assert!(verify_reverse_softmax(&ops[0], &point, value + Ef::ONE, &refs[0],
-            &refs[1], &refs[2], &refs[3], &refs[4], &model, false, &proof,
-            &mut tv, None).is_none());
+        // Original real failure under the 16-bit window.
+        assert!(run_positive(vec![10842, 10843],
+            vec![1, 1, 1, 1, 1, 0, 0, 0], m, n, 86_741));
+        // Measured real-graph maximum (GPT-2 op142 row15, TimesFM op328 row15).
+        assert!(run_positive(vec![84333, 84334],
+            vec![0, 1, 1, 1, 1, 1, 1, 1], m, n, 674_671));
+        // Requested boundary: S = 2^16 exactly.
+        assert!(run_positive(vec![8192],
+            vec![0, 0, 0, 0, 0, 0, 0, 0], m, n, 65_536));
 
-        // Negative: S = 1 + 6*18724 + 18728 = 131,073 (just above 2^17).
-        // The e=1 entry rounds down (65536/131073 ~ 0.499996), so the honest
-        // remainder is exactly 2^17 and leaves the committed window.
+        // Negative boundary: S = 2^21 + 1 with an entry whose rounding error
+        // is exactly +2^20, so the honest remainder is 2^21 and leaves the
+        // committed window.
+        let big = (1i64 << 21) + 1;
+        let target = (big - 1) / 2;
+        let mut special = 0i64;
+        for e in 1..big {
+            if e.checked_mul(1i64 << 16).unwrap() % big == target {
+                special = e;
+                break;
+            }
+        }
+        assert!(special > 0, "no residue found");
+        let rest = big - special - 6;
+        assert!(rest > 0);
         let mut store = Store::new();
-        let (m, n) = (4usize, 8usize);
-        let table = store.push((0..32)
-            .map(|i| from_i64(match i % 3 { 0 => 1, 1 => 18724, _ => 18728 })).collect());
-        let row_idx: Vec<u32> = [0u32, 1, 1, 1, 1, 1, 1, 2].to_vec();
+        let mut table = vec![Goldilocks::ZERO; 32];
+        table[0] = from_i64(special);
+        table[1] = from_i64(1);
+        table[2] = from_i64(rest);
+        let table = store.push(table);
+        let row_idx = vec![0u32, 1, 1, 1, 1, 1, 1, 2];
         let idx = store.push_idx((0..m).flat_map(|_| row_idx.iter().copied()).collect());
-        let e = store.push(vec![Goldilocks::ZERO; 32]);
-        let out = store.push(vec![Goldilocks::ZERO; 32]);
+        let e = store.push(vec![Goldilocks::ZERO; m * n]);
+        let out = store.push(vec![Goldilocks::ZERO; m * n]);
         let ops = vec![Op::Softmax { idx, e, out, table, m, n }];
         forward_ops(&mut store, &ops);
-        assert_eq!((0..n).map(|j| to_i64(store.get(e)[j])).sum::<i64>(), 131073);
+        assert_eq!((0..n).map(|j| to_i64(store.get(e)[j])).sum::<i64>(), big);
         let model = TrustedModelManifest::from_offline_commitment(
-            &[], &store.owned_slices(), &ops).with_index_shapes(&[(idx, 32usize)].into());
+            &[], &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, m * n)].into());
         assert!(prepare_softmax_aux(&store, &ops, &model).is_none(),
-            "S=131073 with remainder 2^17 must fail closed");
+            "S=2^21+1 with remainder 2^21 must fail closed");
     }
 
     /// PR#45 B1: Softmax reverse roundtrip and tamper rejection (direct and
@@ -27813,6 +27982,140 @@ mod tests {
             "AUDIT FAILURE: forged LNC output claim was ACCEPTED");
     }
 
+    /// AUDIT RED->GREEN (LNC rho binding): forge mean+1 and sum_x+n in the
+    /// row aux, use fake mean/var prefix-selector virtuals (the prover hook
+    /// solves for the constant rho shift that zeroes each sumcheck), and
+    /// recompute the committed out witness/out column accordingly. Without
+    /// the rho final-eval checks this proof is accepted; with them it must
+    /// be rejected.
+    #[test]
+    fn audit_lnc_forged_rho_must_reject() {
+        fn recommit(p: &mut PreparedAux) {
+            let refs: Vec<&[Goldilocks]> = p.columns.iter().map(Vec::as_slice).collect();
+            let padded = 1usize << p.descriptor.arity;
+            let vars = p.descriptor.columns.checked_mul(padded).unwrap()
+                .checked_next_power_of_two().unwrap().trailing_zeros() as usize;
+            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+            let whir = zkie_core::pcs::whir::Whir::with_params(
+                p.descriptor.arity, VERIFIER_SECURITY, pow);
+            let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+            p.descriptor.commitment = commitment;
+            p.prover_data = prover_data;
+            p.protocol = protocol;
+            p.whir = whir;
+        }
+        let mut store = Store::new();
+        let (m, d, n_real) = (4usize, 8usize, 5usize);
+        let len = m * d;
+        let xv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 7) % 17) - 8)).collect();
+        let wv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 5) % 9) + 1)).collect();
+        let bv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 3) % 5) - 2)).collect();
+        let x = store.push(xv.clone());
+        let w = store.push(wv.clone());
+        let b = store.push(bv.clone());
+        let out = store.push(vec![Goldilocks::ZERO; len]);
+        let rsqrt_t = store.push((0..32).map(|i| from_i64(1000 + i as i64)).collect());
+        let ops = vec![Op::LayerNormCentered { x, w, b, out,
+            rsqrt_table: rsqrt_t, m, d, n_real }];
+        forward_ops(&mut store, &ops);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-lnc-forged-rho");
+        let model = TrustedModelManifest::from_offline_commitment(
+            &cached, &store.owned_slices(), &ops);
+        let lay = lnc_row_layout(n_real).unwrap();
+        let take = |v: &mut Vec<PreparedAux>, role: AuxRole| {
+            let p = v.iter().position(|q| q.descriptor.role == role).unwrap();
+            v.remove(p)
+        };
+        let mut auxall = prepare_lnc_aux(&store, &ops, &model).unwrap();
+        let mut auxp = LncAux {
+            row: take(&mut auxall, AuxRole::LncRowWitness),
+            out: take(&mut auxall, AuxRole::LncOutWitness),
+            rsqrt_pairs: take(&mut auxall, AuxRole::LncRsqrtPairs),
+            rsqrt_mult: take(&mut auxall, AuxRole::LncRsqrtMultiplicity),
+        };
+        // Forge mean+1, sum_x+n for every real row, with consistent bounded
+        // mean decomposition.
+        let n = n_real as i64;
+        let mut row_mean = vec![0i64; m];
+        for r in 0..m {
+            let mean0 = to_i64(auxp.row.columns[lay.mean][r]);
+            let sum0 = to_i64(auxp.row.columns[lay.sum_x][r]);
+            let mean1 = mean0 + 1;
+            row_mean[r] = mean1;
+            auxp.row.columns[lay.mean][r] = from_i64(mean1);
+            auxp.row.columns[lay.sum_x][r] = from_i64(sum0 + n);
+            let shifted = mean1 + (1i64 << 15);
+            let raw = shifted.div_euclid(1i64 << LNC_MEAN_RAW_BITS);
+            let rem = shifted.rem_euclid(1i64 << LNC_MEAN_RAW_BITS);
+            auxp.row.columns[lay.raw_mean][r] = from_i64(raw);
+            auxp.row.columns[lay.rem_raw_mean][r] = from_i64(rem);
+            let raw_off = (raw + (1i64 << 15)) as u64;
+            for j in 0..LNC_MEAN_RAW_BITS {
+                auxp.row.columns[lay.raw_mean_bits + j][r] =
+                    Goldilocks::from_u64((raw_off >> j) & 1);
+            }
+            for j in 0..LNC_MEAN_REM_BITS {
+                auxp.row.columns[lay.rem_raw_mean_bits + j][r] =
+                    Goldilocks::from_u64(((rem as u64) >> j) & 1);
+            }
+        }
+        // Recompute the out witness for the forged mean (same honest rstd).
+        let mut forged_out = vec![Goldilocks::ZERO; len];
+        for i in 0..len {
+            let row = i / d;
+            let rstd = to_i64(auxp.row.columns[RMS_RSTD][row]);
+            let raw = (to_i64(xv[i]) - row_mean[row]).checked_mul(rstd).unwrap()
+                .checked_mul(to_i64(wv[i])).unwrap();
+            let o = round_div(raw, 1i64 << 32);
+            let out_v = o + to_i64(bv[i]);
+            let rem = raw - o.checked_mul(1i64 << 32).unwrap() + (1i64 << 31);
+            let ob = o + (1i64 << 31);
+            assert!(rem >= 0 && rem < (1i64 << 32));
+            assert!(ob >= 0 && ob < (1i64 << 32));
+            let rem_lo = rem & 0xFFFF;
+            let rem_hi = rem >> 16;
+            let olo = ob & 0xFFFF;
+            let ohi = ob >> 16;
+            forged_out[i] = from_i64(out_v);
+            auxp.out.columns[LNC_OUT][i] = from_i64(out_v);
+            auxp.out.columns[LNC_REM_LO][i] = from_i64(rem_lo);
+            auxp.out.columns[LNC_REM_HI][i] = from_i64(rem_hi);
+            auxp.out.columns[LNC_O_LO][i] = from_i64(olo);
+            auxp.out.columns[LNC_O_HI][i] = from_i64(ohi);
+            for j in 0..LNC_LIMB_BITS {
+                auxp.out.columns[LNC_BITS + j][i] =
+                    Goldilocks::from_u64(((rem_lo as u64) >> j) & 1);
+                auxp.out.columns[LNC_BITS + LNC_LIMB_BITS + j][i] =
+                    Goldilocks::from_u64(((rem_hi as u64) >> j) & 1);
+                auxp.out.columns[LNC_BITS + 2 * LNC_LIMB_BITS + j][i] =
+                    Goldilocks::from_u64(((olo as u64) >> j) & 1);
+                auxp.out.columns[LNC_BITS + 3 * LNC_LIMB_BITS + j][i] =
+                    Goldilocks::from_u64(((ohi as u64) >> j) & 1);
+            }
+        }
+        store.v[out] = TensorData::Owned(forged_out);
+        recommit(&mut auxp.row);
+        recommit(&mut auxp.out);
+        let descs = [auxp.row.descriptor.clone(), auxp.out.descriptor.clone(),
+            auxp.rsqrt_pairs.descriptor.clone(), auxp.rsqrt_mult.descriptor.clone()];
+        let point: Vec<Ef> = (0..len.trailing_zeros())
+            .map(|i| ef_u64(2 + i as u64)).collect();
+        let forged_value = ef_eval(store.get(out), &point);
+        let mut tp = Transcript::new(b"audit-lnc-rho");
+        let (proof, _claims) = prove_reverse_lnc_impl(
+            &store, &ops[0], &point, forged_value, auxp, &model, &mut tp,
+            None, true, false).expect("forged rho proof");
+        let refs = LncAuxRefs { row: &descs[0], out: &descs[1],
+            rsqrt_pairs: &descs[2], rsqrt_mult: &descs[3] };
+        let mut tv = Transcript::new(b"audit-lnc-rho");
+        assert!(verify_reverse_lnc(&ops[0], &point, forged_value, refs, &model,
+            &proof, &mut tv, None).is_none(),
+            "AUDIT FAILURE: forged LNC rho proof was ACCEPTED");
+    }
+
     /// LNC at a real-model shape: GPT-2/TimesFM hidden width with
     /// n_real != d (768 real columns of 1024), m = 16 rows. Exercises the
     /// mean/var truncation with a non-power-of-two n_real, the per-row
@@ -27964,6 +28267,10 @@ mod tests {
             ("sidx", Box::new(|v| bump(v, roww, RMS_SIDX))),
             ("rem_bits", Box::new(|v| flip(v, roww, lay.rem_bits))),
             ("delta_bits", Box::new(|v| flip(v, roww, lay.delta_bits))),
+            ("mean_raw", Box::new(|v| bump(v, roww, lay.raw_mean))),
+            ("mean_rem_raw", Box::new(|v| bump(v, roww, lay.rem_raw_mean))),
+            ("mean_raw_bits", Box::new(|v| flip(v, roww, lay.raw_mean_bits))),
+            ("mean_rem_bits", Box::new(|v| flip(v, roww, lay.rem_raw_mean_bits))),
             ("out", Box::new(|v| bump(v, outw, LNC_OUT))),
             ("rem_lo", Box::new(|v| bump(v, outw, LNC_REM_LO))),
             ("rem_hi", Box::new(|v| bump(v, outw, LNC_REM_HI))),
@@ -28037,6 +28344,12 @@ mod tests {
         assert!(check(&|p| p.mean.final_evals[3] =
             p.mean.final_evals[3] + Ef::ONE).is_none(),
             "verifier accepted tampered sum_x eval");
+        assert!(check(&|p| p.mean.final_evals[1] =
+            p.mean.final_evals[1] + Ef::ONE).is_none(),
+            "verifier accepted tampered mean rho eval");
+        assert!(check(&|p| p.var.final_evals[1] =
+            p.var.final_evals[1] + Ef::ONE).is_none(),
+            "verifier accepted tampered var rho eval");
         assert!(check(&|p| p.var.final_evals[4] =
             p.var.final_evals[4] + Ef::ONE).is_none(),
             "verifier accepted tampered var eval");

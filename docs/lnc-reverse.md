@@ -1,7 +1,7 @@
 # LayerNormCentered reverse reduction (6th B1 operator)
 
 Status: implemented in `crates/zkie-ops/src/compose.rs`; ops suite green
-(208 tests incl. 5 LNC tests). Real-model evidence below.
+(209 tests incl. 6 LNC tests). Real-model evidence below.
 
 ## 1. Forward semantics (aligned with `layer_norm_centered.rs`)
 
@@ -23,7 +23,7 @@ Per row with `n_real <= d` real columns:
 
 | Role | len | columns |
 |---|---|---|
-| `LncRowWitness` | m | full RMS row layout (`var` as `ms`, `sum_var` as `sum_sq`) + `mean, sum_x, rem_mean, delta, rem_{mean} bits, delta bits` |
+| `LncRowWitness` | m | full RMS row layout (`var` as `ms`, `sum_var` as `sum_sq`) + `mean, sum_x, rem_mean, delta, rem/delta bits`, and a bounded mean decomposition (`mean = 2^16*raw + rem - 2^15`, signed 16-bit raw + 16-bit rem + Boolean bits) |
 | `LncOutWitness` | m*d | `out, rem_lo, rem_hi, o_lo, o_hi` + four 16-bit decompositions (`rem_lo/rem_hi` from `rem`, `o_lo/o_hi` from `out-b+2^31`) |
 | `LncRsqrtPairs` | m | `(s_idx, rstd)` |
 | `LncRsqrtMultiplicity` | table_len | counts per table entry |
@@ -38,14 +38,21 @@ column used by the `same_poly` bind.
   raw) plus:
   * `sum_x - n*mean + n/2 - rem_mean = 0` (mean truncation),
   * rem/delta bit decompositions and `rem_mean + delta = n-1`,
+  * the bounded mean decomposition `mean = 2^16*raw + rem - 2^15`, with
+    signed 16-bit raw (raw+2^15 bits), 16-bit rem, and Booleanity. Together
+    with the rem range this makes the mean quotient unique (TL audit HIGH),
   * Booleanity of every new bit.
   This pins `s_idx` to `rsqrt_index(var)`, so the lookup cannot select a wrong
   table entry.
 * **Mean virtual**: `sum_j rho_j x_ij = sum_x_i` over the m*d domain, with the
   row-eq broadcast and `eq_i` sampled on the row axis. The `sum_x_b` column is
-  constant across d, hence the `d_inv` factor.
+  constant across d, hence the `d_inv` factor. The verifier pins the
+  prover-supplied rho column by recomputing `sum_{j<n_real} eq(z[..lg_d])_j`
+  and checking the rho final evaluation (TL audit CRITICAL; same as RmsNorm).
 * **Var virtual**: `sum_j rho_j (x_ij - mean_i)^2 = n*var_i + rem_var_i - n/2`,
-  with `mean_b/var_b/rem_var_b` opened at the row point.
+  with `mean_b/var_b/rem_var_b` opened at the row point and the same rho
+  final-evaluation check. Its term pencil has max degree 4, charged as 4 in
+  the budget arm.
 * **Out virtual**: `(x - mean_b)*rstd_b*w + 2^31 = 2^32*(out-b) + rem_lo +
   2^16 rem_hi`, the signed pin `out-b+2^31 = o_lo + 2^16 o_hi`, and the four
   16-bit Boolean decompositions. The 32-bit remainder range plus the pin gives
@@ -68,10 +75,15 @@ column used by the `same_poly` bind.
   transcript. Red (accepted) with the merged-claim check disabled, green
   (rejected) with the fix. See the tamper test for the exact gates.
 * `lnc_tamper_matrix_must_reject` — prover rejects mutated mean/sum_x/
-  rem_mean/var/rem_var/rstd/s_idx/bits, out limbs/bits/value, rsqrt pair and
-  multiplicity; verifier rejects mutated mean/var/out/limb/ones evals, row
-  mean/ms evals, and a mutated rsqrt index; the pooled bound verifier rejects
-  a mutated LNC step and a tampered aux descriptor.
+  rem_mean/mean decomposition/var/rem_var/rstd/s_idx/bits, out limbs/bits/
+  value, rsqrt pair and multiplicity; verifier rejects mutated mean/var/out/
+  limb/ones evals, the mean/var rho evals, row mean/ms evals, and a mutated
+  rsqrt index; the pooled bound verifier rejects a mutated LNC step and a
+  tampered aux descriptor.
+* `audit_lnc_forged_rho_must_reject` — TL audit regression: row aux forged to
+  mean+1 and sum_x+n, the out witness recomputed, and the mean/var virtuals
+  built with fake rho columns solved to zero the sums. Accepted when the rho
+  gates are disabled (red evidence), rejected with the gates enabled.
 * `lnc_real_shape_roundtrip_pooled` — GPT-2/TimesFM shape
   `(m,d,n_real)=(16,1024,768)` (non-power-of-two n_real), direct + pooled,
   K=4.
@@ -96,9 +108,10 @@ real-shape K=4; both below `MAX_EFFECTIVE_OPENINGS=64`.
   real graph, keep the real input activations/weights/outputs, and prove one
   bound statement over them. `LNC_LIMIT=N` restricts the prefix for a quick
   check.
-  - GPT-2 (1 op, m=16, real 2^23-entry table): prove 66.6 s,
-    proof 940,766 bytes, verify=true, budget K=5.
-  - TimesFM (1 op): prove 78.6 s, proof 954,848 bytes, verify=true, K=5.
+  - GPT-2 (1 op, m=16, real 2^23-entry table, post-audit build):
+    prove 28.4 s, proof 940,094 bytes, verify=true, budget K=5.
+  - TimesFM (1 op, post-audit build): prove 33.8 s, proof 957,312 bytes,
+    verify=true, K=5.
   - The all-ops runs (25 GPT-2 / 20 TimesFM LNC ops in one proof) are the
     same harness without `LNC_LIMIT`; they are long because each op carries
     its own rsqrt table lookup (the M4 per-table aggregation target).

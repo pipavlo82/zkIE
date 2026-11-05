@@ -62,36 +62,57 @@ statement through the bound entry (B2/B3, not yet).
 | StableSoftmaxIndex | softmax_scaled.rs | yes (`74088e4`) | all four models | done (B1) |
 | RmsNorm | rms_norm.rs | yes (`990b709`) | Gemma3/DeepSeek/TimesFM | done (B1) |
 | RoPE | rope.rs | yes (`2346cf3`) | Gemma3/DeepSeek | done (B1) |
-| LayerNormCentered | layer_norm_centered.rs | **no** | GPT-2/TimesFM | out of the five-op scope; stays fail-closed and is listed as a remaining support gap |
+| LayerNormCentered | layer_norm_centered.rs | yes (LNC reverse) | GPT-2/TimesFM | B1 op #6; mean/var/rsqrt/out reduction on the pooled aux wire (`docs/lnc-reverse.md`) |
 | SoftmaxIndex / Layernorm / BatchedMatMul | some | no | none of the four | out of scope; fail-closed |
 
-## 2b. Softmax row-sum window: S <= 2^17
+## 2b. Softmax row-sum window: measured max S and B=21
 
 The reverse Softmax normalization is
 
-    out(i,j) = round(e(i,j) * 2^B / S(i)),     S(i) = sum_j e(i,j),
+    out(i,j) = round(e(i,j) * 2^16 / S(i)),     S(i) = sum_j e(i,j).
 
-and the proof commits `rem = e*2^B - out*S + 2^(B-1)` with a B-bit Boolean
-decomposition, enforcing `rem in [0, 2^B)` via
+The proof commits `rem = e*2^16 - out*S + 2^(B-1)` with B Boolean columns
+and enforces `rem in [0, 2^B)` through
 
-    out*S - 2^B*e - rem + 2^(B-1) = 0.
+    out*S - 2^16*e - rem + 2^(B-1) = 0.
 
-The true rounding error is `e*2^B - round(e*2^B/S)*S`, whose absolute value is
-at most `S/2`. The half-offset window `[-2^(B-1), 2^(B-1))` therefore contains
-the error exactly when `S <= 2^B`; above that, the honest remainder leaves the
-window and the aux preparation fails closed.
+The forward output scale stays **2^16**; only the committed remainder window
+is widened. The true rounding error is at most `S/2` in absolute value, so the
+half-offset window contains it when `|S| <= 2^B`; a row outside that bound
+fails closed at aux preparation.
 
-`SOFTMAX_SCALE_BITS` was raised from 16 to **17** after the GPT-2 real graph
-produced an honest row sum of **86,741 (`op 12, row 2`) > 2^16 = 65,536**.
-The new bound is `S <= 2^17 = 131,072`; larger row sums still fail closed.
-Uniqueness is unchanged: the 17-bit decomposition plus Booleanity is
-canonical, and the window `[2^(B-1)-S/2, 2^(B-1)+S/2)` still admits at most
-two consecutive integers for `out`. The forward remains `i64`
-(`out = round_div(e*2^16, S)`); only the proof's remainder width and the
-rescaling virtual coefficients change. Budget: one extra remainder column per
-Softmax op, one extra opening claim, and three extra gamma terms for the added
-bit (one reconstruction, two Booleanity); the PCS opening count K is
-unchanged.
+**Measured widths** (full real-graph scan, `models/*/examples/softmax_scan.rs`):
+
+| graph | Softmax ops | max abs S | location |
+|---|---|---|---|
+| GPT-2, M=16 | 144 | 573,417 | op 142, row 15 |
+| TimesFM, SEQ=16 | 320 | 674,671 | op 328, row 15 |
+
+Global `max|S| = 674,671`, so `ceil(log2(max)) = 20`. Per the TL's
+measure-then-width rule with one bit of margin, `SOFTMAX_REM_BITS = 21`
+(`S <= 2^21 = 2,097,152`). The earlier values 227,312 (GPT-2 op12 row8) and
+164,266 (TimesFM op29 row4) were the first failures under the 17-bit window,
+not the maxima; a 21-bit window covers both.
+
+**Exact candidate count.** The remainder condition is equivalent to
+
+    out in ( (X - 2^(B-1))/S, (X + 2^(B-1))/S ],  X = e*2^16,
+
+a half-open interval of length `2^B/S`. It contains at most `ceil(2^B/S)`
+consecutive integers. With B=21 the "at most two candidates" property holds
+for `S >= 2^20 = 1,048,576`; rows with smaller S can have more candidates
+(e.g. S=2^16 has up to 32). This is a property of a fixed remainder window:
+covering the measured max S=674,671 and keeping the at-most-two threshold at
+S=2^16 are incompatible for a single B. Real rows include very small S
+(min observed 0), so the uniqueness statement from the 17-bit window
+(`S >= 2^16 -> at most 2`) does not carry over unchanged to B=21. The
+relation and the committed out still bind one value, but the fixed-point
+rounding is not selected uniquely by the window alone for small S. This is
+flagged for the TL; no domain contract is changed in this commit.
+
+Regression `softmax_rowsum_window_measured`: S=86,741 (original failure),
+S=674,671 (measured max), and S=2^16 prove; S=2^21+1 with an error of exactly
++2^20 (remainder 2^21) fails closed.
 
 ## 3. Implementation constraints for B1
 
@@ -119,7 +140,9 @@ unchanged.
 
 All five priority ops now have bound reverse reductions on
 `fix/soundness-repair` (Softmax `908e00b`, ScaleGate `c47ed80`,
-StableSoftmaxIndex `74088e4`, RmsNorm `990b709`, RoPE `2346cf3`). Each
+StableSoftmaxIndex `74088e4`, RmsNorm `990b709`, RoPE `2346cf3`), and
+LayerNormCentered (op #6) is covered by the LNC reduction described in
+`docs/lnc-reverse.md`. Each
 reduction commits its witnesses before the transcript challenges, proves the
 forward rounding/range/index semantics with EF virtuals, and authenticates
 the endpoints against the committed tensors/tables; the old unsafe entries
