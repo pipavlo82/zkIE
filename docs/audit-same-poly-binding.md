@@ -136,3 +136,44 @@ S-series / B1 reviews are not sound until this is fixed.
 4. **Regression**: enable the two red tests after the fix and add an
    attack test per affected op (same construction; regenerate any
    transcript-dependent post-bind proofs).
+
+## 6. Fix status (2026-11-05)
+
+All eight HOLE reductions are fixed, each with a red->green attack test and
+the per-op out witness committed before the challenge:
+
+| Commit | Op |
+|---|---|
+| 6b4a4a0 | ScaleVec (shift 0) |
+| 2ad9c45 | BroadcastScale |
+| 26b4083 | ScaleVecShifted |
+| cbaf2ca | ScaleGate |
+| c4d8c1b | Softmax |
+| d285d52 | StableSoftmaxIndex |
+| 9852c59 | RoPE |
+| b555a89 | RmsNorm (F1 + F2 + LOW items) |
+
+The fix pattern is uniform: the out column (or its limbs) is part of a
+committed aux batch absorbed into the transcript **before** the virtual
+challenge; the `verify_same_poly` merged claim is consumed and opened at
+the merged point and at the virtual endpoint, so gamma separation forces
+every claim value to equal the committed out column's evaluation.
+
+RmsNorm F2 deviation from the literal `out_lo/out_hi` wording: RmsNorm's
+out is signed, so the witness pins `out + 2^31` to `[0, 2^32)` through two
+16-bit limbs (identity-table lookups) and the extra out-virtual equation
+`out + 2^31 = out_lo + 2^16*out_hi`. This is the signed-32-bit equivalent
+and still gives a unique rounded solution.
+
+Multi-consumer DAG merge: per TL review, the per-op bind now authenticates
+the merge transitively; no DAG code change is made. The requested attack
+test `audit_multi_consumer_forged_claim_must_reject` (two consumers of one
+intermediate, one seed forged) is green. The CI lint
+`scripts/check_same_poly_binding.py` and the in-tree
+`same_poly_discard_lint` test reject unmarked
+`verify_same_poly(...).is_none()` discards; the remaining legitimate sites
+carry `LINT-ALLOW` justifications.
+
+Wire/transcript changed for every proof containing the fixed ops, so the
+old segmented baselines are invalid and are being re-run (full64 A/B/D/C,
+A1 K/W/S, negative matrix, double-run byte determinism).

@@ -9485,6 +9485,7 @@ pub fn verify_projection_chain(
             (out_pt.clone(), mle::eval(&ys[i], &out_pt)),
             (in_pt.clone(), mle::eval(&ys[i], &in_pt)),
         ];
+        // LINT-ALLOW: ys is recomputed by the verifier from the committed input.
         if verify_same_poly(&proof.binds[i - 1], &claims, transcript).is_none() {
             return false;
         }
@@ -9592,6 +9593,7 @@ pub fn verify_projection_sharded(
             (out_pt.clone(), mle::eval(&ys[b], &out_pt)),
             (in_pt.clone(), mle::eval(&ys[b], &in_pt)),
         ];
+        // LINT-ALLOW: ys is recomputed by the verifier from the committed input.
         if verify_same_poly(&proof.cross_binds[ci], &claims, transcript).is_none() {
             return false;
         }
@@ -9768,6 +9770,7 @@ pub fn verify_residual_chain(
         claims.push((in_pt.clone(), mle::eval(&xs[i], &in_pt)));
         let r_i = proof.adds[i].1.clone();
         claims.push((r_i.clone(), mle::eval(&xs[i], &r_i)));
+        // LINT-ALLOW: xs is recomputed by the verifier from the committed input.
         if verify_same_poly(&proof.same_x[i], &claims, transcript).is_none() {
             return false;
         }
@@ -9780,6 +9783,7 @@ pub fn verify_residual_chain(
             (pt_i.clone(), mle::eval(&ps[i], &pt_i)),
             (r_i.clone(), mle::eval(&ps[i], &r_i)),
         ];
+        // LINT-ALLOW: ps is recomputed by the verifier from the committed input.
         if verify_same_poly(&proof.same_p[i], &claims, transcript).is_none() {
             return false;
         }
@@ -12818,6 +12822,8 @@ fn verify_shard_precomputed_inner(
         if **t != proof.bound[i] {
             { return None; }
         }
+        // LINT-ALLOW: cs values come from verified per-op sumchecks/openings;
+        // this merge is a consistency check, not the sole authentication.
         if verify_same_poly(&proof.binds[i], cs, transcript).is_none() {
             { return None; }
         }
@@ -13053,6 +13059,8 @@ fn verify_shard_dag_inner(
         return false;
     }
     for (ci, &t) in proof.cross_tensors.iter().enumerate() {
+        // LINT-ALLOW: by_tensor claims are built from verified shard proofs and
+        // committed boundary openings; the merge is a consistency check.
         if verify_same_poly(&proof.cross_binds[ci], &by_tensor[&t], &mut master).is_none() {
             return false;
         }
@@ -26165,6 +26173,72 @@ mod tests {
         let negp = build_aux(&mut auxneg);
         assert!(prove_reverse_rms_norm(&st3, &ops3[0], &p3, v3, negp, &model3,
             &mut Transcript::new(b"rms-low-negms")).is_none());
+    }
+
+    /// CI lint: no production `verify_same_poly(...).is_none()` discard
+    /// without a `LINT-ALLOW` justification. Mirrors
+    /// scripts/check_same_poly_binding.py.
+    #[test]
+    fn same_poly_discard_lint() {
+        let src = include_str!("compose.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let lines: Vec<&str> = prod.lines().collect();
+        let mut hits = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("verify_same_poly") { continue; }
+            let end = (i + 12).min(lines.len());
+            if !lines[i..end].iter().any(|x| x.contains(".is_none()")) { continue; }
+            let start = i.saturating_sub(2);
+            if lines[start..end].iter().any(|x| x.contains("LINT-ALLOW")) { continue; }
+            hits.push(i + 1);
+        }
+        assert!(hits.is_empty(),
+            "unauthenticated verify_same_poly(...).is_none() at lines {:?}; consume the merged claim or add LINT-ALLOW with justification",
+            hits);
+    }
+
+    /// AUDIT (multi-consumer DAG): an intermediate tensor consumed by two
+    /// ops must not allow one consumer's claim to be forged. The honest prover
+    /// refuses the forged seed (it recomputes the store relations), and the
+    /// verifier rejects the forged seed against the honest proof.
+    #[test]
+    fn audit_multi_consumer_forged_claim_must_reject() {
+        let mut store = Store::new();
+        let l = 32usize;
+        let a = store.push((0..l).map(|i| from_i64((i as i64 % 7) + 1)).collect());
+        let b = store.push((0..l).map(|i| from_i64((i as i64 % 5) + 2)).collect());
+        let c1 = store.push((0..l).map(|i| from_i64((i as i64 % 3) + 4)).collect());
+        let c2 = store.push((0..l).map(|i| from_i64((i as i64 % 4) + 6)).collect());
+        let t = store.push(vec![Goldilocks::ZERO; l]);
+        let y1 = store.push(vec![Goldilocks::ZERO; l]);
+        let y2 = store.push(vec![Goldilocks::ZERO; l]);
+        let ops = vec![
+            Op::Add { a, b, c: t },
+            Op::Add { a: t, b: c1, c: y1 },
+            Op::Add { a: t, b: c2, c: y2 },
+        ];
+        forward_ops(&mut store, &ops);
+        let lgl = l.trailing_zeros() as usize;
+        let point: Vec<Ef> = (0..lgl).map(|b| ef_u64(2 + b as u64)).collect();
+        let seeds = vec![
+            EfClaim { tensor_id: y1, point: point.clone(),
+                value: ef_eval(store.get(y1), &point) },
+            EfClaim { tensor_id: y2, point: point.clone(),
+                value: ef_eval(store.get(y2), &point) },
+        ];
+        let proof = prove_reverse_dag(&store, &ops, &seeds,
+            &mut Transcript::new(b"audit-multiconsumer")).expect("honest proof");
+        assert!(verify_reverse_dag(&ops, &seeds, &proof,
+            &mut Transcript::new(b"audit-multiconsumer")).is_some(),
+            "honest multi-consumer DAG must verify");
+        let mut forged = seeds.clone();
+        forged[0].value += Ef::ONE;
+        assert!(prove_reverse_dag(&store, &ops, &forged,
+            &mut Transcript::new(b"audit-multiconsumer")).is_none(),
+            "prover must fail closed on a forged consumer claim");
+        assert!(verify_reverse_dag(&ops, &forged, &proof,
+            &mut Transcript::new(b"audit-multiconsumer")).is_none(),
+            "verifier must reject a forged consumer claim");
     }
 
     /// PR#45 B1: the RmsNorm row gadget must be pointwise zero for every
