@@ -12815,12 +12815,19 @@ impl ProofBudget {
         Some(())
     }
 
-    fn virtual_proof(&mut self, p: &EfVirtualProof) -> Option<()> {
-        self.add(3u128.checked_mul(p.rounds.len() as u128)?)?;
-        // A2 audit: the γ-separated batching inside a virtual relation is a
-        // separate random polynomial in γ. Every production term constructor
-        // has at most 4·|final_evals| terms (checked during the audit), so
-        // its γ-degree is below 4·|final_evals|; charge that as well.
+    /// `deg` is the real per-round x-degree of the relation at this call
+    /// site (`max_deg = max term width`). Default 3; tie_zero uses 4 and
+    /// tie_less uses 5 (their term lists contain 4- and 5-factor terms).
+    ///
+    /// A2 audit: γ-separated batching is a separate random polynomial in γ.
+    /// The true invariant established by the constructor audit is
+    /// `γ-degree ≤ 4·|final_evals|` for every production constructor; charge
+    /// that too. This is a γ-degree bound, not a term-count bound:
+    /// `scatter_counts_terms` has m·n terms (larger than 4(m+n)) but its
+    /// γ-degree is 0 and its per-round x-degree is 2, already covered by the
+    /// default `deg = 3`.
+    fn virtual_proof(&mut self, p: &EfVirtualProof, deg: u128) -> Option<()> {
+        self.add(deg.checked_mul(p.rounds.len() as u128)?)?;
         self.add(4u128.checked_mul(p.final_evals.len() as u128)?)
     }
 
@@ -12833,7 +12840,7 @@ impl ProofBudget {
     }
 
     fn same_poly(&mut self, p: &EfSamePolyProof) -> Option<()> {
-        self.virtual_proof(&p.proof)?;
+        self.virtual_proof(&p.proof, 3)?;
         // Gamma batching of the claims carried by the merge (one MLE per
         // final eval; the first is f itself).
         self.add(p.proof.final_evals.len() as u128)
@@ -12841,7 +12848,7 @@ impl ProofBudget {
 
     fn fractional(&mut self, f: &EfFractionalProof) -> Option<()> {
         for layer in &f.layers {
-            self.virtual_proof(&layer.proof)?;
+            self.virtual_proof(&layer.proof, 3)?;
             self.same_poly(&layer.num_merge)?;
             self.same_poly(&layer.den_merge)?;
             self.add(layer.s.len() as u128)?;
@@ -12930,35 +12937,35 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
         match &step.reduction {
             ReverseReduction::MatMul { proof } => b.sumcheck(&proof.sumcheck)?,
             ReverseReduction::Relu { proof } => {
-                b.virtual_proof(&proof.output)?;
-                b.virtual_proof(&proof.range)?;
+                b.virtual_proof(&proof.output, 3)?;
+                b.virtual_proof(&proof.range, 3)?;
                 b.opening(&proof.bit_opening, RELU_BITS + 1)?;
             }
             ReverseReduction::Projection { proof } => {
                 b.sumcheck(&proof.matmul.sumcheck)?;
-                b.virtual_proof(&proof.booleanity)?;
+                b.virtual_proof(&proof.booleanity, 3)?;
                 // The opening covers each remainder column at two points.
                 b.opening(&proof.opening, 2 * proof.remainder_bits.len())?;
             }
             ReverseReduction::Lookup { proof } => {
                 b.fractional(&proof.witness)?;
                 b.fractional(&proof.table)?;
-                b.virtual_proof(&proof.padding)?;
+                b.virtual_proof(&proof.padding, 3)?;
                 b.opening(&proof.pairs_opening, max_aux_columns)?;
                 b.opening(&proof.multiplicity_opening, 2)?;
                 if proof.table_opening.is_some() { b.base_opening()?; }
             }
             ReverseReduction::GeluIndex { proof } => {
                 for r in [&proof.upper, &proof.lower] {
-                    b.virtual_proof(&r.output)?;
-                    b.virtual_proof(&r.range)?;
+                    b.virtual_proof(&r.output, 3)?;
+                    b.virtual_proof(&r.range, 3)?;
                     b.opening(&r.bit_opening, GELU_BITS + 1)?;
                 }
-                b.virtual_proof(&proof.x_range)?;
+                b.virtual_proof(&proof.x_range, 3)?;
                 b.opening(&proof.range_opening, proof.range_aux_values.len())?;
             }
             ReverseReduction::Scale { proof } => {
-                if let Some(v) = &proof.booleanity { b.virtual_proof(v)?; }
+                if let Some(v) = &proof.booleanity { b.virtual_proof(v, 3)?; }
                 if let Some(o) = &proof.opening {
                     b.opening(o, 2 * proof.remainder_bits.len())?;
                 }
@@ -12967,27 +12974,31 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 for v in [&proof.sel_bool, &proof.bit_bool, &proof.row_sum, &proof.before_sum,
                           &proof.out_sum, &proof.thr_sum, &proof.gate_rel, &proof.d1_rel,
                           &proof.d2_rel] {
-                    b.virtual_proof(v)?;
+                    b.virtual_proof(v, 3)?;
                 }
                 b.opening(&proof.opening, proof.aux_values.len())?;
             }
             ReverseReduction::GatherMatMul { proof } => {
-                b.virtual_proof(&proof.matmul.sumcheck)?;
-                b.virtual_proof(&proof.routing)?;
+                b.virtual_proof(&proof.matmul.sumcheck, 3)?;
+                b.virtual_proof(&proof.routing, 3)?;
                 b.opening(&proof.opening, proof.aux_values.len())?;
             }
             ReverseReduction::Gather { proof } => {
-                b.virtual_proof(&proof.routing)?;
-                b.virtual_proof(&proof.sum)?;
+                b.virtual_proof(&proof.routing, 3)?;
+                b.virtual_proof(&proof.sum, 3)?;
                 b.opening(&proof.opening, proof.aux_values.len())?;
             }
             ReverseReduction::TopKSelect { proof } => {
                 for v in [&proof.bools, &proof.row_sums, &proof.gate, &proof.d1, &proof.d2s,
                           &proof.att_sel, &proof.att_gap, &proof.broadcast, &proof.x_range,
-                          &proof.thr_range, &proof.tie_zero, &proof.tie_bits, &proof.tie_rank,
-                          &proof.tie_row, &proof.tie_less] {
-                    b.virtual_proof(v)?;
+                          &proof.thr_range, &proof.tie_bits, &proof.tie_rank,
+                          &proof.tie_row] {
+                    b.virtual_proof(v, 3)?;
                 }
+                // tie_zero has 4-factor terms (deg 4); tie_less has 5-factor
+                // terms (deg 5) — charge their real per-round x-degree.
+                b.virtual_proof(&proof.tie_zero, 4)?;
+                b.virtual_proof(&proof.tie_less, 5)?;
                 for p in [&proof.perm_p, &proof.perm_t, &proof.perm_b] { b.permutation(p)?; }
                 b.opening(&proof.opening, proof.aux_values.len())?;
                 b.opening(&proof.thr_opening, proof.thr_values.len())?;
@@ -12999,28 +13010,28 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 for v in [&proof.bools, &proof.mask_tok, &proof.mask_exp, &proof.counts,
                           &proof.order_key_cons, &proof.order_key_bits, &proof.order_d_rel,
                           &proof.order_asc] {
-                    b.virtual_proof(v)?;
+                    b.virtual_proof(v, 3)?;
                 }
                 b.permutation(&proof.perm)?;
                 b.opening(&proof.opening, proof.aux_values.len())?;
                 b.opening(&proof.order_opening, proof.order_aux_values.len())?;
             }
             ReverseReduction::BroadcastScale { proof } => {
-                b.virtual_proof(&proof.prod)?;
+                b.virtual_proof(&proof.prod, 3)?;
                 b.same_poly(&proof.bind)?;
             }
             ReverseReduction::ScaleVec { proof } => {
-                b.virtual_proof(&proof.prod)?;
+                b.virtual_proof(&proof.prod, 3)?;
                 b.same_poly(&proof.bind)?;
             }
             ReverseReduction::ScaleVecShifted { proof } => {
-                b.virtual_proof(&proof.prod)?;
+                b.virtual_proof(&proof.prod, 3)?;
                 b.same_poly(&proof.bind)?;
                 b.opening(&proof.opening, proof.remainder_bits.len())?;
             }
             ReverseReduction::LookupGroups { groups } => {
                 for g in groups {
-                    b.virtual_proof(&g.identity)?;
+                    b.virtual_proof(&g.identity, 3)?;
                     // Aggregate column at [identity, table leaf]: two claims.
                     b.opening(&g.aggregate_opening, 2)?;
                     b.fractional(&g.table)?;
@@ -22274,6 +22285,28 @@ mod tests {
         assert!(security_budget_ok(64, 0, 63));
         assert!(security_policy_ok(64, 0, 63));
         assert!(!security_policy_ok(64, MAX_WEIGHTED_ROUNDS + 1, 0));
+    }
+
+    /// S9 WAVE-1 A2: tie_zero/tie_less are charged their real per-round
+    /// x-degree (4/5), not the default 3; the γ term is 4·|final_evals|.
+    #[test]
+    fn s9_a2_virtual_degree_charges_tie_zero_less() {
+        let mk = |rounds: usize, evals: usize| EfVirtualProof {
+            rounds: vec![vec![Ef::ZERO; 6]; rounds],
+            final_evals: vec![Ef::ZERO; evals],
+        };
+        let p = mk(7, 3);
+        let mut b3 = ProofBudget::default();
+        b3.virtual_proof(&p, 3).unwrap();
+        let mut b4 = ProofBudget::default();
+        b4.virtual_proof(&p, 4).unwrap();
+        let mut b5 = ProofBudget::default();
+        b5.virtual_proof(&p, 5).unwrap();
+        let gamma = 4 * 3;
+        assert_eq!(b3.weighted, 3 * 7 + gamma);
+        assert_eq!(b4.weighted, 4 * 7 + gamma); // tie_zero call-site degree
+        assert_eq!(b5.weighted, 5 * 7 + gamma); // tie_less call-site degree
+        assert!(b4.weighted > b3.weighted && b5.weighted > b4.weighted);
     }
 
     /// S9 2d: the sub-table split math must reassemble the original MLE:

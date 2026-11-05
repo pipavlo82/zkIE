@@ -570,17 +570,18 @@ the γ-merge charge.
 - Tests: exact field constant; K=1/63/64 pass; K=65 rejected by the
   effective cap; K=127/128 exercise the exact combined bound; W cap and
   outer half boundaries; 96-bit manifest rejected; honest fixture inside all
-  caps. `ops` 180/0 after the additions.
+  caps. `ops` 181/0 after the additions (including the tie_zero/tie_less
+  degree-charge regression).
 
-97-bit real full64 rerun (r3, final budget code; same harness/inputs; EF
-outer, split sub-tables):
+97-bit real full64 rerun (r4, final corrected budget code; same
+harness/inputs; EF outer, split sub-tables):
 
 | phase | bytes | commit+prove | verify | K | weighted | merge | S | required | peak RSS |
 |---|---|---|---|---|---|---|---|---|---|
-| A | 291,042 | 0.137 s prove | — | 7 | 7,104 | 592 | 7,696 | 93 | — |
-| B | 2,937,745 | 605.5 s | 179.2 ms | 22 | 21,074 | 1,231 | 22,305 | 95 | 4.81 GB |
-| D | 6,645,146 | 1,258.6 s | 404.7 ms | 48 | 16,806,938 | 2,551 | 16,809,489 | 96 | 10.92 GB |
-| C | 410,385 | 290.1 ms | 17.6 ms | 11 | 8,596 | 689 | 9,285 | 94 | — |
+| A | 291,042 | 0.137 s prove | — | 7 | 7,122 | 592 | 7,714 | 93 | — |
+| B | 2,937,745 | 602.1 s | 179.4 ms | 22 | 21,074 | 1,231 | 22,305 | 95 | 4.81 GB |
+| D | 6,645,146 | 1,248.8 s | 403.7 ms | 48 | 16,806,938 | 2,551 | 16,809,489 | 96 | 10.92 GB |
+| C | 410,385 | 285.5 ms | 17.7 ms | 11 | 8,614 | 689 | 9,303 | 94 | — |
 
 D's `weighted` is dominated by the A2 LogUp α/β term for the real 2^24 silu
 table (`N = 2^24`); `S ≤ 2^26` still holds. For D:
@@ -592,10 +593,10 @@ All real-data negatives remain rejected and the harness ends with
 `S7-CHAIN-OK`. Raising the per-opening security 96→97 changes proof bytes
 (A/B/D/C ≈ +424/+8,672/+4,128/+2,088 bytes) and adds ~7–8% prove time on the
 large phases (B 560→605 s, D 1,170→1,259 s); the split keeps the total run in
-the tens of minutes. Three 97-bit runs (r1, r2, r3 with the final budget
-code) produce byte-identical dumps:
+the tens of minutes. Four 97-bit runs (r1–r4; r4 is the final corrected
+budget code with per-call degree charging) produce byte-identical dumps:
 
-| proof | SHA-256 (all three 97-bit runs) |
+| proof | SHA-256 (all four 97-bit runs) |
 |---|---|
 | A | `f857facf7d3001ff86e508c9a98b617dad88f59531f140149b250087b4983a9e` |
 | B | `cb5ea97d6c95a95e2e15cdaef038ce33a96d3ead44e9b32fddb4888650e3cbd1` |
@@ -610,13 +611,22 @@ one PCS opening, where `n` is the number of claims in that opening (points =
 claimed values). Examples: A/B/D/C carry `merge = 592/1,231/2,551/689`
 weighted units. Zero/one-claim openings add zero. Counts saturate/reject on
 overflow, and the verifier's existing length/index/point checks reject
-malformed claim sets before the opening is accepted.
+malformed claim sets before the opening is accepted. The same audit also
+charges the γ-separated term batching inside each virtual relation with the
+true invariant **γ-degree ≤ 4·|final_evals|** (verified for all 33
+constructors; this is not a term-count bound — `scatter_counts_terms` has
+m·n terms but γ-degree 0 and x-degree 2, covered by the default 3), and the
+LogUp α/β collision term `N = max(index length, table length)` per Lookup op
+(manifest/offline lengths; accepted graphs materialize these shapes during
+aux validation). The per-round x-degree is charged per call site: default 3,
+`tie_zero` 4 (4-factor terms), `tie_less` 5 (5-factor terms); all other
+constructors have max_deg ≤3.
 
 Verifier call ↔ budget item audit:
 
 | verifier work | budget charge | coverage |
 |---|---|---|
-| EF virtual/sumcheck rounds | `3·rounds + 4·|final_evals|` (degree ≤3; the extra is the γ-separated term-batching bound; every production term constructor has ≤4·|final_evals| terms) | `weighted` |
+| EF virtual/sumcheck rounds | `deg·rounds + 4·|final_evals|`; `deg` is the real per-round x-degree at the call site (default 3, `tie_zero` 4, `tie_less` 5). The γ invariant is **γ-degree ≤ 4·|final_evals|** for every production constructor (not a term-count bound: `scatter_counts_terms` has m·n terms but γ-degree 0 and x-degree 2, already inside the default 3) | `weighted` |
 | MatMul / batch sum-of-products | `2·rounds` | `weighted` |
 | same_poly merge | virtual charge + `final_evals.len()` | `weighted`; its `final_evals` length is constrained by downstream consumers, so no separate mechanical charge is added |
 | LogUp fractional tree | per layer: virtual charge, both same_poly merges, `s.len()` batching, +8 | `weighted` |
