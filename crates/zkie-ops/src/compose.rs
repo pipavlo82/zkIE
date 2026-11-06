@@ -31,7 +31,8 @@ use crate::scatter::{
 use crate::rms_norm::{prove_rms_norm, rms_norm_forward, verify_rms_norm, RmsNormProof};
 use crate::rope::{prove_rope, rope_forward, rope_out_points, verify_rope, RoPEProof};
 use crate::softmax_scaled::{prove_softmax_rounded, verify_softmax_rounded, SoftmaxRoundedProof};
-use crate::topk::{argmax_forward, prove_argmax, prove_topk, topk_forward, verify_argmax, verify_topk, ArgmaxProof, TopKSelectProof};
+use crate::topk::{argmax_forward, prove_argmax, prove_topk, public_selector_eval, topk_forward,
+    verify_argmax, verify_topk, ArgmaxProof, ArgmaxSelectorProof, TopKSelectProof};
 use rayon::prelude::*;
 use zkie_core::common::field::{Field, Goldilocks, Ef, PrimeCharacteristicRing, XorShift64, ChallengeSource};
 use zkie_core::common::ef_outer::{self as efo, EfSamePolyProof, EfVirtualProof};
@@ -5978,6 +5979,8 @@ struct ReverseArgmaxProof {
     gate_rel: EfVirtualProof,
     d1_rel: EfVirtualProof,
     d2_rel: EfVirtualProof,
+    /// O1: public-token selector reduction (replaces the per-token openings).
+    selector: ArgmaxSelectorProof,
     aux_values: Vec<Ef>,
     opening: EfBatchOpeningProof,
 }
@@ -5990,6 +5993,24 @@ fn argmax_pad_point(point: &[Ef], arity: usize) -> Vec<Ef> {
 
 fn argmax_claim(outs: &[(T, Vec<Ef>, Ef)], id: T) -> Option<(Vec<Ef>, Ef)> {
     outs.iter().find(|o| o.0 == id).map(|o| (o.1.clone(), o.2))
+}
+
+/// The public Argmax token list `t_i` for an op, read from the caller-owned
+/// execution outputs (never from proof-carried arrays).
+fn argmax_public_tokens(execution: Option<&TrustedExecution>, out: T, m: usize, n: usize)
+    -> Option<Vec<u32>>
+{
+    let execution = execution?;
+    let key = TensorKey::Index(out).encoded()?;
+    let vals = execution.outputs.get(&key)?;
+    if vals.len() != m { return None; }
+    let mut tokens = Vec::with_capacity(m);
+    for &v in vals {
+        let x = to_i64(v);
+        if x < 0 || (x as usize) >= n { return None; }
+        tokens.push(x as u32);
+    }
+    Some(tokens)
 }
 
 fn argmax_known_cols(m: usize, n: usize, arity: usize) -> (Vec<Ef>, Vec<Ef>) {
@@ -6045,7 +6066,7 @@ fn argmax_bit_bool_terms(gamma: Ef, count: usize) -> Vec<(Ef, Vec<usize>)> {
 }
 
 fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
-    aux: PreparedAux, transcript: &mut Transcript,
+    aux: PreparedAux, execution: Option<&TrustedExecution>, transcript: &mut Transcript,
     mut rec: Option<&mut AuxOpenRecorder>) -> Option<(ReverseArgmaxProof, Vec<EfClaim>)>
 {
     let (x, sel, thr, gate, d1, d2, out, m, n) = match op {
@@ -6161,6 +6182,29 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     let (out_sum, z5) = efo::prove_virtual(&mles_os, &[(Ef::ONE, vec![0usize, 1usize])], vo, transcript);
     let mles_ts: Vec<&[Ef]> = vec![&thr_rows_col, &cols[0], &xp];
     let (thr_sum, z6) = efo::prove_virtual(&mles_ts, &[(Ef::ONE, vec![0usize, 1usize, 2usize])], vt, transcript);
+    // O1 public-selector reduction: the public token list defines
+    // E(i,j) = 1 iff j == t_i. One sumcheck proves both
+    //   Σ eq(r_row,i)·sel(i,j)·E(i,j) = 1              (public token selected)
+    //   Σ eq(r_row,i)·logits(i,j)·E(i,j) = M(r_row)    (selected logit is max)
+    // so no per-token selector opening is needed. E is built once on the
+    // prover side; the verifier only evaluates E at the sumcheck endpoint.
+    let tokens = argmax_public_tokens(execution, out, m, n)?;
+    let r_rows_sel = transcript.ef_field_vec(lgm);
+    let gamma_sel = transcript.ef_field();
+    let m_eval = ef_eval(store.get(thr), &r_rows_sel);
+    let eq_rows_sel = efo::eq_evals(&r_rows_sel);
+    let eq_rows_sel_col = argmax_coeff_col(&eq_rows_sel, &ones, m, n, arity);
+    let mut e_col = vec![Ef::ZERO; len];
+    for (i, &t) in tokens.iter().enumerate() {
+        e_col[i * n + t as usize] = Ef::ONE;
+    }
+    let sel_terms = vec![
+        (Ef::ONE, vec![0usize, 1usize, 2usize]),
+        (gamma_sel, vec![0usize, 1usize, 3usize]),
+    ];
+    let sel_claimed = Ef::ONE + gamma_sel * m_eval;
+    let (selector_sumcheck, z_sel) = efo::prove_virtual(
+        &[&eq_rows_sel_col, &e_col, &cols[0], &xp], &sel_terms, sel_claimed, transcript);
     let zs = [&z1, &z2, &z3, &z4, &z5, &z6];
 
     // One batch opening for fixed points and all endpoints.
@@ -6192,6 +6236,8 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     push!(0, argmax_pad_point(&zg, arity), col_eval(0, &zg));
     push!(0, argmax_pad_point(&zd1, arity), col_eval(0, &zd1));
     push!(0, argmax_pad_point(&zd2, arity), col_eval(0, &zd2));
+    // O1: sel at the public-selector sumcheck endpoint.
+    push!(0, argmax_pad_point(&z_sel, arity), col_eval(0, &z_sel));
     if let Some(r) = rec.as_deref_mut() {
         r.record(&aux.descriptor, &idxs, &points, &values)?;
     }
@@ -6208,13 +6254,20 @@ fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Ef>, Ef)],
         EfClaim { tensor_id: gate, point: zg.clone(), value: gate_rel.final_evals[3] },
         EfClaim { tensor_id: d1, point: zd1.clone(), value: d1_rel.final_evals[4] },
         EfClaim { tensor_id: d2, point: zd2.clone(), value: d2_rel.final_evals[4] },
+        // O1: logits endpoint continues to lm_head; max value continues as a
+        // thr claim and is authenticated by the same-poly/seed path.
+        EfClaim { tensor_id: x, point: z_sel.clone(), value: selector_sumcheck.final_evals[3] },
+        EfClaim { tensor_id: thr, point: r_rows_sel.clone(), value: m_eval },
     ];
     Some((ReverseArgmaxProof { sel_bool, bit_bool, row_sum, before_sum, out_sum, thr_sum,
-        gate_rel, d1_rel, d2_rel, aux_values: values, opening }, claims))
+        gate_rel, d1_rel, d2_rel,
+        selector: ArgmaxSelectorProof { m_eval, sumcheck: selector_sumcheck },
+        aux_values: values, opening }, claims))
 }
 
 fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
-    descriptor: &AuxDescriptor, proof: &ReverseArgmaxProof, transcript: &mut Transcript,
+    descriptor: &AuxDescriptor, proof: &ReverseArgmaxProof,
+    execution: Option<&TrustedExecution>, transcript: &mut Transcript,
     mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
 {
     let (x, sel, thr, gate, d1, d2, out, m, n) = match op {
@@ -6318,7 +6371,21 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     if !ok5 { return None; }
     let (ok6, z6, f6) = efo::verify_virtual(&proof.thr_sum, &[(Ef::ONE, vec![0usize, 1usize, 2usize])], vt, arity, transcript);
     if !ok6 { return None; }
-    if proof.aux_values.len() != 2 + ARGMAX_D2_BITS + 2 + ARGMAX_D2_BITS + ARGMAX_TIE_BITS + 6 + 1 + (ARGMAX_D2_BITS + ARGMAX_TIE_BITS) + 3 { return None; }
+
+    // O1 public-selector reduction: replay the same two relations over the
+    // public token list. The verifier derives E only at the sumcheck endpoint.
+    let tokens = argmax_public_tokens(execution, out, m, n)?;
+    let r_rows_sel = transcript.ef_field_vec(lgm);
+    let gamma_sel = transcript.ef_field();
+    let sel_terms = vec![
+        (Ef::ONE, vec![0usize, 1usize, 2usize]),
+        (gamma_sel, vec![0usize, 1usize, 3usize]),
+    ];
+    let sel_claimed = Ef::ONE + gamma_sel * proof.selector.m_eval;
+    let (ok_sel, z_sel, f_sel) = efo::verify_virtual(
+        &proof.selector.sumcheck, &sel_terms, sel_claimed, arity, transcript);
+    if !ok_sel { return None; }
+    if proof.aux_values.len() != 2 + ARGMAX_D2_BITS + 2 + ARGMAX_D2_BITS + ARGMAX_TIE_BITS + 6 + 1 + (ARGMAX_D2_BITS + ARGMAX_TIE_BITS) + 3 + 1 { return None; }
 
     // Rebuild the exact opening list.
     let mut idxs: Vec<usize> = Vec::new();
@@ -6350,11 +6417,25 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
     push!(0, argmax_pad_point(&zd1, arity));
     let sel_d2_idx = idxs.len();
     push!(0, argmax_pad_point(&zd2, arity));
+    // O1: sel at the public-selector sumcheck endpoint.
+    let sel_selector_idx = idxs.len();
+    push!(0, argmax_pad_point(&z_sel, arity));
     let padded = 1usize.checked_shl(arity as u32)?;
     if let Some(r) = rec.as_deref_mut() {
         r.record(descriptor, &idxs, &points, &proof.aux_values)?;
     } else if !verify_aux_open(descriptor, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
     let av = &proof.aux_values;
+    if sel_selector_idx + 1 != av.len() { return None; }
+
+    // O1: the selector sumcheck endpoint must match the opened committed sel
+    // and the public E(r) evaluation; the logits endpoint becomes a claim.
+    let sel_selector = av[sel_selector_idx];
+    let e_z = public_selector_eval(&tokens, &z_sel, lgn, lgm)?;
+    let eq_rows_z = efo::eq_poly(&r_rows_sel, &z_sel[lgn..])?;
+    let x_sel_z = *proof.selector.sumcheck.final_evals.get(3)?;
+    if f_sel != efo::virtual_eval(&sel_terms, &[eq_rows_z, e_z, sel_selector, x_sel_z]) {
+        return None;
+    }
 
     // Pointwise bindings against the committed aux (linear relations).
     if av[0] != vs { return None; }
@@ -6404,6 +6485,8 @@ fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
         EfClaim { tensor_id: gate, point: zg.clone(), value: proof.gate_rel.final_evals[3] },
         EfClaim { tensor_id: d1, point: zd1.clone(), value: proof.d1_rel.final_evals[4] },
         EfClaim { tensor_id: d2, point: zd2.clone(), value: proof.d2_rel.final_evals[4] },
+        EfClaim { tensor_id: x, point: z_sel, value: x_sel_z },
+        EfClaim { tensor_id: thr, point: r_rows_sel, value: proof.selector.m_eval },
     ])
 }
 
@@ -10713,7 +10796,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
             Op::Argmax { .. } => {
                 let pairs: Vec<(T, Vec<Ef>, Ef)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
                 let prepared_aux = aux.remove(&(op_index, AuxRole::ArgmaxWitness))?;
-                let reduced = prove_reverse_argmax(store, op, &pairs, prepared_aux, transcript, aux_rec.as_deref_mut());
+                let reduced = prove_reverse_argmax(store, op, &pairs, prepared_aux, execution, transcript, aux_rec.as_deref_mut());
                 let (proof, incoming) = reduced?;
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
@@ -11238,7 +11321,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
             }
             (Op::Argmax { .. }, ReverseReduction::Argmax { proof }) => {
                 let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ArgmaxWitness)?;
-                for c in verify_reverse_argmax(op, &merged_out, descriptor, proof, transcript, aux_rec.as_deref_mut())? {
+                for c in verify_reverse_argmax(op, &merged_out, descriptor, proof, execution, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -17774,15 +17857,18 @@ impl BoundExecutionProof {
     pub fn weight_openings(&self) -> &[WeightBatchOpening] {
         &self.weight_openings
     }
+    /// Read-only selector-opening view for O1 measurement tooling. O1 keeps
+    /// this field empty; the pre-O1 worktree uses it for the before count.
+    pub fn selector_openings(&self) -> &[BoundSelOpening] {
+        &self.sel_openings
+    }
 }
 
-/// S6 (bound path): per-Argmax individual selector openings. The selector
-/// column is the ArgmaxWitness aux column 0 — the SAME committed column the
-/// Argmax reverse reduction binds via its relation virtuals — and one opening
-/// per position pins `sel(i, argmax[i]) == 1` at the per-position points
-/// derived from the PUBLIC argmax output. A claimed argmax pointing at a
-/// column where the committed selector is 0 (e.g. the tied second maximum,
-/// or a forged prompt-row position) is rejected.
+/// Legacy wire type for the pre-O1 per-Argmax selector openings. O1 replaces
+/// this with the public-selector sumcheck inside the Argmax reverse proof:
+/// honest proofs carry an empty list, and the verifier rejects a non-empty one
+/// as non-canonical. The type is retained only so the wire field can still be
+/// decoded and rejected.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct BoundSelOpening {
     pub points: Vec<Vec<Ef>>,
@@ -18462,14 +18548,14 @@ fn token_binding_challenge(
     ts.ef_field_vec(arity)
 }
 
-/// S6 (bound prove): per-Argmax selector openings on the ArgmaxWitness aux
-/// column 0 at the per-position points (i, argmax[i]) claimed 1, plus the
-/// embedding token binding — the first Lookup's LookupPairs aux column 0
-/// opened at a fresh transcript-derived point r. Both are built against the
-/// SAME aux commitments the reverse reduction consumes.
-fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], ops_per_shard: usize,
+/// S6 (bound prove): the embedding token binding — the first Lookup's
+/// LookupPairs aux column 0 opened at a fresh transcript-derived point r, at
+/// the SAME aux commitment the reverse reduction consumes. Argmax public
+/// tokens are bound by the O1 selector reduction inside the reverse proof, so
+/// no per-token selector opening is produced here.
+fn prove_bound_token_binding(prepared: &[PreparedAux], ops: &[Op], ops_per_shard: usize,
     statement: &PublicStatement, model: &TrustedModelManifest, execution: &TrustedExecution, aux: &[AuxDescriptor])
-    -> Option<(Vec<BoundSelOpening>, Option<BoundTokenBinding>)>
+    -> Option<Option<BoundTokenBinding>>
 {
     let aux_ctx = |auxp: &PreparedAux| -> Option<zkie_core::pcs::committed::BatchCtx> {
         let arity = auxp.descriptor.arity;
@@ -18487,31 +18573,6 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
             num_tables: auxp.descriptor.columns,
         })
     };
-    let mut sel_openings = Vec::new();
-    for (op_index, op) in ops.iter().enumerate() {
-        if let Op::Argmax { out, m, n, .. } = op {
-            let auxp = prepared.iter().find(|p| p.descriptor.op_index == op_index && p.descriptor.role == AuxRole::ArgmaxWitness)?;
-            let outs = store.idx.get(*out)?;
-            if outs.len() != *m { return None; }
-            let arity = auxp.descriptor.arity;
-            let cols0 = &auxp.columns[0];
-            let mut points: Vec<Vec<Ef>> = Vec::with_capacity(*m);
-            let claimed = vec![Ef::ONE; *m];
-            for i in 0..*m {
-                let col = outs[i] as usize;
-                if col >= *n { return None; }
-                let idx = i * *n + col;
-                points.push((0..arity).map(|b| ef_u64(((idx >> b) & 1) as u64)).collect());
-            }
-            let idxs = vec![0usize; *m];
-            let tensors: Vec<Vec<Goldilocks>> = vec![cols0.clone()];
-            let ctx = aux_ctx(auxp)?;
-            let opening = prove_batch_open_committed_ef(
-                &ctx.whir, &ctx.commitment, &ctx.protocol, ctx.num_tables, ctx.prover_data,
-                &idxs, tensors, &points, &claimed).ok()?;
-            sel_openings.push(BoundSelOpening { points, claimed, opening });
-        }
-    }
     // S9 2c: a Generic statement never consults the token binding, so the
     // canonical Generic wire form omits it entirely (dead-field
     // canonicalization); only LanguageModel statements produce one.
@@ -18533,7 +18594,7 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
             &[0usize], vec![x_col.clone()], &[r.clone()], &[claimed]).ok()?;
         Some(BoundTokenBinding { point: r, claimed, opening })
     })() };
-    Some((sel_openings, token_binding))
+    Some(token_binding)
 }
 
 fn current_faults() -> (u64, u64) {
@@ -18702,9 +18763,10 @@ static_lookup_groups={static_groups} sel_batch_openings={sel} gelu_bit_columns_p
     }
     let mut aux_recorder = AuxOpenRecorder::new(aux_plan);
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
-    // S6 (bound): selector openings + embedding token binding, built against
-    // the same aux commitments the reverse reduction uses.
-    let (sel_openings, token_binding) = prove_bound_lm_bindings(&prepared, store, ops, ops_per_shard, statement, model, execution, &aux)?;
+    // S6 (bound): the embedding token binding, built against the same aux
+    // commitments the reverse reduction uses. O1 binds Argmax tokens inside
+    // the Argmax reverse proof.
+    let token_binding = prove_bound_token_binding(&prepared, ops, ops_per_shard, statement, model, execution, &aux)?;
     if trace { eprintln!("PROVE stage execution_seeds"); }
     let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux, &aux_groups)?;
     let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
@@ -18869,7 +18931,7 @@ static_lookup_groups={static_groups} sel_batch_openings={sel} gelu_bit_columns_p
     }
     Some(BoundExecutionProof { aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION,
         aux_pooled, internal_table_openings, reverse, weight_openings,
-        sel_openings, token_binding })
+        sel_openings: Vec::new(), token_binding })
 }
 
 /// S9 2c verifier budget over the proof's randomized checks. Degrees are
@@ -19493,40 +19555,17 @@ pub fn verify_committed_shard_dag_bound(
         }
         if sum != leaves[*leaf_index].value { return false; }
     }
-    // S6 (bound): per-Argmax individual selector openings at the
-    // per-position points derived from the PUBLIC argmax outputs. The
-    // committed selector column is the ArgmaxWitness aux column 0 — the same
-    // column the Argmax reverse reduction binds — and each opening must
-    // prove sel(i, argmax[i]) == 1, so a claimed argmax pointing at a column
-    // where the selector is 0 (tied second maximum, forged prompt row) is
-    // rejected.
     if vtr { eprintln!("VERIFY weight openings ok"); }
     let argmax_ops: Vec<(usize, T, usize, usize)> = ops.iter().enumerate().filter_map(|(i, op)| match op {
         Op::Argmax { out, m, n, .. } => Some((i, *out, *m, *n)),
         _ => None,
     }).collect();
-    if proof.sel_openings.len() != argmax_ops.len() { return false; }
-    for (k, &(op_index, out_t, m, n)) in argmax_ops.iter().enumerate() {
-        let so = &proof.sel_openings[k];
-        let out_key = match TensorKey::Index(out_t).encoded() { Some(k) => k, None => return false };
-        let argmax_vals = match execution.outputs.get(&out_key) { Some(v) => v, None => return false };
-        if argmax_vals.len() != m || so.points.len() != m || so.claimed.len() != m { return false; }
-        let descriptor = match proof.aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ArgmaxWitness) {
-            Some(d) => d, None => return false,
-        };
-        let arity = descriptor.arity;
-        let mut points: Vec<Vec<Ef>> = Vec::with_capacity(m);
-        for i in 0..m {
-            let col = to_i64(argmax_vals[i]);
-            if col < 0 || (col as usize) >= n { return false; }
-            let idx = i * n + col as usize;
-            points.push((0..arity).map(|b| ef_u64(((idx >> b) & 1) as u64)).collect());
-        }
-        if so.points != points { return false; }
-        if so.claimed.iter().any(|&c| c != Ef::ONE) { return false; }
-        let idxs = vec![0usize; m];
-        if !verify_aux_open(descriptor, &idxs, &points, &so.claimed, &so.opening) { return false; }
-    }
+    // O1: the public-token selector reduction lives inside each Argmax
+    // reverse proof (it proves sel(i,t_i)=1 and logits(i,t_i)=M_i at a random
+    // row point, with the tied-first-max rule enforced by the existing
+    // selector/tie witness). The legacy per-token openings are gone; a
+    // non-empty wire field is non-canonical and rejected.
+    if !proof.sel_openings.is_empty() { return false; }
     // S6 (bound): language-model sequence checks + embedding token binding.
     // The caller's prompt/response are authoritative; the proof never
     // carries tokens.
@@ -27547,7 +27586,7 @@ mod tests {
     }
 
     #[test]
-    fn argmax_selection_openings_are_individual() {
+    fn argmax_public_selector_replaces_token_openings() {
         use zkie_core::common::field::PrimeCharacteristicRing;
         use zkie_core::pcs::whir::Whir;
 
@@ -27627,10 +27666,15 @@ mod tests {
         };
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &PublicStatement::Generic, &model, &execution).unwrap();
 
-        // One selector-opening group per Argmax op, one individual opening
-        // per position (the points are derived from the public argmax).
-        assert_eq!(proof.sel_openings.len(), 1);
-        assert_eq!(proof.sel_openings[0].points.len(), m);
+        // O1: the per-token openings are gone; the Argmax reverse step carries
+        // the public-selector sumcheck instead.
+        assert!(proof.sel_openings.is_empty());
+        let selector = proof.reverse.steps.iter().find_map(|s| match &s.reduction {
+            ReverseReduction::Argmax { proof } => Some(&proof.selector),
+            _ => None,
+        }).expect("argmax reverse step");
+        assert_eq!(selector.sumcheck.rounds.len(), 5);
+        assert!(!selector.sumcheck.final_evals.is_empty());
         assert!(verify_committed_shard_dag_bound(
             &ops,
             1,
@@ -27647,20 +27691,33 @@ mod tests {
             &PublicStatement::Generic, &model, &execution
         ));
 
-        // Tampering a per-position point must reject: the verifier re-derives
-        // the points from the public argmax.
-        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
-        forged.sel_openings[0].points[0][0] =
-            forged.sel_openings[0].points[0][0] + Goldilocks::ONE;
+        // Forged max value: changing the selector claim breaks the sumcheck.
+        let mut forged_m: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for s in &mut forged_m.reverse.steps {
+            if let ReverseReduction::Argmax { proof } = &mut s.reduction {
+                proof.selector.m_eval += Ef::ONE;
+            }
+        }
         assert!(!verify_committed_shard_dag_bound(
-            &ops,
-            1,
-            &whir,
-            &forged,
+            &ops, 1, &whir, &forged_m,
             &PublicStatement::Generic, &model, &execution
         ));
-        // A wrong public argmax position must also reject: the derived point
-        // lands on a selector-0 column.
+
+        // Forged logits endpoint: the selector final eval no longer matches
+        // the committed x claim.
+        let mut forged_x: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for s in &mut forged_x.reverse.steps {
+            if let ReverseReduction::Argmax { proof } = &mut s.reduction {
+                proof.selector.sumcheck.final_evals[3] += Ef::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(
+            &ops, 1, &whir, &forged_x,
+            &PublicStatement::Generic, &model, &execution
+        ));
+
+        // A wrong public argmax position must reject: the public-token
+        // selector E no longer matches the committed one-hot selector.
         let mut bad = execution.clone();
         bad.outputs.get_mut(&out_key).unwrap()[0] = Goldilocks::from_u64(5);
         assert!(!verify_committed_shard_dag_bound(

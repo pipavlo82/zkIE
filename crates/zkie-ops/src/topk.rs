@@ -9,8 +9,9 @@
 //!   d1 = sel*(x - thr) and d2 = (1-sel)*(thr - x), both in [0, 2^16)
 //!   sum_e sel[t,e] = k for every row  (exactly k selected)
 
-use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
+use zkie_core::common::field::{Goldilocks, Ef, PrimeCharacteristicRing, XorShift64};
 use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
+use zkie_core::common::ef_outer::EfVirtualProof;
 use zkie_core::common::logup_gkr::{
     prove_lookup_fractional, verify_lookup_fractional, verify_lookup_fractional_chain,
     FractionalProof,
@@ -332,6 +333,57 @@ mod tests {
     }
 }
 
+
+/// Public-selector reduction for Argmax: a sumcheck over the logits tensor
+/// and the public token selector `E(u,v) = Σ_i eq(u,bits(i))·eq(v,bits(t_i))`.
+/// The relation simultaneously proves
+///   Σ eq(r_row,i)·sel(i,j)·E(i,j) = 1          (public token is selected)
+///   Σ eq(r_row,i)·logits(i,j)·E(i,j) = M(r_row) (its logit is the max)
+/// where M is authenticated by the existing max/range witness. The verifier
+/// evaluates E at one point in O(m(log m + log v)); it never builds the m×v
+/// table.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ArgmaxSelectorProof {
+    /// M(r_row), supplied by the prover and returned as a thr claim.
+    pub m_eval: Ef,
+    /// Virtual sumcheck over [eq_rows, E, sel, logits].
+    pub sumcheck: EfVirtualProof,
+}
+
+/// Evaluate E(u,v) = Σ_i eq(u,bits(i))·eq(v,bits(t_i)) at one point.
+///
+/// `point` is the sumcheck challenge in index-bit order: its first `lgn`
+/// coordinates are the column bits and the remaining `lgm` coordinates are the
+/// row bits. The cost is O(tokens.len()·(lgn+lgm)); no m×v table is built.
+pub fn public_selector_eval(
+    tokens: &[u32],
+    point: &[Ef],
+    lgn: usize,
+    lgm: usize,
+) -> Option<Ef> {
+    if point.len() != lgn + lgm || tokens.len() > (1usize << lgm) {
+        return None;
+    }
+    let row_limit = 1usize << lgm;
+    let col_limit = 1usize << lgn;
+    let mut acc = Ef::ZERO;
+    for (i, &t) in tokens.iter().enumerate() {
+        if i >= row_limit || (t as usize) >= col_limit {
+            return None;
+        }
+        let mut term = Ef::ONE;
+        for b in 0..lgm {
+            let x = point[lgn + b];
+            term = term * if ((i >> b) & 1) == 1 { x } else { Ef::ONE - x };
+        }
+        for b in 0..lgn {
+            let x = point[b];
+            term = term * if ((t as usize >> b) & 1) == 1 { x } else { Ef::ONE - x };
+        }
+        acc = acc + term;
+    }
+    Some(acc)
+}
 
 /// Argmax (top-1) per row of an m x n matrix. Reuses TopKSelect's range/one-hot
 /// proof with k=1, and binds the public index vector `out` to the one-hot `sel`
