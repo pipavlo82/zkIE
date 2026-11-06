@@ -109,7 +109,6 @@ pub fn verify(
     if u.len() != s.trailing_zeros() as usize {
         return (false, Vec::new());
     }
-    let eq_u = mle::eq_evals(u);
     let (ok, ch, final_claim) = verify_virtual(
         &proof.sumcheck,
         &terms(),
@@ -124,7 +123,11 @@ pub fn verify(
     if ch.len() != (s * k).trailing_zeros() as usize || ch.len() < k_bits {
         return (false, ch);
     }
-    let eq_final = mle::eval(&eq_u, &ch[k_bits..]);
+    // Closed-form point evaluation of the public broadcast selector: the
+    // verifier does not materialize eq_u or the S*K column. Padding is part of
+    // the masked/zeroed power-of-two domain chosen by the caller; the
+    // challenge coordinates are never truncated.
+    let eq_final = mle::eq_poly(u, &ch[k_bits..]);
     let final_evals = vec![
         proof.sumcheck.final_evals[0],
         proof.sumcheck.final_evals[1],
@@ -992,6 +995,33 @@ mod gather_matmul_proof_tests {
     use crate::common::field::{ChallengeSource, XorShift64};
 
     #[test]
+    fn gather_verify_uses_closed_form_broadcast_eq() {
+        let mut rng = XorShift64::new(0x7172);
+        let (s, k, n, n_experts) = (8usize, 4usize, 2usize, 4usize);
+        let w_all: Vec<Goldilocks> = (0..n_experts * k * n)
+            .map(|i| Goldilocks::from_u64((i as u64 % 7) + 1)).collect();
+        let expert_of: Vec<u32> = (0..s).map(|i| (i % n_experts) as u32).collect();
+        let seg: Vec<Goldilocks> = (0..s * k)
+            .map(|i| Goldilocks::from_u64((i as u64 % 11) + 1)).collect();
+        let g = gather_matmul_forward(&seg, &expert_of, &w_all, s, k, n, n_experts);
+        let mut tp = Transcript::new(b"o4-gather");
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize)
+            .map(|_| rng.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+            .map(|_| rng.field()).collect();
+        let (proof, ch) = prove_gather_matmul(
+            &seg, &expert_of, &w_all, &g, s, k, n, n_experts, &u, &v, &mut tp);
+        let mut tv = Transcript::new(b"o4-gather");
+        let (ok, ch_v) = verify_gather_matmul(&proof, s, k, &u, &mut tv);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
+        let k_bits = k.trailing_zeros() as usize;
+        let eq_u = mle::eq_evals(&u);
+        let full = broadcast_eq(&eq_u, k);
+        assert_eq!(mle::eval(&full, &ch), mle::eq_poly(&u, &ch[k_bits..]));
+    }
+
+    #[test]
     fn gather_matmul_self_contained() {
         let mut rng = XorShift64::new(0x7171);
         let (s, k, n, n_experts) = (8usize, 4usize, 2usize, 4usize);
@@ -1060,9 +1090,47 @@ mod o4_tests {
             let full = broadcast_eq(&eq_u, k);
             let full_eval = mle::eval(&full, &ch);
             let k_bits = k.trailing_zeros() as usize;
-            let closed = mle::eval(&eq_u, &ch[k_bits..]);
+            let closed = mle::eq_poly(&u, &ch[k_bits..]);
             assert_eq!(full_eval, closed, "closed form mismatch for s={s}, k={k}");
         }
+    }
+
+    /// A masked/zero-padded power-of-two domain: six real positions are
+    /// embedded in S=8 with zero rows, exactly as the op layer pads S. The
+    /// closed form uses all three position bits; it must not truncate the
+    /// challenge to the six-real-bit prefix.
+    #[test]
+    fn closed_form_handles_zero_padded_rows() {
+        use crate::common::field::ChallengeSource;
+        let mut rng = XorShift64::new(0x04A5);
+        let (s_pad, actual, k, n) = (8usize, 6usize, 4usize, 2usize);
+        let mut seg = vec![Goldilocks::ZERO; s_pad * k];
+        let mut w = vec![Goldilocks::ZERO; s_pad * k * n];
+        for pos in 0..actual {
+            for d in 0..k {
+                seg[pos * k + d] = rng.field();
+                for j in 0..n {
+                    w[(pos * k + d) * n + j] = rng.field();
+                }
+            }
+        }
+        let g = forward(&seg, &w, s_pad, k, n);
+        let u: Vec<Goldilocks> = (0..s_pad.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let (proof, ch) = prove(&seg, &w, &g, s_pad, k, n, &u, &v, &mut Transcript::new(b"o4-pad"));
+        let (ok, ch_v) = verify(&proof, s_pad, k, &u, &mut Transcript::new(b"o4-pad"));
+        assert!(ok, "zero-padded domain must verify");
+        assert_eq!(ch_v, ch);
+        let eq_u = mle::eq_evals(&u);
+        let full = broadcast_eq(&eq_u, k);
+        let k_bits = k.trailing_zeros() as usize;
+        assert_eq!(mle::eval(&full, &ch), mle::eq_poly(&u, &ch[k_bits..]));
+        // The six-real-bit prefix (mechanically truncated coordinates) is not
+        // the selector used by the padded proof.
+        let truncated = mle::eq_poly(&u[..actual.trailing_zeros() as usize], &ch[k_bits..][..actual.trailing_zeros() as usize]);
+        let pad = mle::eq_poly(&u[actual.trailing_zeros() as usize..], &ch[k_bits + actual.trailing_zeros() as usize..]);
+        assert_eq!(mle::eq_poly(&u, &ch[k_bits..]), truncated * pad,
+            "padded closed form must factor through the extra valid bits");
     }
 
     /// Non-power-of-two layouts are outside the closed-form contract and must

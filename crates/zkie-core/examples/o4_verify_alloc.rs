@@ -65,6 +65,15 @@ fn verifier_transcript(s: usize, n: usize) -> Transcript {
     t
 }
 
+fn fnv(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
 fn terms() -> Vec<(Goldilocks, Vec<usize>)> {
     vec![(Goldilocks::ONE, vec![0usize, 1, 2])]
 }
@@ -146,10 +155,13 @@ fn main() {
         "O4 s={} k={} n={} reference_ok={} reference_allocs={} reference_bytes={} reference_ms={:.3}",
         s, k, n, ok_ref, a3 - a2, b3 - b2, ref_ms
     );
+    let proof_bytes = bincode::serialize(&proof).expect("serialize O4 proof");
     println!(
-        "O4 same_result={} same_challenges={} hwm_kb={}",
+        "O4 same_result={} same_challenges={} proof_len={} proof_hash={:016x} hwm_kb={}",
         ok_opt == ok_ref,
         ch_opt == ch_ref,
+        proof_bytes.len(),
+        fnv(&proof_bytes),
         rss_kb()
     );
     let _: VirtualProof = proof.sumcheck;
