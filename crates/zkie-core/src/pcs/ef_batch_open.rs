@@ -38,6 +38,80 @@ fn claim_groups(table_idxs: &[usize]) -> (Vec<usize>, Vec<usize>) {
     (unique, group_of)
 }
 
+/// Build the per-unique-table equality weights `W_t(X) = sum_i gamma^i eq(r_i,X)`
+/// over the global claim order. When all claims of one table share a coordinate
+/// prefix, fold that prefix once and combine it with the gamma-weighted suffix
+/// sum (outer product), instead of materializing one full eq vector per claim.
+fn build_batch_weights(
+    unique: usize,
+    table_len: usize,
+    group_of: &[usize],
+    points: &[Vec<Ef>],
+    gamma: Ef,
+) -> Result<Vec<Vec<Ef>>, String> {
+    let n = points.len();
+    if group_of.len() != n || n == 0 {
+        return Err("EF batch-open grouping mismatch".to_owned());
+    }
+    let d = points[0].len();
+    if d >= usize::BITS as usize || points.iter().any(|p| p.len() != d)
+        || table_len != 1usize.checked_shl(d as u32).ok_or_else(|| "EF batch-open arity overflow".to_owned())?
+    {
+        return Err("EF batch-open point arity mismatch".to_owned());
+    }
+    let mut gamma_pows = Vec::with_capacity(n);
+    let mut gp = Ef::ONE;
+    for _ in 0..n { gamma_pows.push(gp); gp = gp * gamma; }
+
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); unique];
+    for (i, &g) in group_of.iter().enumerate() {
+        groups.get_mut(g).ok_or_else(|| "EF batch-open group out of range".to_owned())?.push(i);
+    }
+    let mut weights: Vec<Vec<Ef>> = (0..unique).map(|_| vec![Ef::ZERO; table_len]).collect();
+    for (g, idxs) in groups.iter().enumerate() {
+        if idxs.is_empty() { continue; }
+        let mut lcp = 0usize;
+        while lcp < d {
+            let c = points[idxs[0]][lcp];
+            if idxs.iter().any(|&i| points[i][lcp] != c) { break; }
+            lcp += 1;
+        }
+        if idxs.len() > 1 && lcp > 0 {
+            let pref_len = 1usize.checked_shl(lcp as u32).ok_or_else(|| "EF batch-open prefix overflow".to_owned())?;
+            let eq_pref = ef_outer::eq_evals(&points[idxs[0]][..lcp]);
+            if eq_pref.len() != pref_len { return Err("EF batch-open eq length mismatch".to_owned()); }
+            let suf_len = table_len / pref_len;
+            let mut suffix = vec![Ef::ZERO; suf_len];
+            for &i in idxs {
+                let eq = ef_outer::eq_evals(&points[i][lcp..]);
+                if eq.len() != suf_len { return Err("EF batch-open eq length mismatch".to_owned()); }
+                let scale = gamma_pows[i];
+                for (acc, &e) in suffix.iter_mut().zip(eq.iter()) {
+                    *acc = *acc + scale * e;
+                }
+            }
+            let w = &mut weights[g];
+            for (s, &sv) in suffix.iter().enumerate() {
+                let base = s << lcp;
+                for (acc, &pv) in w[base..base + pref_len].iter_mut().zip(eq_pref.iter()) {
+                    *acc = *acc + pv * sv;
+                }
+            }
+        } else {
+            let w = &mut weights[g];
+            for &i in idxs {
+                let eq = ef_outer::eq_evals(&points[i]);
+                if eq.len() != table_len { return Err("EF batch-open eq length mismatch".to_owned()); }
+                let scale = gamma_pows[i];
+                for (acc, &e) in w.iter_mut().zip(eq.iter()) {
+                    *acc = *acc + scale * e;
+                }
+            }
+        }
+    }
+    Ok(weights)
+}
+
 /// Prove a multi-point batch opening at EF points. `values` holds exactly one
 /// base-field tensor per unique table, in first-appearance order.
 #[allow(clippy::too_many_arguments)]
@@ -103,19 +177,16 @@ pub fn prove_batch_open_committed_ef_slices(
 
     let trace = std::env::var("ZKIE_TRACE_PROVE").is_ok();
     let t_w = std::time::Instant::now();
-    let mut weights: Vec<Vec<Ef>> =
-        (0..unique.len()).map(|_| vec![Ef::ZERO; table_len]).collect();
+    // W_t for each unique table. Claims of one table that share a coordinate
+    // prefix (the expert-major weight layout has all expert claims on the
+    // same inner (n, k) point) reuse that prefix's eq vector: W_t is the
+    // outer product of eq(prefix) with the gamma-weighted suffix sum. This
+    // lowers generation from O(claims x 2^d) to O(2^d) for those groups; the
+    // values are identical because field arithmetic is exact.
+    let weights = build_batch_weights(unique.len(), table_len, &group_of, points, gamma)?;
     let mut gamma_pow = Ef::ONE;
     let mut claimed_sum = Ef::ZERO;
     for i in 0..n {
-        let eq = ef_outer::eq_evals(&points[i]);
-        if eq.len() != table_len {
-            return Err("EF batch-open eq length mismatch".to_owned());
-        }
-        let w = &mut weights[group_of[i]];
-        for (acc, &e) in w.iter_mut().zip(eq.iter()) {
-            *acc = *acc + gamma_pow * e;
-        }
         claimed_sum = claimed_sum + gamma_pow * claimed[i];
         gamma_pow = gamma_pow * gamma;
     }
@@ -221,6 +292,58 @@ mod tests {
     fn ef_eval_at(values: &[Goldilocks], point: &[Ef]) -> Ef {
         // EF evaluation of a base-field MLE via the core helper.
         crate::common::ef_outer::mle_eval_at_ef(values, point).unwrap()
+    }
+
+    #[test]
+    fn shared_prefix_weights_match_direct() {
+        let mut rng = XorShift64::new(0x9402);
+        let d = 8usize;
+        let gamma = Ef::new([rng.field(), rng.field()]);
+        let shared: Vec<Ef> = (0..5).map(|_| Ef::new([rng.field(), rng.field()])).collect();
+        let mut points: Vec<Vec<Ef>> = Vec::new();
+        for e in 0..4usize {
+            let mut p = shared.clone();
+            for b in 0..3 {
+                p.push(if (e >> b) & 1 == 1 { Ef::ONE } else { Ef::ZERO });
+            }
+            points.push(p);
+        }
+        let group_of = vec![0usize; points.len()];
+        let got = build_batch_weights(1, 1 << d, &group_of, &points, gamma).unwrap();
+        let mut want = vec![Ef::ZERO; 1 << d];
+        let mut gp = Ef::ONE;
+        for p in &points {
+            let eq = ef_outer::eq_evals(p);
+            for (a, &e) in want.iter_mut().zip(eq.iter()) { *a = *a + gp * e; }
+            gp = gp * gamma;
+        }
+        assert_eq!(got[0], want);
+        // All claims at one point: the whole point is the shared prefix.
+        let same = vec![points[0].clone(); 5];
+        let got_same = build_batch_weights(1, 1 << d, &vec![0usize; 5], &same, gamma).unwrap();
+        let mut gp = Ef::ONE;
+        let mut sum = Ef::ZERO;
+        for _ in 0..5 { sum = sum + gp; gp = gp * gamma; }
+        let eq = ef_outer::eq_evals(&points[0]);
+        for (a, &e) in got_same[0].iter().zip(eq.iter()) { assert_eq!(*a, sum * e); }
+        // No shared prefix: two tables, claims interleaved; fallback path.
+        let mut p2 = points.clone();
+        p2[0][0] = Ef::new([rng.field(), rng.field()]);
+        p2[2][1] = Ef::new([rng.field(), rng.field()]);
+        let group_of2 = vec![0usize, 1, 0, 1];
+        let got2 = build_batch_weights(2, 1 << d, &group_of2, &p2, gamma).unwrap();
+        for g in 0..2 {
+            let mut want = vec![Ef::ZERO; 1 << d];
+            let mut gp = Ef::ONE;
+            for (i, p) in p2.iter().enumerate() {
+                if group_of2[i] == g {
+                    let eq = ef_outer::eq_evals(p);
+                    for (a, &e) in want.iter_mut().zip(eq.iter()) { *a = *a + gp * e; }
+                }
+                gp = gp * gamma;
+            }
+            assert_eq!(got2[g], want);
+        }
     }
 
     #[test]

@@ -88,6 +88,41 @@ fn ef_eval(values: &[Goldilocks], point: &[Ef]) -> Ef {
     efo::mle_eval_at_ef(values, point).expect("EF MLE evaluation")
 }
 
+/// Evaluate one base-field MLE at several EF points that share a coordinate
+/// prefix. MLE folding consumes coordinates in order, so the shared prefix is
+/// folded once into a residual table and each claim only folds its remaining
+/// suffix. The returned values are bit-identical to calling `ef_eval` per
+/// point: the same coordinates are folded in the same order with exact field
+/// arithmetic. This is the weight-opening claim evaluation for expert-major
+/// tensors, where every expert claim shares the (n, k) inner point.
+fn ef_eval_shared_prefix(values: &[Goldilocks], points: &[&[Ef]]) -> Option<Vec<Ef>> {
+    let first = points.first()?;
+    let d = first.len();
+    if points.iter().any(|p| p.len() != d) || values.len() != 1usize.checked_shl(d as u32)? {
+        return None;
+    }
+    let mut lcp = 0usize;
+    while lcp < d {
+        let c = first[lcp];
+        if points.iter().any(|p| p[lcp] != c) { break; }
+        lcp += 1;
+    }
+    if lcp == 0 {
+        return points.iter().map(|&p| efo::mle_eval_at_ef(values, p)).collect();
+    }
+    let mut buf: Vec<Ef> = values.iter().map(|&v| Ef::from(v)).collect();
+    for &p in &first[..lcp] {
+        let half = buf.len() / 2;
+        for i in 0..half {
+            let a = buf[2 * i];
+            let b = buf[2 * i + 1];
+            buf[i] = a + p * (b - a);
+        }
+        buf.truncate(half);
+    }
+    points.iter().map(|&p| efo::eval_ef_slice(&buf, &p[lcp..])).collect()
+}
+
 #[inline]
 fn ef_eq_poly(r: &[Ef], x: &[Ef]) -> Ef {
     efo::eq_poly(r, x).expect("EF eq-poly arity")
@@ -9319,10 +9354,22 @@ fn build_pooled_aux_openings(rec: &AuxOpenRecorder,
         // The group is opened exactly once; move its PCS prover data instead
         // of cloning it.
         let prover_data = pg.prover_data.take()?;
+        // Explicit fold budget: one W_t buffer (16 B/row) plus one EF value
+        // buffer (16 B/row), with headroom for the eq-poly scratch; the group
+        // columns themselves are borrowed, not copied. Groups are opened one
+        // at a time (parallel_groups = 1), so this bounds the peak instead of
+        // multiplying it by the number of groups.
+        let table_rows = 1usize.checked_shl(pg.descriptor.arity as u32)?;
+        let fold_bytes = unique.len().checked_mul(table_rows)?.checked_mul(64)?;
+        let fold_budget = std::env::var("ZKIE_FOLD_BUDGET_MB").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(32768)
+            .saturating_mul(1024 * 1024);
+        if fold_bytes > fold_budget { return None; }
         let trace = std::env::var("ZKIE_TRACE_PROVE").is_ok();
         if trace {
-            eprintln!("POOLED group={group} claims={} unique={} arity={} cols={}",
-                idxs.len(), unique.len(), pg.descriptor.arity, pg.descriptor.columns);
+            eprintln!("POOLED group={group} claims={} unique={} arity={} cols={} fold_bytes={} budget_mb={} parallel_groups=1",
+                idxs.len(), unique.len(), pg.descriptor.arity, pg.descriptor.columns,
+                fold_bytes, fold_budget / (1024 * 1024));
         }
         let t_group = std::time::Instant::now();
         let proof = prove_batch_open_committed_ef_slices(
@@ -18150,6 +18197,36 @@ fn prove_bound_lm_bindings(prepared: &[PreparedAux], store: &Store, ops: &[Op], 
     Some((sel_openings, token_binding))
 }
 
+fn current_faults() -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(txt) = std::fs::read_to_string("/proc/self/stat") {
+            let t = txt.replace(')', " ");
+            let f: Vec<&str> = t.split_whitespace().collect();
+            let minflt = f.get(9).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let majflt = f.get(11).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            return (minflt, majflt);
+        }
+    }
+    (0, 0)
+}
+
+fn current_io_bytes() -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(txt) = std::fs::read_to_string("/proc/self/io") {
+            let mut rchar = 0u64;
+            let mut read_bytes = 0u64;
+            for line in txt.lines() {
+                if let Some(v) = line.strip_prefix("rchar: ") { rchar = v.trim().parse().unwrap_or(0); }
+                if let Some(v) = line.strip_prefix("read_bytes: ") { read_bytes = v.trim().parse().unwrap_or(0); }
+            }
+            return (rchar, read_bytes);
+        }
+    }
+    (0, 0)
+}
+
 fn current_rss_kb() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -18331,11 +18408,14 @@ static_lookup_groups={static_groups} sel_batch_openings={sel} gelu_bit_columns_p
     };
     let grouping = group_reverse_weights(model, ops, &leaves)?;
     let mut weight_openings = Vec::with_capacity(grouping.groups.len());
-    // S9 2d: split sub-tables share one parent tensor. Materialize each
-    // parent once per proof instead of once per chunk (16x less I/O for a
-    // 2^28 tensor); proof bytes are unaffected.
-    let mut weight_parents: std::collections::BTreeMap<T, Arc<Vec<Goldilocks>>> =
-        std::collections::BTreeMap::new();
+    // O5: per-batch mmap streaming. Each committed batch's tables are read
+    // one 2^arity chunk at a time (the PCS prover data is rebuilt over the
+    // whole committed batch); only the unique claimed buffers are moved into
+    // the opening, and every temporary is dropped when it returns. No
+    // parent-owned Vec is retained across batches.
+    let fold_budget = std::env::var("ZKIE_FOLD_BUDGET_MB").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(32768)
+        .saturating_mul(1024 * 1024);
     for (bi, entries) in grouping.groups.iter().enumerate() {
         let table_idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
         let points: Vec<Vec<Ef>> = entries.iter().map(|e| e.1.clone()).collect();
@@ -18344,55 +18424,95 @@ static_lookup_groups={static_groups} sel_batch_openings={sel} gelu_bit_columns_p
             continue;
         }
         let cw = &cached[bi];
+        let io0 = current_io_bytes();
+        let faults0 = current_faults();
         let t_mat = std::time::Instant::now();
         let chunk_len = 1usize << cw.arity;
         let chunk_off = cw.chunk_index.checked_shl(cw.arity as u32)?;
-        let mut tensors: Vec<Vec<Goldilocks>> = cw.table_ids.iter().map(|&id| {
-            let full = weight_parents.entry(id)
-                .or_insert_with(|| Arc::new(store.materialize(id).into_owned()));
+        let (unique_tables, group_of) = zkie_core::pcs::batch_open::claim_groups(&table_idxs);
+        // Explicit folding budget for one weight batch, which is opened alone
+        // (parallel_batches = 1): one streamed base-field chunk per batch
+        // table (8 B/row) plus the EF W_t and value buffers during sumcheck
+        // (2 x 16 B/row), with headroom for the eq-poly scratch. All batch
+        // tables are read because the PCS prover data must be rebuilt over
+        // the whole committed batch, but only one chunk per table is live.
+        let fold_bytes = cw.num_tables.checked_mul(chunk_len)?.checked_mul(64)?;
+        if fold_bytes > fold_budget {
+            return None; // fail closed, never OOM
+        }
+        let mut tensors: Vec<Vec<Goldilocks>> = Vec::with_capacity(cw.num_tables);
+        let mut copied_values = 0usize;
+        for &id in &cw.table_ids {
+            let blocks = store.weight_blocks(id);
             let mut v = vec![Goldilocks::ZERO; chunk_len];
-            if let Some(src) = full.get(chunk_off..) {
-                let n = src.len().min(chunk_len);
-                v[..n].copy_from_slice(&src[..n]);
+            match blocks {
+                zkie_core::common::batched_matmul::WeightBlocks::Slice(s) => {
+                    if chunk_off < s.len() {
+                        let n = (s.len() - chunk_off).min(chunk_len);
+                        v[..n].copy_from_slice(&s[chunk_off..chunk_off + n]);
+                        copied_values += n;
+                    }
+                }
+                zkie_core::common::batched_matmul::WeightBlocks::Mmap { mmap, start, len } => {
+                    if chunk_off < len {
+                        let n = (len - chunk_off).min(chunk_len);
+                        let written = mmap.read_goldilocks_into(
+                            start.checked_add(chunk_off)?, &mut v[..n]);
+                        if written != n { return None; }
+                        copied_values += n;
+                    }
+                }
             }
-            v
-        }).collect();
-        // Split sub-claims are opened at their proof-provided values; the
-        // verifier later checks the public weighted sum back to the leaf.
-        let claimed: Vec<Ef> = entries.iter().map(|e| match e.2 {
-            Some(v) => v,
-            None => ef_eval(&tensors[e.0], &e.1),
-        }).collect();
-        let refs: Vec<&[Goldilocks]> = tensors.iter().map(Vec::as_slice).collect();
+            tensors.push(v);
+        }
         let mat_ms = t_mat.elapsed().as_secs_f64() * 1e3;
         let rss_mat = current_rss_kb();
+        // Split sub-claims are opened at their proof-provided values; full
+        // claims use the streamed chunk value.
+        let t_eval = std::time::Instant::now();
+        let mut claimed: Vec<Ef> = vec![Ef::ZERO; entries.len()];
+        let mut pending: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+        for (i, e) in entries.iter().enumerate() {
+            match e.2 {
+                Some(v) => claimed[i] = v,
+                None => {
+                    let pos = *group_of.get(i)?;
+                    let t = *unique_tables.get(pos)?;
+                    pending.entry(t).or_default().push(i);
+                }
+            }
+        }
+        for (t, idxs) in pending {
+            let points: Vec<&[Ef]> = idxs.iter().map(|&i| entries[i].1.as_slice()).collect();
+            let vals = ef_eval_shared_prefix(tensors.get(t)?, &points)?;
+            for (i, v) in idxs.into_iter().zip(vals) { claimed[i] = v; }
+        }
+        let eval_ms = t_eval.elapsed().as_secs_f64() * 1e3;
+        let moved_bytes: usize = unique_tables.iter()
+            .map(|&t| tensors[t].len() * std::mem::size_of::<Goldilocks>()).sum();
+        let rss_clone = current_rss_kb();
         let batch_whir = zkie_core::pcs::whir::Whir::with_params(cw.num_vars, cw.security, cw.pow_bits);
         let mut reader = std::io::BufReader::new(std::fs::File::open(&cw.cache_path).ok()?);
         let commitment: zkie_core::pcs::whir::Commitment = bincode::deserialize_from(&mut reader).ok()?;
         if bincode::serialize(&commitment).ok()? != bincode::serialize(&cw.commitment).ok()? { return None; }
         let t_res = std::time::Instant::now();
-        let prover_data = batch_whir.restore_batch_prover_data_from(&refs, &mut reader).ok()?;
+        let prover_data = batch_whir.restore_batch_prover_data_from(
+            &tensors.iter().map(Vec::as_slice).collect::<Vec<_>>(), &mut reader).ok()?;
         let res_ms = t_res.elapsed().as_secs_f64() * 1e3;
         let rss_res = current_rss_kb();
         let protocol = batch_whir.batch_opening_protocol(cw.num_tables, cw.arity);
         let ctx = zkie_core::pcs::committed::BatchCtx { commitment, prover_data, protocol, whir: batch_whir, num_tables: cw.num_tables };
-        // O5: combined equality grouping. Duplicate-table claims share one
-        // W_t(X) = Sum_i gamma^i eq(r_i,X), so the opening takes exactly one
-        // owned buffer per UNIQUE table (first-appearance order) and the
-        // padded buffers are MOVED, never cloned per claim.
-        let (unique_tables, _) = zkie_core::pcs::batch_open::claim_groups(&table_idxs);
-        let moved_bytes: usize = unique_tables
-            .iter()
-            .map(|&t| tensors[t].len() * std::mem::size_of::<Goldilocks>())
-            .sum();
-        drop(refs);
-        let opened: Vec<Vec<Goldilocks>> =
-            unique_tables.iter().map(|&t| std::mem::take(&mut tensors[t])).collect();
-        // Tables outside the claim set are not needed by the opening proof.
+        // The opening needs one owned buffer per UNIQUE claimed table; the
+        // unclaimed batch tables only had to exist while the prover data was
+        // rebuilt and are released here.
+        let opened: Vec<Vec<Goldilocks>> = unique_tables.iter()
+            .map(|&t| std::mem::take(&mut tensors[t])).collect();
         drop(tensors);
-        let rss_clone = current_rss_kb();
-        eprintln!("O5-metrics batch={} claims={} unique={} moved_bytes={} cloned_bytes=0 tables={}",
-            bi, table_idxs.len(), unique_tables.len(), moved_bytes, cw.num_tables);
+        let copied_bytes = copied_values.checked_mul(std::mem::size_of::<Goldilocks>())?;
+        let alloc_bytes = cw.num_tables.checked_mul(chunk_len)?.checked_mul(std::mem::size_of::<Goldilocks>())?;
+        eprintln!("O5-metrics batch={} claims={} unique={} copied_bytes={} alloc_bytes={} moved_bytes={} fold_bytes={} tables={} budget_mb={} parallel_batches=1",
+            bi, table_idxs.len(), unique_tables.len(), copied_bytes, alloc_bytes, moved_bytes, fold_bytes,
+            cw.num_tables, fold_budget / (1024 * 1024));
         let t_open = std::time::Instant::now();
         let opening = prove_batch_open_committed_ef(
             &ctx.whir, &ctx.commitment, &ctx.protocol, ctx.num_tables,
@@ -18400,8 +18520,12 @@ static_lookup_groups={static_groups} sel_batch_openings={sel} gelu_bit_columns_p
         ).ok()?;
         let open_ms = t_open.elapsed().as_secs_f64() * 1e3;
         let rss_open = current_rss_kb();
-        eprintln!("O5-phases mat_ms={:.1} restore_ms={:.1} open_ms={:.1} rss_now_mat={} rss_now_restore={} rss_now_clone={} rss_now_open={} hwm={}",
-            mat_ms, res_ms, open_ms, rss_mat, rss_res, rss_clone, rss_open, peak_rss_kb());
+        let io1 = current_io_bytes();
+        let faults1 = current_faults();
+        eprintln!("O5-phases mat_ms={:.1} eval_ms={:.1} restore_ms={:.1} open_ms={:.1} rss_now_mat={} rss_now_eval={} rss_now_restore={} rss_now_open={} hwm={} rchar_delta={} read_bytes_delta={} minflt_delta={} majflt_delta={}",
+            mat_ms, eval_ms, res_ms, open_ms, rss_mat, rss_clone, rss_res, rss_open, peak_rss_kb(),
+            io1.0.saturating_sub(io0.0), io1.1.saturating_sub(io0.1),
+            faults1.0.saturating_sub(faults0.0), faults1.1.saturating_sub(faults0.1));
         weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: Some(opening) });
     }
     Some(BoundExecutionProof { aux, aux_groups, aux_layout: AUX_LAYOUT_VERSION,
@@ -31529,6 +31653,37 @@ mod tests {
         assert_eq!(b4.weighted, 4 * 7 + gamma); // tie_zero call-site degree
         assert_eq!(b5.weighted, 5 * 7 + gamma); // tie_less call-site degree
         assert!(b4.weighted > b3.weighted && b5.weighted > b4.weighted);
+    }
+
+    #[test]
+    fn ef_eval_shared_prefix_matches_per_point() {
+        let vals: Vec<Goldilocks> = (0..(1usize << 8))
+            .map(|i| Goldilocks::from_u64((i as u64) * 7 + 3)).collect();
+        let shared: Vec<Ef> = (0..5)
+            .map(|j| Ef::from(Goldilocks::from_u64((j as u64) * 11 + 1))).collect();
+        let mut points: Vec<Vec<Ef>> = Vec::new();
+        for e in 0..6usize {
+            let mut p = shared.clone();
+            for b in 0..3 {
+                p.push(if (e >> b) & 1 == 1 { Ef::ONE } else { Ef::ZERO });
+            }
+            points.push(p);
+        }
+        // Also exercise the no-shared-prefix fallback.
+        let mut other = shared.clone();
+        other[0] = Ef::from(Goldilocks::from_u64(999));
+        other.extend_from_slice(&[Ef::ZERO, Ef::ONE, Ef::ZERO]);
+        points.push(other);
+        let refs: Vec<&[Ef]> = points.iter().map(Vec::as_slice).collect();
+        let got = ef_eval_shared_prefix(&vals, &refs).expect("shared-prefix eval");
+        for (p, g) in points.iter().zip(got) {
+            assert_eq!(g, ef_eval(&vals, p));
+        }
+        // All points identical: the shared prefix is the whole point.
+        let same = vec![points[0].clone(); 3];
+        let same_refs: Vec<&[Ef]> = same.iter().map(Vec::as_slice).collect();
+        let got_same = ef_eval_shared_prefix(&vals, &same_refs).expect("identical-point eval");
+        for g in got_same { assert_eq!(g, ef_eval(&vals, &points[0])); }
     }
 
     /// S9 2d: the sub-table split math must reassemble the original MLE:
