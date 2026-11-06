@@ -680,11 +680,14 @@ fn main() {
     let cached_b = commit_model_weights(&sb, &ops_b, &cache_b);
     let model_b = TrustedModelManifest::from_offline_commitment(&cached_b, &sb.owned_slices(), &ops_b)
         .with_index_shapes(&[(tok_b, s_pad), (exp_b, s_pad), (idx_seg, s_pad * H)].into());
+    sb.o7_metrics_reset();
     let proof_b = prove_committed_shard_dag_bound(&mut sb, &ops_b, 1, &whir, &cached_b, 0, 0,
         &PublicStatement::Generic, &model_b, &execution_b)
         .expect("phase B real FFN proof");
     let bytes_b = bincode::serialize(&proof_b).expect("serialize B");
     let b_prove_t = t3.elapsed();
+    let (o7_trees, o7_openings, o7_scan) = sb.o7_deep_metrics();
+    let o7_commits = sb.o7_table_commits();
     let t4 = Instant::now();
     assert!(verify_committed_shard_dag_bound_bytes(&bytes_b, &ops_b, 1, &whir,
         &PublicStatement::Generic, &model_b, &execution_b), "phase B must verify");
@@ -743,8 +746,8 @@ fn main() {
     assert!(!verify_segmented(&stmt, &ops_a, &model_a, &bytes_a, &ops2, &model_b, &bytes_b2, &ops_c, &model_c, &bytes_c, &whir),
         "cross-segment A1 + B2 mismatch must be rejected");
     println!("negative rejected: cross-segment individually-valid A1+B2 mismatch");
-    println!("B commit+prove {:?} verify {:?} bytes {} peak_rss={}kB",
-        b_prove_t, b_verify_t, bytes_b.len(), peak_rss_kb());
+    println!("B commit+prove {:?} verify {:?} bytes {} peak_rss={}kB o7_commits={} o7_trees={} o7_openings={} o7_scan_bytes={}",
+        b_prove_t, b_verify_t, bytes_b.len(), peak_rss_kb(), o7_commits, o7_trees, o7_openings, o7_scan);
 
     // S9 2d: the former O2 route-A measurement hook consumed the weight
     // opening's points/claimed values as base-field Goldilocks. Those fields

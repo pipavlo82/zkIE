@@ -21975,6 +21975,12 @@ mod tests {
         assert_eq!(proof.reverse.steps.iter()
             .filter(|s| matches!(&s.reduction, ReverseReduction::Lookup { .. })).count(), 2,
             "per-op witness-side fractional proofs remain");
+        assert_eq!(proof.aux.iter()
+            .filter(|a| a.role == AuxRole::LookupMultiplicityAgg).count(), 1,
+            "one aggregated multiplicity column per table group");
+        assert_eq!(proof.aux.iter()
+            .filter(|a| a.role == AuxRole::LookupMultiplicity).count(), 2,
+            "per-op multiplicities are still committed for each member");
         let groups = match &proof.reverse.steps.last().unwrap().reduction {
             ReverseReduction::LookupGroups { groups } => groups,
             _ => panic!("missing trailing group step"),
@@ -21997,6 +22003,65 @@ mod tests {
             "grouped proof bytes must be deterministic");
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof2,
             &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// O7 closeout accounting: four same-table Lookups still produce one
+    /// table-side fraction tree, one table opening and one aggregated
+    /// multiplicity column; the per-op witness trees/multiplicities remain
+    /// four. This is the numeric check that aggregation is per table, not
+    /// per op.
+    #[test]
+    fn o7_four_same_table_group_counts() {
+        let mut store = Store::new();
+        let t = store.push((0..32).map(|i| from_i64(100 + i)).collect());
+        let mut idxs = Vec::new();
+        let mut outs = Vec::new();
+        for j in 0..4u32 {
+            idxs.push(store.push_idx((0..32u32).map(|i| (i * (2 * j + 1) + j) % 32).collect()));
+            outs.push(store.push(vec![]));
+        }
+        let ops: Vec<Op> = (0..4)
+            .map(|j| Op::Lookup { idx: idxs[j], out: outs[j], table: t })
+            .collect();
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops)
+            .with_index_shapes(&idxs.iter().map(|&i| (i, 32usize)).collect());
+        let mut inputs = std::collections::BTreeMap::new();
+        for &i in &idxs {
+            inputs.insert(TensorKey::Index(i).encoded().unwrap(),
+                store.idx[i].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect());
+        }
+        let execution = TrustedExecution {
+            inputs,
+            outputs: outs.iter().map(|&o| (o, store.get(o).to_vec())).collect(),
+        };
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
+        store.o7_metrics_reset();
+        let proof = prove_committed_shard_dag_bound(
+            &mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("four-lookup group proof");
+        assert!(verify_committed_shard_dag_bound(
+            &ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let (trees, openings, _scan) = store.o7_deep_metrics();
+        assert_eq!((trees, openings), (1, 1),
+            "one table-side tree and one opening for the whole group");
+        assert_eq!(store.o7_table_commits(), 1, "one per-table Merkle commit");
+        assert_eq!(proof.aux.iter()
+            .filter(|a| a.role == AuxRole::LookupMultiplicityAgg).count(), 1,
+            "aggregate multiplicity is committed once per group");
+        assert_eq!(proof.aux.iter()
+            .filter(|a| a.role == AuxRole::LookupMultiplicity).count(), 4,
+            "each member keeps its own multiplicity column");
+        assert_eq!(proof.reverse.steps.iter()
+            .filter(|s| matches!(&s.reduction, ReverseReduction::Lookup { .. })).count(), 4,
+            "each member keeps its own witness-side tree");
+        let groups = match &proof.reverse.steps.last().unwrap().reduction {
+            ReverseReduction::LookupGroups { groups } => groups,
+            _ => panic!("missing trailing group step"),
+        };
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members, vec![0, 1, 2, 3]);
     }
 
     // ---- Deep O7 (b) negatives ----
@@ -22194,6 +22259,99 @@ mod tests {
         aux.remove(drop_pos);
         assert!(!validate_aux_descriptors(&ops, &model, &aux),
             "merging two table groups into one aggregate descriptor must be rejected");
+    }
+
+    /// O7 closeout: a proof that omits one of the group's Lookup reverse
+    /// steps (or the trailing group step) must be rejected, never silently
+    /// accepted as a smaller group.
+    #[test]
+    fn o7_missing_lookup_step_rejected() {
+        let mut f = o7b_two_lookup_fixture("missing-step");
+        let proof = o7b_bound_proof(&mut f);
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(
+            &bytes, &f.ops, 1, &f.whir, &PublicStatement::Generic, &f.model, &f.execution));
+
+        let mut missing_member: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut removed = false;
+        missing_member.reverse.steps.retain(|s| {
+            if !removed && matches!(&s.reduction, ReverseReduction::Lookup { .. }) {
+                removed = true;
+                false
+            } else {
+                true
+            }
+        });
+        assert!(removed, "fixture must contain two Lookup steps");
+        let ok = s8_catch_verify("missing lookup step", || {
+            verify_committed_shard_dag_bound(
+                &f.ops, 1, &f.whir, &missing_member,
+                &PublicStatement::Generic, &f.model, &f.execution)
+        });
+        assert!(!ok, "dropping a Lookup step must be rejected");
+
+        let mut missing_group: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        missing_group.reverse.steps.retain(
+            |s| !matches!(&s.reduction, ReverseReduction::LookupGroups { .. }));
+        let ok = s8_catch_verify("missing lookup group step", || {
+            verify_committed_shard_dag_bound(
+                &f.ops, 1, &f.whir, &missing_group,
+                &PublicStatement::Generic, &f.model, &f.execution)
+        });
+        assert!(!ok, "dropping the group step must be rejected");
+    }
+
+    /// O7 closeout: two distinct trusted tables form two groups. Swapping
+    /// their group proofs (or table ids) is a cross-group misconnection and
+    /// must be rejected.
+    #[test]
+    fn o7_cross_group_swap_rejected() {
+        let mut store = Store::new();
+        let t1 = store.push((0..8).map(|i| from_i64(100 + i)).collect());
+        let t2 = store.push((0..8).map(|i| from_i64(200 + i)).collect());
+        let idx1 = store.push_idx((0..8u32).collect());
+        let idx2 = store.push_idx((0..8u32).map(|i| 7 - i).collect());
+        let out1 = store.push(vec![]);
+        let out2 = store.push(vec![]);
+        let ops = vec![
+            Op::Lookup { idx: idx1, out: out1, table: t1 },
+            Op::Lookup { idx: idx2, out: out2, table: t2 },
+        ];
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx1, 8usize), (idx2, 8usize)].into());
+        let execution = TrustedExecution {
+            inputs: [
+                (TensorKey::Index(idx1).encoded().unwrap(),
+                 store.idx[idx1].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect()),
+                (TensorKey::Index(idx2).encoded().unwrap(),
+                 store.idx[idx2].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect()),
+            ].into(),
+            outputs: [(out1, store.get(out1).to_vec()), (out2, store.get(out2).to_vec())].into(),
+        };
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
+        let proof = prove_committed_shard_dag_bound(
+            &mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("two-group proof");
+        assert!(verify_committed_shard_dag_bound(
+            &ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+
+        let mut swapped: BoundExecutionProof =
+            bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
+        let groups = match &mut swapped.reverse.steps.last_mut().unwrap().reduction {
+            ReverseReduction::LookupGroups { groups } => groups,
+            _ => panic!("missing trailing group step"),
+        };
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].table_id < groups[1].table_id);
+        groups.swap(0, 1);
+        let ok = s8_catch_verify("cross-group swap", || {
+            verify_committed_shard_dag_bound(
+                &ops, 1, &whir, &swapped,
+                &PublicStatement::Generic, &model, &execution)
+        });
+        assert!(!ok, "swapping two group proofs must be rejected");
     }
 
     /// Deep O7 (b) negative 4: an op-written (dynamic) table is never grouped
