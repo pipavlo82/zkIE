@@ -5,6 +5,10 @@ State: `58fa40e` on `fix/soundness-repair` (test machine
 inventory only; routes A/B change proof/transcript structure and are reported
 to the TL before implementation per the task constraint.
 
+Update 2026-11-06: the committed cross-bind route A/B implementations and
+cold/warm measurement are in the final section of this file; route B is
+selected.
+
 ## Step 1 — baseline inventory (measured)
 
 Instrumentation (temporary, not committed): `prove_reverse_dag_inner` prints
@@ -246,3 +250,113 @@ number in O5 changes meaning because of the byte fix itself.
 
 S7 is not accepted; O2 is not complete. No security parameter or
 authentication relation is changed by this baseline step.
+
+## Committed cross-bind routes (2026-11-06)
+
+Scope: the `committed_cross_bind` boundary primitive. The incumbent opened
+every claim separately and then ran S4 `same_poly` as an extra consistency
+check; the merge result was not consumed. Two routes were implemented and
+measured on the same tensor/claims; route B is selected.
+
+### Implementations
+
+- **Incumbent, retained as reference**: `committed_cross_bind_per_claim` /
+  `verify_committed_cross_bind_per_claim` (proof `CommittedCrossBindProofPerClaim`).
+  N single-point WHIR openings, each immediately self-verified by the prover,
+  then `same_poly`. Shape mismatches are now rejected before the WHIR call
+  (the old verifier could panic on a short point).
+- **Route A**: `committed_cross_bind_route_a` /
+  `verify_committed_cross_bind_route_a` (proof `CommittedCrossBindProofA`).
+  The root and all input claims are absorbed first; `prove_same_poly` merges
+  them into one S4 endpoint; one WHIR opening authenticates that endpoint.
+  The verifier replays the same transcript, derives the endpoint with
+  `verify_same_poly`, and checks one opening against the boundary root.
+  Implemented per boundary commitment; cross-tensor batching of same-shape
+  endpoints would require a combined batch commitment and was not added.
+- **Route B (selected)**: `committed_cross_bind_route_b` /
+  `verify_committed_cross_bind_route_b`; the public `committed_cross_bind` /
+  `verify_committed_cross_bind` wrappers and the `CommittedCrossBindProof`
+  alias now use this route. One multi-point `BatchOpeningProof` authenticates
+  every claim of the tensor through the gamma-weighted sum-of-products
+  relation; there is no `same_poly`. The batch proof absorbs the root, the
+  points and the claimed values before its challenge.
+
+FS order in both routes: boundary root and the complete claim list are fixed
+before the merge/batch challenge; no challenge is moved ahead of the root.
+
+### Measurement (cold + warm)
+
+Real prefix of `silu_table_i32.bin` materialized as one boundary tensor,
+`2^20` field elements (8 MiB), 8 claims, `Whir::try_with_params(20, 97, 17)`
+(the verifier's production boundary parameters). `o5_measure.py` was run per
+route; the input file was the page-cache probe. Unique tensor count is 1,
+claim count is 8, and the boundary tensor is 8 MiB. The incumbent clones the
+PCS prover data once per claim (8 clones); routes A and B clone it once.
+Route B additionally copies the 8 MiB tensor into the batch-opening values;
+route A borrows the tensor.
+
+| route | cache | opens | proof bytes | prove ms | verify ms | maxrss KiB | minflt | majflt | read bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| current | cold | 8 | 819,024 | 939.7 | 22.716 | 225,272 | 32,897 | 39 | 6,705,152 |
+| current | warm | 8 | 819,024 | 943.9 | 22.853 | 226,884 | 33,257 | 0 | 0 |
+| A | cold | 1 | 103,160 | 195.1 | 3.300 | 222,632 | 21,247 | 36 | 4,743,168 |
+| A | warm | 1 | 103,160 | 185.3 | 3.294 | 222,932 | 20,328 | 0 | 0 |
+| B | cold | 1 | 102,768 | 149.3 | 3.262 | 150,328 | 11,393 | 39 | 6,840,320 |
+| B | warm | 1 | 102,768 | 148.4 | 3.233 | 149,640 | 12,295 | 0 | 0 |
+
+All runs: `verify=true`; a tampered claim value, a moved claim point, a
+wrong tensor root, a short point, and a wrong boundary arity are all rejected. Cold `fincore_before=0`; warm
+`fincore_before=full`, `read_bytes=0`, `majflt=0`. The current row's prove
+time includes its embedded self-verification; the A/B rows default to no
+self-verification (separate numbers below).
+
+Route B vs incumbent: 8x fewer openings, 7.97x smaller proof, 6.30x faster
+prove (cold), 6.96x faster verify, 33% lower process maxrss and 65% fewer
+minor faults. Route B vs A: 392 B smaller proof and lower prove/verify/RSS; the net 392 B
+is A's `SamePolyProof` fields (gamma, virtual rounds, merged point) minus B's
+batch sumcheck plus one table evaluation.
+
+Proof-byte explanation by route:
+
+- current: 8 single-point WHIR proofs plus one `SamePolyProof`.
+- A: one single-point WHIR proof plus one `SamePolyProof`.
+- B: one batch-opening proof (batch sumcheck + one WHIR proof + one table
+  evaluation); the S4 merge is omitted because the batch relation already
+  authenticates every claim against the one root.
+
+Selected route B changes the boundary part of the legacy
+`CommittedShardDagProof` byte layout: each `cross_binds` entry now carries the
+batch-opening proof instead of the per-claim openings + `SamePolyProof`. The
+legacy committed verifier is permanently closed and is not a deployed
+consumer; the bound O5/S7 path is unaffected. The outer cross-bind transcript
+no longer absorbs `same_poly` messages for these boundaries; the root and
+claims are still absorbed before any challenge.
+
+### Self-verification accounting
+
+The incumbent pays 45.3 ms (cold) / 44.2 ms (warm) inside `prove`, covering
+its 8 immediate opening verifications plus 8 MLE evaluations. With
+`ZKIE_O2_SKIP_SELFVERIFY=1` the same current run proves in 834.3 ms warm,
+isolating that self-check from the proof cost.
+
+Selected route B defaults to no prover self-verification. With
+`ZKIE_O2_SELFVERIFY=1` its optional opening self-check costs 3.341 ms warm
+(honest); route A's optional self-check costs 2.849 ms. These are reported
+separately and are never included in the user-facing `verify_ms`.
+
+### S4 / 8/8 interaction
+
+`same_poly.rs` is untouched; route A uses the existing S4 primitive without
+modification, and route B removes `same_poly` only from this boundary
+primitive after the batch opening authenticates the claims. The incumbent's
+`same_poly` was an extra consistency check, not the authentication: every
+claim was already opened against the boundary root. The batch opening keeps
+that direct-root authentication for every claim through the gamma relation,
+so no S4 binding strength is relied on or weakened here. All other S4 uses,
+including the 8/8 output-commitment + merged-claim-consumption pattern, are
+unchanged. The full `zkie-ops` and `zkie-core` suites remain green.
+
+Evidence logs: `logs/o2-{current,a,b}-{cold,warm}.log`,
+`logs/o2-{a,b}-selfverify-warm.log`,
+`logs/o2-current-noselfverify-warm.log`. Measurement example:
+`crates/zkie-ops/examples/o2_cross_bind.rs`.

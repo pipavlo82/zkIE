@@ -38,6 +38,7 @@ use zkie_core::common::ef_outer::{self as efo, EfSamePolyProof, EfVirtualProof};
 use zkie_core::common::ef_matmul::EfMatmulProof;
 use zkie_core::common::ef_logup::{EfFractionalProof, EfFractionalChainClaims, EfPermutationProof};
 use zkie_core::pcs::ef_batch_open::{EfBatchOpeningProof, prove_batch_open_committed_ef, prove_batch_open_committed_ef_slices, verify_batch_open_committed_ef};
+use zkie_core::pcs::batch_open::{BatchOpeningProof, prove_batch_open_committed_unique_owned, verify_batch_open_committed};
 use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
 use zkie_core::common::logup_gkr::{
     prove_lookup_fractional, prove_lookup_fractional_batch, prove_lookup_fractional_columns,
@@ -15346,7 +15347,7 @@ fn verify_shard_dag_inner(
 /// the prover side) and carried in the proof, so the verifier never touches the
 /// committed tensor data.
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct CommittedCrossBindProof {
+pub struct CommittedCrossBindProofPerClaim {
     pub same_poly: SamePolyProof,
     pub openings: Vec<(zkie_core::pcs::whir::Proof, Goldilocks)>,
 }
@@ -15371,27 +15372,42 @@ pub struct WeightBatchCommit {
     pub whir: zkie_core::pcs::whir::WhirParams,
 }
 
-pub fn committed_cross_bind(
+pub fn committed_cross_bind_per_claim(
     whir: &zkie_core::pcs::whir::Whir,
     committed: &zkie_core::pcs::committed::Committed,
     tensor: &[Goldilocks],
     claims: &[(Vec<Goldilocks>, Goldilocks)],
     transcript: &mut Transcript,
-) -> Option<CommittedCrossBindProof> {
+) -> Option<CommittedCrossBindProofPerClaim> {
+    if claims.is_empty() || !tensor.len().is_power_of_two()
+        || claims.iter().any(|(p, _)| p.len() != tensor.len().trailing_zeros() as usize)
+    {
+        return None;
+    }
     let mut openings = Vec::with_capacity(claims.len());
+    let skip_self_verify = std::env::var("ZKIE_O2_SKIP_SELFVERIFY").ok().as_deref() == Some("1");
+    let mut self_verify_ns = 0u128;
     for (pt, expected) in claims {
         let (open, opened) = whir.open(committed.prover_data.clone(), &committed.protocol, pt);
-        if whir
-            .verify(&committed.commitment, &open, &committed.protocol, pt)
-            .ok()?
-            != opened
-        {
-            { return None; }
-        }
-        if opened != *expected || opened != mle::eval(tensor, pt) {
-            { return None; }
+        if !skip_self_verify {
+            let t_sv = std::time::Instant::now();
+            if whir
+                .verify(&committed.commitment, &open, &committed.protocol, pt)
+                .ok()?
+                != opened
+            {
+                { return None; }
+            }
+            if opened != *expected || opened != mle::eval(tensor, pt) {
+                { return None; }
+            }
+            self_verify_ns += t_sv.elapsed().as_nanos();
         }
         openings.push((open, opened));
+    }
+    if std::env::var("ZKIE_O2_TRACE").is_ok() {
+        eprintln!("O2-crossbind route=current selfverify_ms={:.3}",
+            self_verify_ns as f64 / 1e6);
     }
     // S1: the merged-point sumcheck binds the commitment root and the claims.
     transcript.absorb(&bincode::serialize(&committed.commitment).ok()?);
@@ -15399,7 +15415,7 @@ pub fn committed_cross_bind(
         transcript.absorb_fields(pt);
         transcript.absorb_field(*ev);
     }
-    Some(CommittedCrossBindProof {
+    Some(CommittedCrossBindProofPerClaim {
         same_poly: {
             // S4: the merged claim of the committed cross-bind is not
             // consumed — every input claim is opened directly against the
@@ -15414,13 +15430,15 @@ pub fn committed_cross_bind(
 
 /// Verify a [`committed_cross_bind`] proof: verify each WHIR opening against the
 /// commitment root, then verify the merged `same_poly`. No tensor data is read.
-pub fn verify_committed_cross_bind(
+pub fn verify_committed_cross_bind_per_claim(
     committed: &BoundaryCommit,
     claims: &[(Vec<Goldilocks>, Goldilocks)],
-    proof: &CommittedCrossBindProof,
+    proof: &CommittedCrossBindProofPerClaim,
     transcript: &mut Transcript,
 ) -> bool {
-    if proof.openings.len() != claims.len() {
+    if claims.is_empty() || proof.openings.len() != claims.len()
+        || claims.iter().any(|(p, _)| p.len() != committed.arity)
+    {
         return false;
     }
     let whir = match zkie_core::pcs::whir::Whir::try_with_params(committed.arity, VERIFIER_SECURITY, 17) {
@@ -15445,6 +15463,194 @@ pub fn verify_committed_cross_bind(
         transcript.absorb_field(*ev);
     }
     verify_same_poly(&proof.same_poly, claims, transcript).is_some()
+}
+
+/// Route A: merge the tensor's claims into one S4 endpoint (`same_poly`) and
+/// open the committed tensor once at that endpoint. The root and the input
+/// claims are absorbed before the merge challenge; the verifier derives the
+/// endpoint from its own transcript replay, then authenticates it with one
+/// WHIR opening against the boundary root.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct CommittedCrossBindProofA {
+    pub merge: SamePolyProof,
+    pub opening: zkie_core::pcs::whir::Proof,
+}
+
+fn cross_bind_arity(tensor_len: usize, claims: &[(Vec<Goldilocks>, Goldilocks)]) -> Option<usize> {
+    if claims.is_empty() || tensor_len == 0 || !tensor_len.is_power_of_two() { return None; }
+    let arity = tensor_len.trailing_zeros() as usize;
+    if claims.iter().any(|(p, _)| p.len() != arity) { return None; }
+    Some(arity)
+}
+
+fn boundary_arity_len(arity: usize) -> Option<usize> {
+    if arity >= usize::BITS as usize { return None; }
+    1usize.checked_shl(arity as u32)
+}
+
+fn cross_bind_selfverify_enabled() -> bool {
+    std::env::var("ZKIE_O2_SELFVERIFY").ok().as_deref() == Some("1")
+}
+
+fn absorb_cross_bind_statement(
+    transcript: &mut Transcript,
+    commitment: &zkie_core::pcs::whir::Commitment,
+    claims: &[(Vec<Goldilocks>, Goldilocks)],
+) -> Option<()> {
+    transcript.absorb(&bincode::serialize(commitment).ok()?);
+    for (pt, ev) in claims {
+        transcript.absorb_fields(pt);
+        transcript.absorb_field(*ev);
+    }
+    Some(())
+}
+
+pub fn committed_cross_bind_route_a(
+    whir: &zkie_core::pcs::whir::Whir,
+    committed: &zkie_core::pcs::committed::Committed,
+    tensor: &[Goldilocks],
+    claims: &[(Vec<Goldilocks>, Goldilocks)],
+    transcript: &mut Transcript,
+) -> Option<CommittedCrossBindProofA> {
+    let arity = cross_bind_arity(tensor.len(), claims)?;
+    if whir.num_variables() != arity { return None; }
+    absorb_cross_bind_statement(transcript, &committed.commitment, claims)?;
+    let (merge, merged_eval) = prove_same_poly(tensor, claims, transcript);
+    let (opening, opened) = whir.open(
+        committed.prover_data.clone(), &committed.protocol, &merge.merged_point);
+    if opened != merged_eval { return None; }
+    if cross_bind_selfverify_enabled() {
+        let t = std::time::Instant::now();
+        let ok = whir.verify(
+            &committed.commitment, &opening, &committed.protocol, &merge.merged_point)
+            .ok() == Some(merged_eval);
+        eprintln!("O2-crossbind route=a selfverify_ms={:.3} ok={ok}",
+            t.elapsed().as_secs_f64() * 1e3);
+        if !ok { return None; }
+    }
+    Some(CommittedCrossBindProofA { merge, opening })
+}
+
+pub fn verify_committed_cross_bind_route_a(
+    committed: &BoundaryCommit,
+    claims: &[(Vec<Goldilocks>, Goldilocks)],
+    proof: &CommittedCrossBindProofA,
+    transcript: &mut Transcript,
+) -> bool {
+    let Some(len) = boundary_arity_len(committed.arity) else { return false; };
+    let Some(arity) = cross_bind_arity(len, claims) else { return false; };
+    if arity != committed.arity { return false; }
+    if absorb_cross_bind_statement(transcript, &committed.commitment, claims).is_none() { return false; }
+    let Some((merged_point, merged_eval)) = verify_same_poly(&proof.merge, claims, transcript) else {
+        return false;
+    };
+    if merged_point.len() != arity { return false; }
+    let whir = match zkie_core::pcs::whir::Whir::try_with_params(
+        committed.arity, VERIFIER_SECURITY, 17) {
+        Some(w) => w, None => return false,
+    };
+    let protocol = whir.opening_protocol(committed.arity, 1);
+    whir.verify(
+        &committed.commitment, &proof.opening, &protocol, &merged_point)
+        .ok() == Some(merged_eval)
+}
+
+/// Route B: keep the multi-point batch opening and drop the redundant S4
+/// merge. One WHIR proof authenticates every claim of the boundary tensor
+/// through the gamma-weighted sum-of-products relation; the commitment root
+/// and the claim list are absorbed before the batch challenge.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct CommittedCrossBindProofB {
+    pub opening: BatchOpeningProof,
+}
+
+pub fn committed_cross_bind_route_b(
+    whir: &zkie_core::pcs::whir::Whir,
+    committed: &zkie_core::pcs::committed::Committed,
+    tensor: &[Goldilocks],
+    claims: &[(Vec<Goldilocks>, Goldilocks)],
+    transcript: &mut Transcript,
+) -> Option<CommittedCrossBindProofB> {
+    let arity = cross_bind_arity(tensor.len(), claims)?;
+    if whir.num_variables() != arity { return None; }
+    absorb_cross_bind_statement(transcript, &committed.commitment, claims)?;
+    let table_idxs = vec![0usize; claims.len()];
+    let points: Vec<Vec<Goldilocks>> = claims.iter().map(|(p, _)| p.clone()).collect();
+    let claimed: Vec<Goldilocks> = claims.iter().map(|(_, v)| *v).collect();
+    let batch_whir = zkie_core::pcs::whir::Whir::with_params(
+        whir.num_variables(), whir.security_level(), whir.pow_bits());
+    let ctx = zkie_core::pcs::committed::BatchCtx {
+        commitment: committed.commitment.clone(),
+        prover_data: committed.prover_data.clone(),
+        protocol: committed.protocol.clone(),
+        whir: batch_whir,
+        num_tables: 1,
+    };
+    let opening = prove_batch_open_committed_unique_owned(
+        ctx, &table_idxs, vec![tensor.to_vec()], &points, &claimed).ok()?;
+    if cross_bind_selfverify_enabled() {
+        let t = std::time::Instant::now();
+        let verify_whir = zkie_core::pcs::whir::Whir::with_params(
+            arity, whir.security_level(), whir.pow_bits());
+        let protocol = verify_whir.opening_protocol(arity, 1);
+        let ok = verify_batch_open_committed(
+            &verify_whir, &committed.commitment, &protocol, 1,
+            &table_idxs, &points, &claimed, &opening);
+        eprintln!("O2-crossbind route=b selfverify_ms={:.3} ok={ok}",
+            t.elapsed().as_secs_f64() * 1e3);
+        if !ok { return None; }
+    }
+    Some(CommittedCrossBindProofB { opening })
+}
+
+pub fn verify_committed_cross_bind_route_b(
+    committed: &BoundaryCommit,
+    claims: &[(Vec<Goldilocks>, Goldilocks)],
+    proof: &CommittedCrossBindProofB,
+    transcript: &mut Transcript,
+) -> bool {
+    let Some(len) = boundary_arity_len(committed.arity) else { return false; };
+    let Some(arity) = cross_bind_arity(len, claims) else { return false; };
+    if arity != committed.arity { return false; }
+    if absorb_cross_bind_statement(transcript, &committed.commitment, claims).is_none() { return false; }
+    let whir = match zkie_core::pcs::whir::Whir::try_with_params(
+        committed.arity, VERIFIER_SECURITY, 17) {
+        Some(w) => w, None => return false,
+    };
+    let protocol = whir.opening_protocol(committed.arity, 1);
+    let table_idxs = vec![0usize; claims.len()];
+    let points: Vec<Vec<Goldilocks>> = claims.iter().map(|(p, _)| p.clone()).collect();
+    let claimed: Vec<Goldilocks> = claims.iter().map(|(_, v)| *v).collect();
+    verify_batch_open_committed(
+        &whir, &committed.commitment, &protocol, 1,
+        &table_idxs, &points, &claimed, &proof.opening)
+}
+
+/// Selected O2 route B proof: one multi-point batch opening, no redundant
+/// same_poly. The alias keeps the public boundary-proof field type stable
+/// within the legacy committed proof envelope.
+pub type CommittedCrossBindProof = CommittedCrossBindProofB;
+
+/// O2 selected entry point (route B). Kept as a wrapper so the existing
+/// boundary call sites use the measured-best implementation.
+pub fn committed_cross_bind(
+    whir: &zkie_core::pcs::whir::Whir,
+    committed: &zkie_core::pcs::committed::Committed,
+    tensor: &[Goldilocks],
+    claims: &[(Vec<Goldilocks>, Goldilocks)],
+    transcript: &mut Transcript,
+) -> Option<CommittedCrossBindProof> {
+    committed_cross_bind_route_b(whir, committed, tensor, claims, transcript)
+}
+
+/// O2 selected verifier (route B).
+pub fn verify_committed_cross_bind(
+    committed: &BoundaryCommit,
+    claims: &[(Vec<Goldilocks>, Goldilocks)],
+    proof: &CommittedCrossBindProof,
+    transcript: &mut Transcript,
+) -> bool {
+    verify_committed_cross_bind_route_b(committed, claims, proof, transcript)
 }
 
 /// Collect the tensor ids of model weights: read but never written, and not a
@@ -16232,8 +16438,10 @@ fn prove_committed_shard_dag_inner(
     let (plain, shard_claims) = prove_shard_dag_inner(store, ops, ops_per_shard, FracMode::Committed);
     let boundary_tensors = plain.cross_tensors.clone();
 
-    // S1: the cross-bind merged-point sumchecks get their own statement-bound
-    // transcript; the verifier replays it in the same per-tensor order.
+    // S1: the cross-bind transcript gets its own statement-bound domain; the
+    // selected O2 route B absorbs the boundary root and claims before its
+    // batch challenge and appends no same_poly messages. The legacy verifier
+    // is permanently closed, so this per-tensor order has no external reader.
     let mut bind_ts = Transcript::new(b"zkie-committed-binds-v1");
     absorb_statement(&mut bind_ts, ops, ops_per_shard);
 
@@ -22050,7 +22258,7 @@ mod tests {
 
         let mut tp = Transcript::new(b"zkie-committed-binds-v1");
         tp.absorb_u64(0x1414);
-        let proof = committed_cross_bind(&whir, &c, &f, &claims, &mut tp).expect("honest bind");
+        let proof = committed_cross_bind_per_claim(&whir, &c, &f, &claims, &mut tp).expect("honest bind");
         assert_eq!(proof.same_poly.proof.final_evals.len(), 3); // mles [f, eq0, eq1]
 
         // A wrong claimed eval must fail the commitment check.
@@ -22060,7 +22268,93 @@ mod tests {
         ];
         let mut tp2 = Transcript::new(b"zkie-committed-binds-v1");
         tp2.absorb_u64(0x1414);
-        assert!(committed_cross_bind(&whir, &c, &f, &bad, &mut tp2).is_none());
+        assert!(committed_cross_bind_per_claim(&whir, &c, &f, &bad, &mut tp2).is_none());
+    }
+
+    #[test]
+    fn committed_cross_bind_routes_roundtrip_and_negatives() {
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::committed::commit;
+        use zkie_core::pcs::whir::Whir;
+
+        let mut rng = XorShift64::new(0x1415);
+        let d = 6usize;
+        let f: Vec<Goldilocks> = (0..(1usize << d)).map(|_| rng.field()).collect();
+        let f2: Vec<Goldilocks> = (0..(1usize << d)).map(|_| rng.field()).collect();
+        let whir = Whir::with_params(d, VERIFIER_SECURITY, 17);
+        let c = commit(&whir, &f);
+        let c2 = commit(&whir, &f2);
+        let points: Vec<Vec<Goldilocks>> = (0..3)
+            .map(|_| (0..d).map(|_| rng.field()).collect()).collect();
+        let claims: Vec<(Vec<Goldilocks>, Goldilocks)> = points
+            .iter().map(|p| (p.clone(), mle::eval(&f, p))).collect();
+        let boundary = BoundaryCommit { commitment: c.commitment.clone(), arity: d };
+        let wrong_boundary = BoundaryCommit { commitment: c2.commitment.clone(), arity: d };
+        let wrong_arity = BoundaryCommit { commitment: c.commitment.clone(), arity: d + 1 };
+
+        // Current: per-claim openings + same_poly.
+        let mut tp = Transcript::new(b"zkie-committed-binds-v1");
+        let p = committed_cross_bind_per_claim(&whir, &c, &f, &claims, &mut tp).expect("current");
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(verify_committed_cross_bind_per_claim(&boundary, &claims, &p, &mut tv));
+        let mut bad = claims.clone(); bad[0].1 += Goldilocks::ONE;
+        let mut moved = claims.clone(); moved[0].0[0] += Goldilocks::ONE;
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind_per_claim(&boundary, &bad, &p, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind_per_claim(&boundary, &moved, &p, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind_per_claim(&wrong_boundary, &claims, &p, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind_per_claim(&wrong_arity, &claims, &p, &mut tv));
+
+        // Route A: one merge + one opening.
+        let mut tp = Transcript::new(b"zkie-committed-binds-v1");
+        let a = committed_cross_bind_route_a(&whir, &c, &f, &claims, &mut tp).expect("route a");
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(verify_committed_cross_bind_route_a(&boundary, &claims, &a, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind_route_a(&boundary, &bad, &a, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind_route_a(&boundary, &moved, &a, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind_route_a(&wrong_boundary, &claims, &a, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind_route_a(&wrong_arity, &claims, &a, &mut tv));
+        let mut short = claims.clone();
+        short[0].0 = short[0].0[..d - 1].to_vec();
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind_route_a(&boundary, &short, &a, &mut tv));
+        let a_bytes = bincode::serialize(&a).unwrap();
+        let a2: CommittedCrossBindProofA = bincode::deserialize(&a_bytes).unwrap();
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(verify_committed_cross_bind_route_a(&boundary, &claims, &a2, &mut tv));
+
+        // Route B (selected default): one multi-point batch opening, no same_poly.
+        let mut tp = Transcript::new(b"zkie-committed-binds-v1");
+        let b = committed_cross_bind(&whir, &c, &f, &claims, &mut tp).expect("route b");
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(verify_committed_cross_bind(&boundary, &claims, &b, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind(&boundary, &bad, &b, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind(&boundary, &moved, &b, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind(&wrong_boundary, &claims, &b, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind(&wrong_arity, &claims, &b, &mut tv));
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(!verify_committed_cross_bind(&boundary, &short, &b, &mut tv));
+        let b_bytes = bincode::serialize(&b).unwrap();
+        let b2: CommittedCrossBindProof = bincode::deserialize(&b_bytes).unwrap();
+        let mut tv = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(verify_committed_cross_bind(&boundary, &claims, &b2, &mut tv));
+
+        // The prover rejects points of the wrong arity before any challenge.
+        let mut ta = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(committed_cross_bind_route_a(&whir, &c, &f, &short, &mut ta).is_none());
+        let mut tb = Transcript::new(b"zkie-committed-binds-v1");
+        assert!(committed_cross_bind_route_b(&whir, &c, &f, &short, &mut tb).is_none());
     }
 
     #[test]
