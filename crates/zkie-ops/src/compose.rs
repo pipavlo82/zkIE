@@ -20993,6 +20993,65 @@ mod tests {
             &PublicStatement::Generic, &model, &execution));
     }
 
+    /// P1/P2: an A rsqrt table used by LNC joins the shared M4b group; the
+    /// internal lookup uses the registry values and produces no PCS table
+    /// opening.
+    #[test]
+    fn p1_a_table_lnc_rsqrt_shared_group() {
+        use crate::tables::{hash_a_table, LoadedATables};
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let (m, d, n_real) = (4usize, 8usize, 5usize);
+        let len = m * d;
+        let xv: Vec<Goldilocks> = (0..len).map(|i| from_i64(((i as i64 * 7) % 17) - 8)).collect();
+        let wv: Vec<Goldilocks> = (0..len).map(|i| from_i64(((i as i64 * 5) % 9) + 1)).collect();
+        let bv: Vec<Goldilocks> = (0..len).map(|i| from_i64(((i as i64 * 3) % 5) - 2)).collect();
+        let x = store.push(xv.clone());
+        let w = store.push(wv.clone());
+        let b = store.push(bv.clone());
+        let out = store.push(vec![Goldilocks::ZERO; len]);
+        let table_vals: Vec<Goldilocks> = (0..32).map(|i| from_i64(1000 + i as i64)).collect();
+        let rsqrt_t = store.push(table_vals.clone());
+        let ops = vec![Op::LayerNormCentered { x, w, b, out,
+            rsqrt_table: rsqrt_t, m, d, n_real }];
+        forward_ops(&mut store, &ops);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-p1-a-lnc");
+        let mut model = TrustedModelManifest::from_offline_commitment(
+            &cached, &store.owned_slices(), &ops);
+        let digest = hash_a_table(rsqrt_t, 32, 5, &table_vals);
+        let entries = [(rsqrt_t, ATableEntry { kind: ATableKind::File,
+            length: 32, arity: 5, file_path: Some("r.bin".to_string()),
+            digest: Some(digest) })].into_iter().collect();
+        let values = [(rsqrt_t, std::sync::Arc::new(table_vals.clone()))].into_iter().collect();
+        let digests = [(rsqrt_t, digest)].into_iter().collect();
+        LoadedATables { entries, values, digests }.install(&mut model).expect("install A");
+        let groups = static_lookup_groups(&ops, &model).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups.contains_key(&rsqrt_t));
+        let execution = TrustedExecution {
+            inputs: [(x, xv)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let whir = Whir::new_testing(5);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir,
+            &cached, 0, 0, &PublicStatement::Generic, &model, &execution)
+            .expect("A rsqrt LNC proof");
+        assert!(proof.internal_table_openings.is_empty());
+        let mut grouped = false;
+        for step in &proof.reverse.steps {
+            if let ReverseReduction::LookupGroups { groups } = &step.reduction {
+                assert!(groups[0].table_opening.is_none(), "A group has no PCS opening");
+                grouped = true;
+            }
+            if let ReverseReduction::Lnc { proof } = &step.reduction {
+                assert!(proof.rsqrt.table_opening.is_none());
+            }
+        }
+        assert!(grouped, "LNC rsqrt must be in the shared group proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+    }
+
     /// P1 Phase 2: the full sidecar path for a Lookup A table — write the
     /// table file + JSON sidecar, load/authenticate, install, prove, verify.
     #[test]
