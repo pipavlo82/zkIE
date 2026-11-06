@@ -85,10 +85,15 @@ fn main() {
         .expect("GPT-2 bound proof");
     let elapsed = t0.elapsed();
     let bytes = bincode::serialize(&proof).expect("serialize proof");
-    let bundle = PublicBundle::new(ops.clone(), 1, stmt, model, execution);
+    let bundle = PublicBundle::new(ops.clone(), 1, stmt, model.clone(), execution);
     write_bundle(Path::new(&bundle_dir), &bundle, &bytes).expect("write bundle");
     let model_dir = Path::new(dir).join("tables.meta").exists().then_some(Path::new(dir));
+    let t_verify = Instant::now();
     let ok = verify_bundle_dir_with_model(Path::new(&bundle_dir), model_dir);
-    println!("gpt2 bundle={bundle_dir} prove={elapsed:?} proof_bytes={} independent_verify={ok}",
-        bytes.len());
+    let verify_ms = t_verify.elapsed().as_secs_f64() * 1e3;
+    let transcript = model.transcript_bytes().expect("manifest transcript");
+    let mut fnv = 0xcbf29ce484222325u64;
+    for &b in &transcript { fnv ^= b as u64; fnv = fnv.wrapping_mul(0x100000001b3); }
+    println!("gpt2 bundle={bundle_dir} prove={elapsed:?} proof_bytes={} transcript_bytes={} transcript_fnv={:016x} independent_verify={ok} verify_ms={verify_ms:.3}",
+        bytes.len(), transcript.len(), fnv);
 }

@@ -21048,8 +21048,18 @@ mod tests {
             }
         }
         assert!(grouped, "LNC rsqrt must be in the shared group proof");
-        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
-            &PublicStatement::Generic, &model, &execution));
+        let pbytes = bincode::serialize(&proof).expect("proof bytes");
+        let tr = model.transcript_bytes().expect("manifest transcript");
+        let mut tr_fn = 0xcbf29ce484222325u64;
+        for &b in &tr { tr_fn ^= b as u64; tr_fn = tr_fn.wrapping_mul(0x100000001b3); }
+        let t_verify = std::time::Instant::now();
+        let accept = verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution);
+        let verify_ms = t_verify.elapsed().as_secs_f64() * 1e3;
+        let k = opening_upper_bound(&ops, &model).expect("K");
+        eprintln!("P2-SMALL-E2E accept={accept} proof_bytes={} proof_fnv={:016x} transcript_bytes={} transcript_fnv={:016x} K={k} verify_ms={verify_ms:.3}",
+            pbytes.len(), p1_fnv64(&pbytes), tr.len(), tr_fn);
+        assert!(accept);
     }
 
     /// P1 Phase 2: the full sidecar path for a Lookup A table — write the
