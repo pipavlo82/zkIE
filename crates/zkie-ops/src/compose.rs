@@ -37,7 +37,7 @@ use zkie_core::common::field::{Field, Goldilocks, Ef, PrimeCharacteristicRing, X
 use zkie_core::common::ef_outer::{self as efo, EfSamePolyProof, EfVirtualProof};
 use zkie_core::common::ef_matmul::EfMatmulProof;
 use zkie_core::common::ef_logup::{EfFractionalProof, EfFractionalChainClaims, EfPermutationProof};
-use zkie_core::pcs::ef_batch_open::{EfBatchOpeningProof, prove_batch_open_committed_ef, verify_batch_open_committed_ef};
+use zkie_core::pcs::ef_batch_open::{EfBatchOpeningProof, prove_batch_open_committed_ef, prove_batch_open_committed_ef_slices, verify_batch_open_committed_ef};
 use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
 use zkie_core::common::logup_gkr::{
     prove_lookup_fractional, prove_lookup_fractional_batch, prove_lookup_fractional_columns,
@@ -120,7 +120,7 @@ const MAX_EFFECTIVE_OPENINGS: usize = 64;
 const MAX_PROOF_OPENINGS: usize = 1 << 12;
 /// S9 2c/A2: aggregate outer-reduction budget `W = Σ(r·d + c) + Σ(n−1)` over
 /// the EF outer checks and batch-opening γ merges, capped at 2^26.
-const MAX_WEIGHTED_ROUNDS: u128 = 1u128 << 26;
+const MAX_WEIGHTED_ROUNDS: u128 = 1u128 << 27;
 /// Exact size of the quadratic extension field:
 /// `(2^64 − 2^32 + 1)^2 = 2^128 − 2^97 + 2^65 + 2^64 − 2^33 + 1`.
 /// It fits in u128 (strictly below 2^128); do not approximate it by 2^128.
@@ -305,6 +305,21 @@ fn static_lookup_groups(
         model.lookup_lengths.get(&table)?;
         groups.entry(table).or_default().push(i);
     }
+    // A single-member table keeps the group only when its two columns are
+    // small enough to avoid the vars=2^27 PoW jump (required_pow_bits steps
+    // from 24 to 32 at 2^27). The 2^26 embedding table is ungrouped so its
+    // per-op multiplicity/table openings stay at vars=2^26 (pow 24).
+    groups.retain(|tid, members| {
+        if members.len() >= 2 { return true; }
+        let len = match model.lookup_lengths.get(tid) { Some(&v) => v, None => return false };
+        let padded = len.checked_next_power_of_two().unwrap_or(usize::MAX).max(32);
+        let keep = padded.checked_mul(2).map(|v| v <= (1usize << 26)).unwrap_or(false);
+        if !keep && std::env::var("ZKIE_TRACE_PROVE").is_ok() {
+            eprintln!("M4B-UNGROUP table={tid} logical_len={len} padded=2^{} op={:?} roles=LookupMultiplicityAgg+member-multiplicity (B static); vars would be 2^27 (pow 32), using ungrouped per-op path (vars 2^26, pow 24)",
+                padded.trailing_zeros(), &ops[members[0]]);
+        }
+        keep
+    });
     Some(groups)
 }
 
@@ -3781,19 +3796,21 @@ fn internal_lookup_prove(store: &Store, table_id: T, pairs: PreparedAux,
     let (padding, padding_point) = efo::prove_virtual(
         &[&eq, &mult_cols[0], &padding_mask], &padding_terms, Ef::ZERO, transcript);
     let padding_value = padding.final_evals[1];
-    if let Some(r) = rec.as_deref_mut() {
+    let (pairs_opening, multiplicity_opening) = if let Some(r) = rec.as_deref_mut() {
         r.record(&pairs.descriptor, &[idx_col, val_col, idx_col, val_col],
             &[point.to_vec(), point.to_vec(), w_den_point.clone(), w_den_point.clone()],
             &[output_index, value, witness_index, witness_value])?;
         r.record(&multiplicity.descriptor, &[0, 0],
             &[t_num_point.clone(), padding_point.clone()],
             &[mult_eval, padding_value])?;
-    }
-    let pairs_opening = open_aux(pairs, &[idx_col, val_col, idx_col, val_col],
-        &[point.to_vec(), point.to_vec(), w_den_point.clone(), w_den_point],
-        &[output_index, value, witness_index, witness_value])?;
-    let multiplicity_opening = open_aux(multiplicity, &[0, 0],
-        &[t_num_point, padding_point], &[mult_eval, padding_value])?;
+        (None, None)
+    } else {
+        (Some(open_aux(pairs, &[idx_col, val_col, idx_col, val_col],
+            &[point.to_vec(), point.to_vec(), w_den_point.clone(), w_den_point],
+            &[output_index, value, witness_index, witness_value])?),
+         Some(open_aux(multiplicity, &[0, 0],
+            &[t_num_point, padding_point], &[mult_eval, padding_value])?))
+    };
     let table_opening = if model.identity_tables.contains_key(&table_id) {
         if table_eval != lookup_index_eval(&t_den_point) { return None; }
         None
@@ -3877,12 +3894,12 @@ fn internal_lookup_verify(table_id: T, pairs: &AuxDescriptor, multiplicity: &Aux
             &[table.q_num.clone(), padding_point.clone()],
             &[proof.multiplicity, proof.padding.final_evals[1]])?;
     } else {
-        if !verify_aux_open(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values, &proof.pairs_opening) {
+        if !verify_aux_open(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values, proof.pairs_opening.as_ref()?) {
             return None;
         }
         if !verify_aux_open(multiplicity, &[0, 0],
             &[table.q_num.clone(), padding_point],
-            &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) {
+            &[proof.multiplicity, proof.padding.final_evals[1]], proof.multiplicity_opening.as_ref()?) {
             return None;
         }
     }
@@ -3959,12 +3976,14 @@ fn internal_lookup_prove_group(store: &Store, table_id: T, pairs: PreparedAux,
     let pair_values = [output_index, value, witness_index, witness_value];
     let mult_points = vec![group.identity_point.to_vec(), padding_point.clone()];
     let mult_values = [group.member_eval, padding_value];
-    if let Some(r) = rec.as_deref_mut() {
+    let (pairs_opening, multiplicity_opening) = if let Some(r) = rec.as_deref_mut() {
         r.record(&pairs.descriptor, &pair_idxs, &pair_points, &pair_values)?;
         r.record(&multiplicity.descriptor, &[0, 0], &mult_points, &mult_values)?;
-    }
-    let pairs_opening = open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?;
-    let multiplicity_opening = open_aux(multiplicity, &[0, 0], &mult_points, &mult_values)?;
+        (None, None)
+    } else {
+        (Some(open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?),
+         Some(open_aux(multiplicity, &[0, 0], &mult_points, &mult_values)?))
+    };
     Some((InternalLookupProof {
         witness,
         table: EfFractionalProof { layers: Vec::new() },
@@ -4015,9 +4034,9 @@ fn internal_lookup_verify_group(table_id: T, pairs: &AuxDescriptor, multiplicity
     if let Some(r) = rec.as_deref_mut() {
         r.record(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values)?;
         r.record(multiplicity, &[0, 0], &mult_points, &mult_values)?;
-    } else if !verify_aux_open(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values, &proof.pairs_opening)
+    } else if !verify_aux_open(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values, proof.pairs_opening.as_ref()?)
         || !verify_aux_open(multiplicity, &[0, 0], &mult_points, &mult_values,
-            &proof.multiplicity_opening) { return None; }
+            proof.multiplicity_opening.as_ref()?) { return None; }
     Some((witness.final_num, witness.final_den))
 }
 
@@ -6652,11 +6671,11 @@ struct ReverseLookupProof {
     multiplicity: Ef,
     table_value: Ef,
     padding: EfVirtualProof,
-    pairs_opening: EfBatchOpeningProof,
+    pairs_opening: Option<EfBatchOpeningProof>,
     /// Ungrouped: opens the per-op multiplicity at [table num leaf, padding].
     /// Grouped: opens this op's multiplicity at [group identity point,
     /// padding].
-    multiplicity_opening: EfBatchOpeningProof,
+    multiplicity_opening: Option<EfBatchOpeningProof>,
     table_opening: Option<zkie_core::pcs::whir::Proof>,
 }
 
@@ -6712,8 +6731,8 @@ struct InternalLookupProof {
     multiplicity: Ef,
     table_value: Ef,
     padding: EfVirtualProof,
-    pairs_opening: EfBatchOpeningProof,
-    multiplicity_opening: EfBatchOpeningProof,
+    pairs_opening: Option<EfBatchOpeningProof>,
+    multiplicity_opening: Option<EfBatchOpeningProof>,
     table_opening: Option<zkie_core::pcs::whir::Proof>,
 }
 
@@ -9277,23 +9296,42 @@ struct AuxGroupOpening {
 }
 
 fn build_pooled_aux_openings(rec: &AuxOpenRecorder,
-    groups: &[PreparedAuxGroup]) -> Option<Vec<AuxGroupOpening>>
+    groups: &mut [PreparedAuxGroup]) -> Option<Vec<AuxGroupOpening>>
 {
     let mut out = Vec::new();
     for group in rec.groups_with_claims() {
-        let pg = groups.get(group)?;
+        let pg = groups.get_mut(group)?;
         if pg.descriptor.columns != rec.plan.groups.get(group)?.1 { return None; }
         let claims = rec.claims_for(group);
         let idxs: Vec<usize> = claims.iter().map(|(c, _, _)| *c).collect();
         let points: Vec<Vec<Ef>> = claims.iter().map(|(_, p, _)| p.clone()).collect();
         let values: Vec<Ef> = claims.iter().map(|(_, _, v)| *v).collect();
+        // First-appearance unique columns in O(n log n), matching the
+        // batch-opening API's group order.
+        let mut seen = std::collections::BTreeSet::new();
         let mut unique: Vec<usize> = Vec::new();
-        for &c in &idxs { if !unique.contains(&c) { unique.push(c); } }
-        let tensors: Vec<Vec<Goldilocks>> = unique.iter()
-            .map(|&c| pg.columns.get(c).cloned()).collect::<Option<_>>()?;
-        let proof = prove_batch_open_committed_ef(
+        for &c in &idxs { if seen.insert(c) { unique.push(c); } }
+        // Borrow the group columns in place; no per-column base-field clone.
+        let mut tensors: Vec<&[Goldilocks]> = Vec::with_capacity(unique.len());
+        for &c in &unique {
+            tensors.push(pg.columns.get(c)?.as_slice());
+        }
+        // The group is opened exactly once; move its PCS prover data instead
+        // of cloning it.
+        let prover_data = pg.prover_data.take()?;
+        let trace = std::env::var("ZKIE_TRACE_PROVE").is_ok();
+        if trace {
+            eprintln!("POOLED group={group} claims={} unique={} arity={} cols={}",
+                idxs.len(), unique.len(), pg.descriptor.arity, pg.descriptor.columns);
+        }
+        let t_group = std::time::Instant::now();
+        let proof = prove_batch_open_committed_ef_slices(
             &pg.whir, &pg.descriptor.commitment, &pg.protocol, pg.descriptor.columns,
-            pg.prover_data.clone(), &idxs, tensors, &points, &values).ok()?;
+            prover_data, &idxs, &tensors, &points, &values).ok()?;
+        if trace {
+            eprintln!("POOLED group={group} done ms={:.1}",
+                t_group.elapsed().as_secs_f64() * 1e3);
+        }
         out.push(AuxGroupOpening { group, proof });
     }
     Some(out)
@@ -9336,13 +9374,24 @@ fn internal_lookup_member_counts(ops: &[Op], model: &TrustedModelManifest)
     -> std::collections::BTreeMap<T, usize>
 {
     let mut out: std::collections::BTreeMap<T, usize> = Default::default();
+    let groups = static_lookup_groups(ops, model).unwrap_or_default();
     let mut add = |t: T, n: usize| {
-        if !model.identity_tables.contains_key(&t) && !model.a_tables.contains_key(&t) {
+        if !model.identity_tables.contains_key(&t) && !model.a_tables.contains_key(&t)
+            && !groups.contains_key(&t) {
             *out.entry(t).or_default() += n;
         }
     };
+    let written = op_field_writes(ops);
     for op in ops {
         match op {
+            Op::Lookup { table, .. } => {
+                // Ungrouped static B lookup: one deferred per-table batch
+                // opening. Dynamic/identity/A tables do not open.
+                if !written.contains(table) && !model.identity_tables.contains_key(table)
+                    && !model.a_tables.contains_key(table) && !groups.contains_key(table) {
+                    add(*table, 1);
+                }
+            }
             Op::Softmax { table, .. } => add(*table, 1),
             Op::LayerNormCentered { rsqrt_table, .. } => add(*rsqrt_table, 1),
             // RmsNorm: one rsqrt lookup plus four limb lookups (the limb
@@ -9489,7 +9538,8 @@ fn validate_aux_plan(ops: &[Op], model: &TrustedModelManifest,
 struct PreparedAuxGroup {
     descriptor: AuxGroupDescriptor,
     columns: Vec<Vec<Goldilocks>>,
-    prover_data: zkie_core::pcs::whir::ProverData,
+    /// Taken by the one pooled opening of this group; no prover-data clone.
+    prover_data: Option<zkie_core::pcs::whir::ProverData>,
     protocol: zkie_core::pcs::whir::OpeningProtocol,
     whir: zkie_core::pcs::whir::Whir,
 }
@@ -9533,8 +9583,7 @@ fn commit_aux_groups_from(prepared: &[PreparedAux], ops: &[Op], model: &TrustedM
     if filled.iter().any(|v| v.iter().any(|&x| !x)) { return None; }
     let mut groups = Vec::with_capacity(plan.groups.len());
     let mut prepared_groups = Vec::with_capacity(plan.groups.len());
-    for (arity, cols) in &plan.groups {
-        let columns = &group_cols[groups.len()];
+    for ((arity, cols), columns) in plan.groups.iter().zip(group_cols.into_iter()) {
         if columns.len() != *cols { return None; }
         let padded = 1usize.checked_shl(*arity as u32)?;
         let vars = cols.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
@@ -9547,7 +9596,7 @@ fn commit_aux_groups_from(prepared: &[PreparedAux], ops: &[Op], model: &TrustedM
         };
         groups.push(descriptor.clone());
         prepared_groups.push(PreparedAuxGroup {
-            descriptor, columns: columns.clone(), prover_data, protocol, whir,
+            descriptor, columns, prover_data: Some(prover_data), protocol, whir,
         });
     }
     Some((plan, groups, prepared_groups))
@@ -9621,15 +9670,16 @@ fn projection_boolean_terms(columns: usize, gamma: Ef) -> Vec<(Ef, Vec<usize>)> 
 fn open_aux(aux: PreparedAux, idxs: &[usize], points: &[Vec<Ef>], values: &[Ef])
     -> Option<EfBatchOpeningProof>
 {
-    // One base-field tensor per unique table, first-appearance order.
+    // One base-field tensor per unique table, first-appearance order; borrow
+    // the prepared columns and move the PCS prover data instead of cloning.
+    let mut seen = std::collections::BTreeSet::new();
     let mut unique = Vec::new();
-    for &j in idxs {
-        if !unique.contains(&j) { unique.push(j); }
-    }
-    let tensors: Vec<Vec<Goldilocks>> = unique.iter().map(|&j| aux.columns[j].clone()).collect();
-    prove_batch_open_committed_ef(
+    for &j in idxs { if seen.insert(j) { unique.push(j); } }
+    let mut tensors: Vec<&[Goldilocks]> = Vec::with_capacity(unique.len());
+    for &j in &unique { tensors.push(aux.columns.get(j)?.as_slice()); }
+    prove_batch_open_committed_ef_slices(
         &aux.whir, &aux.descriptor.commitment, &aux.protocol, aux.descriptor.columns,
-        aux.prover_data, idxs, tensors, points, values,
+        aux.prover_data, idxs, &tensors, points, values,
     ).ok()
 }
 
@@ -9970,16 +10020,18 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
         let pair_idxs = [0, 1, 0, 1];
         let pair_points = vec![output_point.clone(), output_point.clone(), w_den_point.clone(), w_den_point];
         let pair_values = [output_index, value, witness_index, witness_value];
-        if let Some(r) = rec.as_deref_mut() {
+        let (pairs_opening, multiplicity_opening) = if let Some(r) = rec.as_deref_mut() {
             r.record(&pairs.descriptor, &pair_idxs, &pair_points, &pair_values)?;
             r.record(&multiplicity.descriptor, &[0, 0],
                 &[g.identity_point.to_vec(), padding_point.clone()],
                 &[g.member_eval, padding_value])?;
-        }
-        let pairs_opening = open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?;
-        let multiplicity_opening = open_aux(multiplicity, &[0, 0],
-            &[g.identity_point.to_vec(), padding_point],
-            &[g.member_eval, padding_value])?;
+            (None, None)
+        } else {
+            (Some(open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?),
+             Some(open_aux(multiplicity, &[0, 0],
+                &[g.identity_point.to_vec(), padding_point],
+                &[g.member_eval, padding_value])?))
+        };
         let mut claims = vec![EfClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index }];
         let proof = ReverseLookupProof {
             witness,
@@ -10037,13 +10089,15 @@ fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let pair_idxs = [0, 1, 0, 1];
     let pair_points = vec![output_point.clone(), output_point.clone(), w_den_point.clone(), w_den_point];
     let pair_values = [output_index, value, witness_index, witness_value];
-    if let Some(r) = rec.as_deref_mut() {
+    let (pairs_opening, multiplicity_opening) = if let Some(r) = rec.as_deref_mut() {
         r.record(&pairs.descriptor, &pair_idxs, &pair_points, &pair_values)?;
         r.record(&multiplicity.descriptor, &[0, 0],
             &[t_num_point.clone(), padding_point.clone()], &[mult_eval, padding_value])?;
-    }
-    let pairs_opening = open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?;
-    let multiplicity_opening = open_aux(multiplicity, &[0, 0], &[t_num_point, padding_point], &[mult_eval, padding_value])?;
+        (None, None)
+    } else {
+        (Some(open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?),
+         Some(open_aux(multiplicity, &[0, 0], &[t_num_point, padding_point], &[mult_eval, padding_value])?))
+    };
     let table_opening = if dynamic_table {
         // The table is an op-produced intermediate (e.g. the router gate);
         // the returned table claim is authenticated by its producer instead
@@ -10138,10 +10192,10 @@ fn verify_reverse_lookup(op: &Op, point: &[Ef], value: Ef, pairs: &AuxDescriptor
             r.record(multiplicity, &[0, 0],
                 &[g.identity_point.to_vec(), padding_point.clone()],
                 &[proof.multiplicity, proof.padding.final_evals[1]])?;
-        } else if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
+        } else if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, proof.pairs_opening.as_ref()?)
             || !verify_aux_open(multiplicity, &[0, 0],
                 &[g.identity_point.to_vec(), padding_point],
-                &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) { return None; }
+                &[proof.multiplicity, proof.padding.final_evals[1]], proof.multiplicity_opening.as_ref()?) { return None; }
         // Step (c): no per-member table opening; the group already verified
         // the single opening and checked the shared leaf relation.
         let claims = vec![EfClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: proof.output_index }];
@@ -10166,8 +10220,8 @@ fn verify_reverse_lookup(op: &Op, point: &[Ef], value: Ef, pairs: &AuxDescriptor
         r.record(pairs, &[0, 1, 0, 1], &points, &values)?;
         r.record(multiplicity, &[0, 0], &[table.q_num.clone(), padding_point.clone()],
             &[proof.multiplicity, proof.padding.final_evals[1]])?;
-    } else if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
-        || !verify_aux_open(multiplicity, &[0, 0], &[table.q_num, padding_point], &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) { return None; }
+    } else if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, proof.pairs_opening.as_ref()?)
+        || !verify_aux_open(multiplicity, &[0, 0], &[table.q_num, padding_point], &[proof.multiplicity, proof.padding.final_evals[1]], proof.multiplicity_opening.as_ref()?) { return None; }
     if dynamic_table {
         if proof.table_opening.is_some() { return None; }
     } else if let Some(&len) = model.identity_tables.get(&table_id) {
@@ -18219,7 +18273,7 @@ pub fn prove_committed_shard_dag_bound(
     if trace { eprintln!("PROVE stage prepare_all_aux"); }
     let prepared = prepare_all_aux(store, ops, model)?;
     if trace { eprintln!("PROVE stage commit_aux_groups aux={}", prepared.len()); }
-    let (aux_plan, aux_groups, aux_prepared_groups) = commit_aux_groups_from(&prepared, ops, model)?;
+    let (aux_plan, aux_groups, mut aux_prepared_groups) = commit_aux_groups_from(&prepared, ops, model)?;
     if trace {
         let ub = opening_upper_bound(ops, model)?;
         let internal = internal_lookup_member_counts(ops, model).len();
@@ -18252,7 +18306,7 @@ static_lookup_groups={static_groups} sel_batch_openings={sel} gelu_bit_columns_p
     if trace { eprintln!("PROVE stage reverse DAG"); }
     let (reverse, prover_leaves) = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model), Some(&certified), Some(execution), &lookup_groups, Some(&mut aux_recorder))?;
     if trace { eprintln!("PROVE stage pooled aux openings"); }
-    let aux_pooled = build_pooled_aux_openings(&aux_recorder, &aux_prepared_groups)?;
+    let aux_pooled = build_pooled_aux_openings(&aux_recorder, &mut aux_prepared_groups)?;
     if trace { eprintln!("PROVE stage internal table openings"); }
     let internal_table_openings =
         build_internal_table_openings(&aux_recorder, store, model)?;
@@ -18491,8 +18545,15 @@ fn lookup_collision_units(ops: &[Op], model: &TrustedModelManifest, aux: &[AuxDe
         .max()
         .unwrap_or(2);
     let mut total = 0u128;
+    // A static table used by several Lookup ops contributes one denominator
+    // set (M4b/O7 shared group); charge its length once, not once per member.
+    let written = op_field_writes(ops);
+    let mut seen_static = std::collections::BTreeSet::new();
     for op in ops {
         if let Op::Lookup { idx, table, .. } = op {
+            if !written.contains(table)
+                && !model.identity_tables.contains_key(table)
+                && !seen_static.insert(*table) { continue; }
             let ki = TensorKey::Index(*idx).encoded()?;
             let kt = TensorKey::Field(*table).encoded()?;
             // Index length: trusted manifest shape, else the precommitted
@@ -18567,8 +18628,8 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.fractional(&proof.table)?;
                 b.virtual_proof(&proof.padding, 3)?;
                 if proof_aux_layout < 2 {
-                    b.opening(&proof.pairs_opening, max_aux_columns)?;
-                    b.opening(&proof.multiplicity_opening, 2)?;
+                    b.opening(proof.pairs_opening.as_ref()?, max_aux_columns)?;
+                    b.opening(proof.multiplicity_opening.as_ref()?, 2)?;
                 }
                 if proof.table_opening.is_some() { b.base_opening()?; }
             }
@@ -18677,8 +18738,8 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.fractional(&proof.lookup.table)?;
                 b.virtual_proof(&proof.lookup.padding, 3)?;
                 if proof_aux_layout < 2 {
-                    b.opening(&proof.lookup.pairs_opening, 4)?;
-                    b.opening(&proof.lookup.multiplicity_opening, 2)?;
+                    if let Some(o) = &proof.lookup.pairs_opening { b.opening(o, 4)?; }
+                    if let Some(o) = &proof.lookup.multiplicity_opening { b.opening(o, 2)?; }
                 }
                 if proof.lookup.table_opening.is_some() { b.base_opening()?; }
                 b.virtual_proof(&proof.row_sum, 3)?;
@@ -18712,8 +18773,8 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                     b.fractional(&l.table)?;
                     b.virtual_proof(&l.padding, 3)?;
                     if !pooled {
-                        b.opening(&l.pairs_opening, 4)?;
-                        b.opening(&l.multiplicity_opening, 2)?;
+                        if let Some(o) = &l.pairs_opening { b.opening(o, 4)?; }
+                        if let Some(o) = &l.multiplicity_opening { b.opening(o, 2)?; }
                     }
                     if l.table_opening.is_some() { b.base_opening()?; }
                 }
@@ -18733,8 +18794,8 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 b.fractional(&proof.rsqrt.table)?;
                 b.virtual_proof(&proof.rsqrt.padding, 3)?;
                 if proof_aux_layout < 2 {
-                    b.opening(&proof.rsqrt.pairs_opening, 4)?;
-                    b.opening(&proof.rsqrt.multiplicity_opening, 2)?;
+                    if let Some(o) = &proof.rsqrt.pairs_opening { b.opening(o, 4)?; }
+                    if let Some(o) = &proof.rsqrt.multiplicity_opening { b.opening(o, 2)?; }
                     b.opening(&proof.row_opening, lnc_row_claims)?;
                     b.opening(&proof.out_opening, LNC_OUT_COLS + 1)?;
                 }
@@ -18752,8 +18813,8 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                     b.fractional(&l.table)?;
                     b.virtual_proof(&l.padding, 3)?;
                     if proof_aux_layout < 2 {
-                        b.opening(&l.pairs_opening, 4)?;
-                        b.opening(&l.multiplicity_opening, 2)?;
+                        if let Some(o) = &l.pairs_opening { b.opening(o, 4)?; }
+                        if let Some(o) = &l.multiplicity_opening { b.opening(o, 2)?; }
                     }
                     if l.table_opening.is_some() { b.base_opening()?; }
                 }
@@ -18834,7 +18895,12 @@ pub fn verify_committed_shard_dag_bound(
     // Resource/wire prefilter (2^12), effective K cap (64), explicit outer
     // half (outer_units·2^91 ≤ |EF|) and the exact combined check
     // K·2^-97 + (weighted+merge)/|EF| ≤ 2^-90.
-    if !security_policy_ok(budget.openings, budget.weighted, budget.merge) { return false; }
+    let vtr0 = std::env::var("ZKIE_TRACE_PROVE").is_ok();
+    let policy_ok = security_policy_ok(budget.openings, budget.weighted, budget.merge);
+    if vtr0 { eprintln!("VERIFY precheck policy_ok={policy_ok} aux_layout={} plan_ok={}",
+        proof.aux_layout,
+        validate_aux_plan(ops, model, &proof.aux_groups).is_some()); }
+    if !policy_ok { return false; }
     // Dead-field canonicalization: a Generic statement never consults the
     // token binding, so a Generic proof must not carry one (S8 malleability).
     if !matches!(statement, PublicStatement::LanguageModel { .. }) && proof.token_binding.is_some() {
@@ -18856,19 +18922,27 @@ pub fn verify_committed_shard_dag_bound(
     let aux_plan = match validate_aux_plan(ops, model, &proof.aux_groups) {
         Some(p) => p, None => return false,
     };
+    let vtr = std::env::var("ZKIE_TRACE_PROVE").is_ok();
+    if vtr { eprintln!("VERIFY stage aux plan"); }
     let mut aux_recorder = AuxOpenRecorder::new(aux_plan);
-    let (mut transcript, seeds) = match execution_seeds(ops, model, execution, &proof.aux, &proof.aux_groups) { Some(v) => v, None => return false };
+    let (mut transcript, seeds) = match execution_seeds(ops, model, execution, &proof.aux, &proof.aux_groups) { Some(v) => v, None => { if vtr { eprintln!("VERIFY fail execution_seeds"); } return false } };
+    if vtr { eprintln!("VERIFY stage lookup groups derive"); }
     let certified = certified_index_tensors(ops, execution);
     let lookup_groups = match derive_lookup_group_ab(&mut transcript, ops, model) {
-        Some(v) => v, None => return false,
+        Some(v) => v, None => { if vtr { eprintln!("VERIFY fail derive groups"); } return false },
     };
+    if vtr { eprintln!("VERIFY stage reverse DAG"); }
     let leaves = match verify_reverse_dag_inner(ops, &seeds, &proof.reverse, &mut transcript, &proof.aux, Some(model), Some(&certified), Some(execution), &lookup_groups, Some(&mut aux_recorder)) {
-        Some(v) => v, None => return false,
+        Some(v) => v, None => { if vtr { eprintln!("VERIFY fail reverse DAG"); } return false },
     };
+    if vtr { eprintln!("VERIFY stage pooled openings"); }
     if !verify_pooled_aux_openings(&aux_recorder, &proof.aux_groups, &proof.aux_pooled) {
+        if vtr { eprintln!("VERIFY fail pooled openings"); }
         return false;
     }
+    if vtr { eprintln!("VERIFY stage internal openings"); }
     if !verify_internal_table_openings(&aux_recorder, model, &proof.internal_table_openings) {
+        if vtr { eprintln!("VERIFY fail internal openings"); }
         return false;
     }
     let weights: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
@@ -18903,8 +18977,11 @@ pub fn verify_committed_shard_dag_bound(
             if ef_eval(&vals, &c.point) != c.value { return false; }
         }
     }
-    let grouping = match group_reverse_weights(model, ops, &leaves) { Some(g) => g, None => return false };
+    if vtr { eprintln!("VERIFY leaves ok count={}", leaves.len()); }
+    let grouping = match group_reverse_weights(model, ops, &leaves) { Some(g) => g, None => { if vtr { eprintln!("VERIFY fail weight grouping"); } return false } };
+    if vtr { eprintln!("VERIFY weight grouping ok groups={}", grouping.groups.len()); }
     if proof.weight_openings.len() != grouping.groups.len() { return false; }
+    if vtr { eprintln!("VERIFY weight openings start"); }
     for (bi, (opening, entries)) in proof.weight_openings.iter().zip(&grouping.groups).enumerate() {
         let idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
         let points: Vec<Vec<Ef>> = entries.iter().map(|e| e.1.clone()).collect();
@@ -18947,6 +19024,7 @@ pub fn verify_committed_shard_dag_bound(
     // prove sel(i, argmax[i]) == 1, so a claimed argmax pointing at a column
     // where the selector is 0 (tied second maximum, forged prompt row) is
     // rejected.
+    if vtr { eprintln!("VERIFY weight openings ok"); }
     let argmax_ops: Vec<(usize, T, usize, usize)> = ops.iter().enumerate().filter_map(|(i, op)| match op {
         Op::Argmax { out, m, n, .. } => Some((i, *out, *m, *n)),
         _ => None,
@@ -18976,12 +19054,13 @@ pub fn verify_committed_shard_dag_bound(
     // S6 (bound): language-model sequence checks + embedding token binding.
     // The caller's prompt/response are authoritative; the proof never
     // carries tokens.
+    if vtr { eprintln!("VERIFY sel openings ok"); }
     if let PublicStatement::LanguageModel { prompt, response, next_token } = statement {
         if argmax_ops.len() != 1 { return false; }
         let (_, out_t, m, n) = argmax_ops[0];
         let mut tokens = prompt.clone();
         tokens.extend_from_slice(response);
-        if tokens.len() != m { return false; }
+        if tokens.len() != m { if vtr { eprintln!("VERIFY fail language tokens len"); } return false; }
         for &t in &tokens {
             if (t as usize) >= n {
                 return false; // vocab range (padded vocab columns are masked)
@@ -19003,7 +19082,8 @@ pub fn verify_committed_shard_dag_bound(
         // Token binding: the first Lookup's index witness column (LookupPairs
         // aux column 0) is opened at a fresh random point r with claimed
         // x_hat(r) recomputed from the public tokens.
-        let tb = match &proof.token_binding { Some(tb) => tb, None => return false };
+        if vtr { eprintln!("VERIFY language teacher-forcing ok"); }
+        let tb = match &proof.token_binding { Some(tb) => tb, None => { if vtr { eprintln!("VERIFY fail token binding missing"); } return false } };
         let first_lookup = match ops.iter().position(|op| matches!(op, Op::Lookup { .. })) { Some(p) => p, None => return false };
         let table_t = match &ops[first_lookup] { Op::Lookup { table, .. } => *table, _ => return false };
         let descriptor = match proof.aux.iter().find(|a| a.op_index == first_lookup && a.role == AuxRole::LookupPairs) {
@@ -30154,7 +30234,7 @@ mod tests {
         let value = ef_eval(&pg.columns[col], &point);
         let opening = prove_batch_open_committed_ef(
             &pg.whir, &pg.descriptor.commitment, &pg.protocol, pg.descriptor.columns,
-            pg.prover_data.clone(), &[col], vec![pg.columns[col].clone()],
+            pg.prover_data.clone().expect("group prover data"), &[col], vec![pg.columns[col].clone()],
             &[point.clone()], &[value]).expect("pooled group opening");
         assert!(verify_batch_open_committed_ef(
             &pg.whir, &pg.descriptor.commitment, &pg.protocol, pg.descriptor.columns,

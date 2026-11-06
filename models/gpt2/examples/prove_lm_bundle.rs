@@ -73,10 +73,18 @@ fn main() {
         eprintln!("prompt_len={prompt_len} out of range for m={m}");
         std::process::exit(2);
     }
-    let stmt = PublicStatement::LanguageModel {
-        prompt: tokens[..prompt_len].to_vec(),
-        response: tokens[prompt_len..].to_vec(),
-        next_token: None,
+    // A reduced-layer model cannot be expected to satisfy canonical GPT-2
+    // teacher forcing; ZKIE_GENERIC_STATEMENT exercises the same proof and
+    // verifier machinery with a Generic statement for resource-constrained
+    // e2e runs.
+    let stmt = if std::env::var("ZKIE_GENERIC_STATEMENT").is_ok() {
+        PublicStatement::Generic
+    } else {
+        PublicStatement::LanguageModel {
+            prompt: tokens[..prompt_len].to_vec(),
+            response: tokens[prompt_len..].to_vec(),
+            next_token: None,
+        }
     };
     let whir = Whir::new_testing(5);
     let t0 = Instant::now();

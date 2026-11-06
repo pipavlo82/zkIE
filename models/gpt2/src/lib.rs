@@ -374,7 +374,12 @@ pub fn build_gpt2(
     let mask_t = store.push(causal_mask(m));
 
     let mut x_cur = x0;
-    for layer in 0..LAYERS {
+    // Resource-constrained e2e harness: ZKIE_GPT2_LAYERS=N builds a prefix of
+    // N layers (default: the full 12-layer GPT-2 graph).
+    let layers = std::env::var("ZKIE_GPT2_LAYERS").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(LAYERS).clamp(1, LAYERS);
+    for layer in 0..layers {
         x_cur = build_layer(
             store, ops, x_cur, layer, m, shift, exp_t, gelu_t, rsqrt_t, mask_t,
         );

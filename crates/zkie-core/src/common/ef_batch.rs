@@ -71,18 +71,28 @@ pub fn prove_sum_of_products(
     claimed_sum: Ef,
     transcript: &mut Transcript,
 ) -> (EfSumcheckProofBatch, Vec<Ef>) {
-    let n = weights.len();
+    prove_sum_of_products_owned(weights.to_vec(), values.to_vec(), claimed_sum, transcript)
+}
+
+/// Ownership-taking variant: the caller's weight/value buffers become the
+/// folding buffers, so no full column copies are made. This is the path used
+/// by the pooled aux openings, where columns can be large.
+pub fn prove_sum_of_products_owned(
+    mut w_bufs: Vec<Vec<Ef>>,
+    mut v_bufs: Vec<Vec<Ef>>,
+    claimed_sum: Ef,
+    transcript: &mut Transcript,
+) -> (EfSumcheckProofBatch, Vec<Ef>) {
+    let n = w_bufs.len();
     assert!(n > 0, "empty batch");
-    assert_eq!(values.len(), n);
-    let t = weights[0].len().trailing_zeros() as usize;
-    assert!(weights[0].len().is_power_of_two());
+    assert_eq!(v_bufs.len(), n);
+    let t = w_bufs[0].len().trailing_zeros() as usize;
+    assert!(w_bufs[0].len().is_power_of_two());
     for i in 0..n {
-        assert_eq!(weights[i].len(), values[i].len(), "batch column length mismatch");
-        assert_eq!(weights[i].len(), weights[0].len(), "batch arity mismatch");
+        assert_eq!(w_bufs[i].len(), v_bufs[i].len(), "batch column length mismatch");
+        assert_eq!(w_bufs[i].len(), w_bufs[0].len(), "batch arity mismatch");
     }
     transcript.absorb_ef(claimed_sum);
-    let mut w_bufs = weights.to_vec();
-    let mut v_bufs = values.to_vec();
     let mut rounds = Vec::with_capacity(t);
     let mut challenges = Vec::with_capacity(t);
     for _ in 0..t {

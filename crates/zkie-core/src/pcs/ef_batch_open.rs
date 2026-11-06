@@ -20,14 +20,18 @@ pub struct EfBatchOpeningProof {
 
 /// Unique tables in first-appearance order plus each claim's group index.
 fn claim_groups(table_idxs: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    // First-appearance order, O(n log n): map table id to its group slot.
+    let mut index_of = std::collections::BTreeMap::new();
     let mut unique = Vec::new();
     let mut group_of = Vec::with_capacity(table_idxs.len());
     for &t in table_idxs {
-        match unique.iter().position(|&u| u == t) {
-            Some(i) => group_of.push(i),
+        match index_of.get(&t) {
+            Some(&i) => group_of.push(i),
             None => {
+                let i = unique.len();
                 unique.push(t);
-                group_of.push(unique.len() - 1);
+                index_of.insert(t, i);
+                group_of.push(i);
             }
         }
     }
@@ -45,6 +49,25 @@ pub fn prove_batch_open_committed_ef(
     prover_data: ProverData,
     table_idxs: &[usize],
     values: Vec<Vec<Goldilocks>>,
+    points: &[Vec<Ef>],
+    claimed: &[Ef],
+) -> Result<EfBatchOpeningProof, String> {
+    let refs: Vec<&[Goldilocks]> = values.iter().map(Vec::as_slice).collect();
+    prove_batch_open_committed_ef_slices(whir, commitment, protocol, num_tables,
+        prover_data, table_idxs, &refs, points, claimed)
+}
+
+/// Borrowed-column variant used by pooled openings: no base-field column
+/// copies; each unique column is converted to EF once for the sumcheck.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_batch_open_committed_ef_slices(
+    whir: &Whir,
+    commitment: &Commitment,
+    protocol: &OpeningProtocol,
+    num_tables: usize,
+    prover_data: ProverData,
+    table_idxs: &[usize],
+    values: &[&[Goldilocks]],
     points: &[Vec<Ef>],
     claimed: &[Ef],
 ) -> Result<EfBatchOpeningProof, String> {
@@ -78,6 +101,8 @@ pub fn prove_batch_open_committed_ef(
     }
     let gamma = t.ef_field();
 
+    let trace = std::env::var("ZKIE_TRACE_PROVE").is_ok();
+    let t_w = std::time::Instant::now();
     let mut weights: Vec<Vec<Ef>> =
         (0..unique.len()).map(|_| vec![Ef::ZERO; table_len]).collect();
     let mut gamma_pow = Ef::ONE;
@@ -94,13 +119,30 @@ pub fn prove_batch_open_committed_ef(
         claimed_sum = claimed_sum + gamma_pow * claimed[i];
         gamma_pow = gamma_pow * gamma;
     }
+    if trace {
+        eprintln!("BATCH weights_ms={:.1} claims={} unique={} table_len={}",
+            t_w.elapsed().as_secs_f64() * 1e3, n, unique.len(), table_len);
+    }
+    let t_v = std::time::Instant::now();
     let values_ef: Vec<Vec<Ef>> = values
-        .into_iter()
-        .map(|v| v.into_iter().map(Ef::from).collect())
+        .iter()
+        .map(|v| v.iter().map(|&x| Ef::from(x)).collect())
         .collect();
+    if trace {
+        eprintln!("BATCH values_ef_ms={:.1}", t_v.elapsed().as_secs_f64() * 1e3);
+    }
+    let t_s = std::time::Instant::now();
     let (sumcheck, challenges) =
-        ef_batch::prove_sum_of_products(&weights, &values_ef, claimed_sum, &mut t);
+        ef_batch::prove_sum_of_products_owned(weights, values_ef, claimed_sum, &mut t);
+    if trace {
+        eprintln!("BATCH sumcheck_ms={:.1}", t_s.elapsed().as_secs_f64() * 1e3);
+    }
+    let t_o = std::time::Instant::now();
     let (open, evals) = whir.open_batch_multi_ef(prover_data, protocol, num_tables, &challenges);
+    if trace {
+        eprintln!("BATCH whir_open_ms={:.1} num_tables={}",
+            t_o.elapsed().as_secs_f64() * 1e3, num_tables);
+    }
     Ok(EfBatchOpeningProof { sumcheck, open, evals })
 }
 
