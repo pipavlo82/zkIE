@@ -61,25 +61,36 @@ shared prefix keep the previous per-claim path.
 Cold-page-cache S7 full-64-expert segmented example (real layer-10 weights,
 `DS_LAYER=10`): 48 committed weight batches in total (16 for the gate weight,
 16 up + 16 down for the FFN). Every batch carries 64 global claims and one
-unique chunk table.
+unique chunk table. `W_t` and claim evaluation are timed separately only in
+the traced runs; HEAD folds them into `mat`/`open`. Raw logs on the test
+machine: `logs/o5-base-cold-full64.log`,
+`logs/o5-stream-cold-full64-trace.log`, `logs/o5-opt-cold-full64-trace.log`,
+and `logs/o5-opt-warm-full64.log`.
 
-| run | batches | claims/batch | unique/batch | mat+eval | restore | open | stage total | stage max RSS |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| HEAD cold | 48 | 64 | 1 | 740.9 s | 7.8 s | 985.3 s | 1734.0 s | 10.48 GB |
-| streaming cold | 48 | 64 | 1 | 739.4 s | 7.8 s | 1059.8 s | 1807.0 s | 6.32 GB |
-| streaming + prefix reuse cold | 48 | 64 | 1 | 13.3 s | 7.8 s | 332.8 s | 353.9 s | 6.28 GB |
+### Before / after
 
-Whole-run metering (cold page cache; `fincore_before=0` for all three weight
-files and the 64 MiB table):
+| run | cache | wall | B commit+prove | D commit+prove | weight stage | `W_t` | claim eval | stage peak RSS | whole maxrss | minor faults | major faults | read bytes |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| HEAD | cold | 1848.3 s | 595.2 s | 1240.6 s | 1734.0 s | in open | in mat | 10.48 GB | 11,461,680 KiB | 4,904,378 | 24,719 | 3,292,844,032 |
+| streaming only | cold | 1923.9 s | 619.3 s | 1291.8 s | 1807.0 s | 732.8 s | 735.9 s | 6.32 GB | 11,461,128 KiB | 4,907,097 | 24,610 | 3,292,835,840 |
+| + prefix reuse | cold | 470.2 s | 132.2 s | 325.3 s | 353.9 s | 7.9 s | 11.2 s | 6.28 GB | 11,461,052 KiB | 969,706 | 24,610 | 3,292,975,104 |
+| + prefix reuse | warm | 472.1 s | 132.8 s | 326.9 s | 358.8 s | not traced | 11.2 s | 6.28 GB | 11,461,796 KiB | 1,056,453 | 0 | 0 |
 
-| run | wall | maxrss | minor faults | major faults | read bytes |
-|---|---:|---:|---:|---:|---:|
-| HEAD cold | 1848.3 s | 11,461,680 KiB | 4,904,378 | 24,719 | 3,292,844,032 |
-| streaming cold | 1923.9 s | 11,461,128 KiB | 4,907,097 | 24,610 | 3,292,835,840 |
-| streaming + prefix reuse cold | 470.2 s | 11,461,052 KiB | 969,706 | 24,610 | 3,292,975,104 |
+Cold prefix-reuse vs HEAD: wall 3.93x, B proof 4.50x, D proof 3.81x, weight
+stage 4.90x; `W_t` 92.6x and claim evaluation 65.4x vs the streaming-only run;
+weight-stage peak RSS -40.0%; minor faults -80.2%. Major faults and cold read
+bytes are unchanged.
 
-First gate-weight batch (one `2^24` chunk, 64 claims) decomposition under
-`ZKIE_TRACE_PROVE`:
+Warm prefix-reuse (`fincore_before` = 1 GiB for each weight file + 64 MiB
+table, `read_bytes=0`, `inblock=0`, `majflt=0`) has wall 472.1 s vs 470.2 s
+cold (+0.4%), weight stage 358.8 s vs 353.9 s (+1.4%), and the same 6.28 GB
+stage peak. The cold/warm wall difference is within 2 s (0.4%), so the
+3.29 GB cold read is not what drives the 4.9x stage reduction; the gains are
+not a page-cache artifact.
+
+### First gate-weight batch decomposition
+
+One `2^24` chunk, 64 claims, `ZKIE_TRACE_PROVE`:
 
 | phase | HEAD | streaming | streaming + prefix reuse |
 |---|---:|---:|---:|
@@ -92,41 +103,42 @@ First gate-weight batch (one `2^24` chunk, 64 claims) decomposition under
 | WHIR opening | inside `open` | 7.495 s | 7.507 s |
 | total (mat+eval+restore+open) | 38.7 s | 39.4 s | 8.82 s |
 
-The trace shows that, for the split `2^24` chunks with 64 claims, `W_t`
-construction plus the per-claim MLE evaluations are the dominant cost (31.0 s
-of 39.4 s), not the WHIR opening. Across the whole cold streaming run the same
-split is 733.8 s of `W_t` plus 735.9 s of claim evaluation against a 1807.0 s
-weight stage (81%), so the reuse was required rather than a documentation-only
-conclusion. With reuse the whole stage falls to 353.9 s: `W_t` 7.9 s, claim
-evaluation 11.2 s, WHIR 292.1 s, sumcheck 30.5 s, value conversion 2.2 s.
-Claim values and `W_t` are mathematically unchanged.
+For the split `2^24` chunks with 64 claims, `W_t` construction plus the
+per-claim MLE evaluations are the dominant cost (31.0 s of 39.4 s), not the
+WHIR opening. Across the cold streaming run the same split is 732.8 s of `W_t`
+plus 735.9 s of claim evaluation against a 1807.0 s weight stage (81%), so the
+reuse was required rather than a documentation-only conclusion. With reuse the
+whole stage falls to 353.9 s: `W_t` 7.9 s, claim evaluation 11.2 s, WHIR
+292.1 s, sumcheck 30.5 s, value conversion 2.2 s. Claim values and `W_t` are
+mathematically unchanged.
 
-Per proof segment (cold):
+### Per-proof segment
 
-| segment | HEAD | streaming | streaming + prefix reuse |
-|---|---:|---:|---:|
-| B gate (16 batches), commit+prove | 595.2 s | 619.3 s | 132.2 s |
-| D up/down (32 batches), commit+prove | 1240.6 s | 1291.8 s | 325.3 s |
-| proof bytes B / D | 3,081,547 / 6,582,852 | same | same |
-| verify B / D | 181.7 / 400.0 ms | 182.2 / 390.2 ms | 181.0 / 394.4 ms |
-| weight-stage peak RSS B / D | 3.90 / 10.48 GB | 1.81 / 6.32 GB | 1.77 / 6.28 GB |
+| segment | HEAD cold | streaming cold | prefix reuse cold | prefix reuse warm |
+|---|---:|---:|---:|---:|
+| B gate (16 batches), commit+prove | 595.2 s | 619.3 s | 132.2 s | 132.8 s |
+| D up/down (32 batches), commit+prove | 1240.6 s | 1291.8 s | 325.3 s | 326.9 s |
+| proof bytes B / D | 3,081,547 / 6,582,852 | same | same | same |
+| verify B / D | 181.7 / 400.0 ms | 182.2 / 390.2 ms | 181.0 / 394.4 ms | 182.9 / 395.0 ms |
+| weight-stage peak RSS B / D | 3.90 / 10.48 GB | 1.81 / 6.32 GB | 1.77 / 6.28 GB | 1.77 / 6.28 GB |
 
 The streaming-only cold run is ~4% slower in wall time than HEAD in this
 window, but its weight-stage peak RSS drops from 10.48 GB to 6.32 GB. The
-prefix-reuse run keeps that memory reduction and removes the compute
+prefix-reuse runs keep that memory reduction and remove the compute
 bottleneck. Whole-run maxrss is unchanged because it is set by the offline
 weight commit before proving; the O5 stage peak is measured inside the proof.
 
-Minor faults fall from 4.90 M (HEAD) to 0.97 M (prefix reuse) because the
-per-claim full `eq` vectors and per-claim EF conversion buffers are no longer
-allocated. Major faults and read bytes are unchanged (24,610 / 3.293 GB),
-i.e. the cold weight read is not hidden by the change.
+Minor faults fall from 4.90 M (HEAD) to 0.97 M (cold prefix reuse; 1.06 M warm)
+because the per-claim full `eq` vectors and per-claim EF conversion buffers are
+no longer allocated. Major faults and read bytes are unchanged on cold
+(24,610 / 3.293 GB), i.e. the cold weight read is not hidden by the change.
 
 `O5-metrics` for every batch reports `claims=64 unique=1 copied_bytes=134217728
 tables=1` (plus the fold projection and budget); the full run therefore copies
 48 x 128 MiB = 6 GiB of chunk data. HEAD additionally retained 1 GiB (gate) and
 2 GiB (up/down) parent buffers for the duration of each proof; those are gone
-in the streaming runs.
+in the streaming runs. The `o5-opt-warm` run verifies `S7-CHAIN-OK` with the
+same A/B/D/C proof byte counts as the other runs.
 
 ## Tests
 
