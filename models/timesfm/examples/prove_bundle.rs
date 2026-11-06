@@ -9,7 +9,7 @@ use std::time::Instant;
 use zkie_core::pcs::whir::Whir;
 use zkie_models_timesfm::build_timesfm;
 use zkie_ops::bundle::{
-    index_shapes, public_execution, verify_bundle_dir, write_bundle, PublicBundle,
+    index_shapes, public_execution, verify_bundle_dir_with_model, write_bundle, PublicBundle,
 };
 use zkie_ops::compose::{
     commit_model_weights, evaluate_ops, prove_committed_shard_dag_bound, PublicStatement,
@@ -27,15 +27,19 @@ fn main() {
     let _out = build_timesfm(&mut store, &mut ops, dir, 16);
     evaluate_ops(&mut store, &ops);
     let cached = commit_model_weights(&store, &ops, &cache_dir);
-    let model = TrustedModelManifest::from_offline_commitment(
+    let mut model = TrustedModelManifest::from_offline_commitment(
         &cached, &store.owned_slices(), &ops).with_index_shapes(&index_shapes(&store));
+    match zkie_ops::tables::try_install_a_tables(Path::new(dir), &ops, &mut model) {
+        Ok(_) => {}
+        Err(e) => { eprintln!("A-table sidecar rejected: {e}"); std::process::exit(2); }
+    }
     if std::env::var("ZKIE_BUDGET_ESTIMATE").is_ok() {
         let ub = zkie_ops::compose::opening_upper_bound(&ops, &model)
             .expect("opening upper bound");
         println!("timesfm opening upper bound = {ub} (cap 64)");
         return;
     }
-    let execution = match public_execution(&store, &ops, &cached) {
+    let execution = match public_execution(&store, &ops, &cached, &model) {
         Some(e) => e,
         None => {
             eprintln!("TimesFM public execution extraction failed closed; no bundle written");
@@ -52,7 +56,8 @@ fn main() {
     let bytes = bincode::serialize(&proof).expect("serialize proof");
     let bundle = PublicBundle::new(ops.clone(), 1, stmt, model, execution);
     write_bundle(Path::new(&bundle_dir), &bundle, &bytes).expect("write bundle");
-    let ok = verify_bundle_dir(Path::new(&bundle_dir));
+    let model_dir = Path::new(dir).join("tables.meta").exists().then_some(Path::new(dir));
+    let ok = verify_bundle_dir_with_model(Path::new(&bundle_dir), model_dir);
     println!("timesfm bundle={bundle_dir} prove={elapsed:?} proof_bytes={} independent_verify={ok}",
         bytes.len());
 }

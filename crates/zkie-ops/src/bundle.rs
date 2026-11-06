@@ -22,9 +22,10 @@ use std::path::Path;
 /// descriptors (`AUX_LAYOUT_VERSION = 1` in compose.rs). Old bundles
 /// (version 1) are rejected; there is no silent reinterpretation.
 /// M4 adds per-table internal lookup batch openings: version 4.
-/// P1 Phase 1 adds the carried A-table registry (not yet absorbed):
-/// version 5; v4 and older are rejected.
-pub const BUNDLE_VERSION: u32 = 5;
+/// P1 adds the carried A-table registry and digest absorption (v5).
+/// P2 moves GeluIndex/Relu bit openings into the pooled aux plan:
+/// version 6; older versions are rejected.
+pub const BUNDLE_VERSION: u32 = 6;
 /// Hard cap on each serialized bundle file before decoding.
 pub const MAX_BUNDLE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -81,10 +82,44 @@ pub fn write_bundle(dir: &Path, bundle: &PublicBundle, proof: &[u8]) -> std::io:
     write_proof(dir, proof)
 }
 
-/// Independent verifier: reads only bundle.bin + proof.bin.
+/// Independent verifier: reads only bundle.bin + proof.bin. A-bearing
+/// bundles additionally need the model distribution directory (sidecar +
+/// table files) from `ZKIE_MODEL_DIR`; it is never read from the proof.
 pub fn verify_bundle_dir(dir: &Path) -> bool {
-    let bundle = match PublicBundle::read(dir) { Some(b) => b, None => return false };
+    let model_dir = std::env::var_os("ZKIE_MODEL_DIR").map(std::path::PathBuf::from);
+    verify_bundle_dir_with_model(dir, model_dir.as_deref())
+}
+
+/// Verifier entry with an explicit caller-owned model directory. The
+/// manifest copy inside the bundle is compared against the distribution
+/// sidecar; a mismatch rejects before proof verification. Non-A bundles do
+/// not require a model directory.
+pub fn verify_bundle_dir_with_model(dir: &Path, model_dir: Option<&Path>) -> bool {
+    let mut bundle = match PublicBundle::read(dir) { Some(b) => b, None => return false };
     let proof = match read_proof(dir) { Some(p) => p, None => return false };
+    match model_dir {
+        Some(model_dir) => {
+            // Caller-owned model distribution is the authoritative A set: the
+            // bundle's caller copy must match it exactly, and an A-bearing
+            // graph without a usable sidecar rejects.
+            let entries = match crate::tables::load_tables_meta(&model_dir.join("tables.meta")) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if entries != bundle.model.a_tables { return false; }
+            let loaded = match crate::tables::load_a_tables(model_dir, &bundle.ops, &bundle.model) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if !loaded.is_empty() && loaded.install(&mut bundle.model).is_none() { return false; }
+        }
+        None => {
+            // Without the distribution we can only verify a bundle that
+            // carries no A registry. A-bearing bundles require the caller's
+            // model directory.
+            if !bundle.model.a_tables.is_empty() { return false; }
+        }
+    }
     // The bound verifier rebuilds its WHIR parameters from VERIFIER_SECURITY
     // and each opening's arity; the `whir` argument is part of the legacy
     // signature and is ignored (`let _ = whir` in the verifier). Pass a
@@ -113,8 +148,8 @@ fn execution_value(store: &Store, key: usize) -> Option<Vec<Goldilocks>> {
 /// static tables); outputs are the single Argmax's columns for language
 /// models, or the last op's writes for a Generic graph. Fails closed if any
 /// op lacks a reverse IO contract.
-pub fn public_execution(store: &Store, ops: &[Op], cached: &[CachedWeightBatch])
-    -> Option<TrustedExecution>
+pub fn public_execution(store: &Store, ops: &[Op], cached: &[CachedWeightBatch],
+    model: &TrustedModelManifest) -> Option<TrustedExecution>
 {
     let tag = 1usize << (usize::BITS - 1);
     let mut weights: BTreeSet<usize> = BTreeSet::new();
@@ -130,7 +165,7 @@ pub fn public_execution(store: &Store, ops: &[Op], cached: &[CachedWeightBatch])
     }
     let mut inputs = BTreeMap::new();
     for &k in reads.difference(&writes) {
-        if weights.contains(&k) { continue; }
+        if weights.contains(&k) || model.a_tables.contains_key(&k) { continue; }
         inputs.insert(k, execution_value(store, k)?);
     }
     let argmax: Vec<usize> = ops.iter().enumerate()

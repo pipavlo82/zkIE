@@ -233,7 +233,13 @@ fn field_writes(ops: &[Op]) -> BTreeSet<T> {
     let tag = if usize::BITS == 64 { 1usize << (usize::BITS - 1) } else { 0 };
     let mut w = BTreeSet::new();
     for op in ops {
-        for t in op.writes() { if t & tag == 0 { w.insert(t); } }
+        // Use the field/index-encoded wire writes: raw `op.writes()` mixes the
+        // two namespaces and can alias an index output onto an A table id.
+        let writes = match crate::compose::reverse_op_io(op) {
+            Some((_, ws)) => ws,
+            None => op.writes(),
+        };
+        for t in writes { if t & tag == 0 { w.insert(t); } }
     }
     w
 }
@@ -262,7 +268,7 @@ fn load_file_values(dir: &Path, entry: &ATableEntry) -> Result<Vec<Goldilocks>, 
 /// Compute the public exp table used by the attention softmax: index
 /// `i` maps to `x = (i - 2^21) / 2^16` in `[-32, 0]`, value
 /// `round(exp(x) * 2^16)`, clipped to the non-negative i32 range.
-fn compute_exp_values(entry: &ATableEntry) -> Result<Vec<Goldilocks>, TableMetaError> {
+pub(crate) fn compute_exp_values(entry: &ATableEntry) -> Result<Vec<Goldilocks>, TableMetaError> {
     if entry.length != (1usize << 21) || entry.arity != 21 {
         return Err(TableMetaError::UnsupportedCompute(0));
     }
@@ -324,7 +330,7 @@ pub fn load_a_tables(model_dir: &Path, ops: &[Op], model: &TrustedModelManifest)
             return Err(TableMetaError::InvalidEntry(format!(
                 "table {id} is dynamic/identity and cannot be an A lookup table")));
         }
-        let expected_logical = model.lookup_length(id).ok_or_else(|| TableMetaError::InvalidEntry(
+        let expected_logical = model.table_logical_length(id).ok_or_else(|| TableMetaError::InvalidEntry(
             format!("table {id} has no trusted lookup length")))?;
         if entry.length != expected_logical {
             return Err(TableMetaError::InvalidEntry(format!(
@@ -359,6 +365,21 @@ pub fn load_a_tables(model_dir: &Path, ops: &[Op], model: &TrustedModelManifest)
         digests.insert(id, digest);
     }
     Ok(LoadedATables { entries, values, digests })
+}
+
+/// Convenience for model builders/tests: install A tables when the model
+/// distribution ships a sidecar; return `false` when it does not (legacy
+/// non-A manifest). A present sidecar whose contents fail authentication is
+/// an error, never a silent fallback.
+pub fn try_install_a_tables(model_dir: &Path, ops: &[Op], model: &mut TrustedModelManifest)
+    -> Result<bool, TableMetaError>
+{
+    if !model_dir.join("tables.meta").exists() { return Ok(false); }
+    let loaded = load_a_tables(model_dir, ops, model)?;
+    if loaded.is_empty() { return Ok(false); }
+    loaded.install(model).ok_or_else(|| TableMetaError::InvalidEntry(
+        "A table install rejected the loaded set".to_string()))?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

@@ -342,7 +342,10 @@ pub fn build_gpt2(
     // tensors and statement, not the op graph.
     let tokens_file = if m <= 16 { "tokens_16_i32.bin" } else { "tokens_i32.bin" };
     let tokens_raw = load_i32(&format!("{dir}/{tokens_file}"));
-    let tokens = store.push_idx(tokens_raw.iter().map(|&v| to_i32(v) as u32).collect());
+    // Only the first m tokens enter the public sequence; this keeps the
+    // caller-owned execution length equal to the graph's sequence length for
+    // smaller-M runs (the canonical M=16 case uses the whole file).
+    let tokens = store.push_idx(tokens_raw.iter().take(m).map(|&v| to_i32(v) as u32).collect());
     let emb_idx: Vec<u32> = (0..m)
         .flat_map(|i| {
             let ti = to_i32(tokens_raw[i]) as u32;

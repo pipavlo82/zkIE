@@ -3871,10 +3871,11 @@ fn internal_lookup_verify(table_id: T, pairs: &AuxDescriptor, multiplicity: &Aux
         if proof.table_opening.is_some() || proof.table_value != lookup_index_eval(&table.q_den) {
             return None;
         }
-    } else if let Some(values) = model.a_table_values(table_id) {
+    } else if model.a_table_values(table_id).is_some() {
         // A table: the leaf evaluation is checked against the digest-verified
         // caller-loaded values; A tables never carry a proof-side opening.
-        if proof.table_opening.is_some() || ef_eval(values, &table.q_den) != proof.table_value {
+        if proof.table_opening.is_some()
+            || model.eval_a_table(table_id, &table.q_den) != Some(proof.table_value) {
             return None;
         }
     } else if let Some(r) = rec.as_deref_mut() {
@@ -4525,8 +4526,18 @@ fn prove_reverse_rope(store: &Store, op: &Op, point: &[Ef], value: Ef,
 
     let x_f = rope_extract(store.get(x), m, heads, d, false)?;
     let x_s = rope_extract(store.get(x), m, heads, d, true)?;
-    let cos_b = rope_broadcast_pair(store.get(cos), m, heads, d)?;
-    let sin_b = rope_broadcast_pair(store.get(sin), m, heads, d)?;
+    // A-table cos/sin are the digest-verified caller values; legacy/synthetic
+    // manifests without an A registry keep the store table.
+    let cos_tab: &[Goldilocks] = match model.a_table_values(cos) {
+        Some(v) => &v[..model.table_logical_length(cos)?],
+        None => store.get(cos),
+    };
+    let sin_tab: &[Goldilocks] = match model.a_table_values(sin) {
+        Some(v) => &v[..model.table_logical_length(sin)?],
+        None => store.get(sin),
+    };
+    let cos_b = rope_broadcast_pair(cos_tab, m, heads, d)?;
+    let sin_b = rope_broadcast_pair(sin_tab, m, heads, d)?;
     let out_f = rope_extract(store.get(out), m, heads, d, false)?;
     let out_s = rope_extract(store.get(out), m, heads, d, true)?;
     let out_ef = ef_lift(store.get(out));
@@ -4619,10 +4630,18 @@ fn prove_reverse_rope(store: &Store, op: &Op, point: &[Ef], value: Ef,
     ] {
         claims.push(EfClaim { tensor_id: x, point: rope_insert_bit(z, half_log, bit), value: val });
     }
-    claims.push(EfClaim { tensor_id: cos, point: table_p_f.clone(), value: first.final_evals[2] });
-    claims.push(EfClaim { tensor_id: sin, point: table_p_f, value: first.final_evals[4] });
-    claims.push(EfClaim { tensor_id: cos, point: table_p_s.clone(), value: second.final_evals[2] });
-    claims.push(EfClaim { tensor_id: sin, point: table_p_s, value: second.final_evals[4] });
+    for (id, point, val) in [
+        (cos, table_p_f.clone(), first.final_evals[2]),
+        (sin, table_p_f, first.final_evals[4]),
+        (cos, table_p_s.clone(), second.final_evals[2]),
+        (sin, table_p_s, second.final_evals[4]),
+    ] {
+        if model.is_a_table(id) {
+            if model.eval_a_table(id, &point) != Some(val) { return None; }
+        } else {
+            claims.push(EfClaim { tensor_id: id, point, value: val });
+        }
+    }
     Some((ReverseRopeProof { first, second, bind, out_opening, v0, v1,
         rem_f: rem_f_proof, rem_s: rem_s_proof }, claims))
 }
@@ -4726,10 +4745,20 @@ fn verify_reverse_rope(op: &Op, point: &[Ef], value: Ef,
     ] {
         claims.push(EfClaim { tensor_id: x, point: rope_insert_bit(z, half_log, bit), value: val });
     }
-    claims.push(EfClaim { tensor_id: cos, point: table_p_f.clone(), value: ff[2] });
-    claims.push(EfClaim { tensor_id: sin, point: table_p_f, value: ff[4] });
-    claims.push(EfClaim { tensor_id: cos, point: table_p_s.clone(), value: fs[2] });
-    claims.push(EfClaim { tensor_id: sin, point: table_p_s, value: fs[4] });
+    for (id, point, val) in [
+        (cos, table_p_f.clone(), ff[2]),
+        (sin, table_p_f, ff[4]),
+        (cos, table_p_s.clone(), fs[2]),
+        (sin, table_p_s, fs[4]),
+    ] {
+        if model.is_a_table(id) {
+            // A table: the leaf evaluation is checked against the
+            // digest-verified caller values; no execution claim is emitted.
+            if model.eval_a_table(id, &point) != Some(val) { return None; }
+        } else {
+            claims.push(EfClaim { tensor_id: id, point, value: val });
+        }
+    }
     Some(claims)
 }
 
@@ -5425,7 +5454,9 @@ fn reverse_tensor_values(store: &Store, id: T) -> Option<Cow<'_, [Goldilocks]>> 
 }
 
 fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
-    point: &[Ef], value: Ef, range_aux: PreparedAux, transcript: &mut Transcript,
+    point: &[Ef], value: Ef, range_aux: PreparedAux,
+    upper_bits: Option<PreparedAux>, lower_bits: Option<PreparedAux>,
+    transcript: &mut Transcript,
     mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseGeluIndexProof, Vec<(Vec<Ef>, Ef)>)>
 {
@@ -5453,16 +5484,11 @@ fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
         }
     }
     let limit = (table_len - 1) as i64;
-    let mut shifted = Vec::with_capacity(input.len());
-    let mut upper_input = Vec::with_capacity(input.len());
+    let (shifted, upper_input) = gelu_shifted_upper(input, offset, table_len)?;
     let mut indices = Vec::with_capacity(input.len());
-    for &x in input {
-        let w = to_i64(x).checked_add(offset)?;
-        if !(-GELU_BOUND..GELU_BOUND).contains(&w) { return None; }
-        let high = w.checked_sub(limit)?;
-        if !(-GELU_BOUND..GELU_BOUND).contains(&high) { return None; }
-        shifted.push(from_i64(w));
-        upper_input.push(from_i64(high));
+    for (i, &s) in shifted.iter().enumerate() {
+        let w = to_i64(s);
+        let high = to_i64(upper_input[i]);
         indices.push(ef_i64(w.max(0) - high.max(0)));
     }
     if efo::eval_ef_slice(&indices, point)? != value { return None; }
@@ -5492,11 +5518,19 @@ fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
     }
     let range_opening = open_aux(range_aux, &idxs, &points, &values)?;
     let range_claim = unpad_relu_claim(&range_point, x_range.final_evals[1], input_arity)?;
-    let (upper, upper_inputs) = prove_reverse_relu(&upper_input, point, lower_at_output - value, GELU_BITS, transcript)?;
+    if let Some(a) = &upper_bits {
+        if a.descriptor.role != AuxRole::GeluUpperBits { return None; }
+    }
+    if let Some(a) = &lower_bits {
+        if a.descriptor.role != AuxRole::GeluLowerBits { return None; }
+    }
+    let (upper, upper_inputs) = prove_reverse_relu(&upper_input, point,
+        lower_at_output - value, GELU_BITS, upper_bits, transcript, rec.as_deref_mut())?;
     let limit_f = ef_i64(limit);
     transcript.absorb_u64(upper_inputs.len() as u64);
     for (p, v) in &upper_inputs { transcript.absorb_u64(p.len() as u64); transcript.absorb_efs(p); transcript.absorb_ef(*v); }
-    let (lower, shifted_inputs) = prove_reverse_relu(&shifted, point, lower_at_output, GELU_BITS, transcript)?;
+    let (lower, shifted_inputs) = prove_reverse_relu(&shifted, point,
+        lower_at_output, GELU_BITS, lower_bits, transcript, rec.as_deref_mut())?;
     let offset_f = ef_i64(offset);
     let mut inputs: Vec<_> = upper_inputs.into_iter().map(|(p, v)| (p, v + limit_f - offset_f)).collect();
     inputs.extend(shifted_inputs.into_iter().map(|(p, v)| (p, v - offset_f)));
@@ -5505,7 +5539,9 @@ fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
 }
 
 fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Ef], value: Ef,
-    range_aux: Option<&AuxDescriptor>, proof: &ReverseGeluIndexProof, transcript: &mut Transcript,
+    range_aux: Option<&AuxDescriptor>,
+    upper_bits: Option<&AuxDescriptor>, lower_bits: Option<&AuxDescriptor>,
+    proof: &ReverseGeluIndexProof, transcript: &mut Transcript,
     mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<Vec<(Vec<Ef>, Ef)>>
 {
@@ -5547,10 +5583,18 @@ fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Ef], value:
         if proof.x_range.final_evals[2 + b] != proof.range_aux_values[b] { return None; }
     }
     let range_claim = unpad_relu_claim(&range_point, proof.x_range.final_evals[1], input_arity)?;
-    let upper_inputs = verify_reverse_relu(&proof.upper, point, proof.lower_at_output - value, GELU_BITS, transcript)?;
+    if let Some(a) = upper_bits {
+        if a.role != AuxRole::GeluUpperBits { return None; }
+    }
+    if let Some(a) = lower_bits {
+        if a.role != AuxRole::GeluLowerBits { return None; }
+    }
+    let upper_inputs = verify_reverse_relu(&proof.upper, point,
+        proof.lower_at_output - value, GELU_BITS, upper_bits, transcript, rec.as_deref_mut())?;
     transcript.absorb_u64(upper_inputs.len() as u64);
     for (p, v) in &upper_inputs { transcript.absorb_u64(p.len() as u64); transcript.absorb_efs(p); transcript.absorb_ef(*v); }
-    let shifted_inputs = verify_reverse_relu(&proof.lower, point, proof.lower_at_output, GELU_BITS, transcript)?;
+    let shifted_inputs = verify_reverse_relu(&proof.lower, point,
+        proof.lower_at_output, GELU_BITS, lower_bits, transcript, rec.as_deref_mut())?;
     let offset_f = ef_i64(offset);
     let mut inputs: Vec<_> = upper_inputs.into_iter().map(|(p, v)| (p, v + limit_f - offset_f)).collect();
     inputs.extend(shifted_inputs.into_iter().map(|(p, v)| (p, v - offset_f)));
@@ -6399,7 +6443,7 @@ fn verify_reverse_gather_matmul(op: &Op, outs: &[(T, Vec<Ef>, Ef)],
 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecOut, BroadcastScaleOut, ScaleGateOut, ScaleVecRemainder, ScaleGateRemainder, SoftmaxOut, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RmsNormOutLimbLoPairs, RmsNormOutLimbHiPairs, RmsNormOutLimbLoMultiplicity, RmsNormOutLimbHiMultiplicity, LncRowWitness, LncOutWitness, LncRsqrtPairs, LncRsqrtMultiplicity, RopeOut, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, ExpertRouting, GatherRouting, LookupPairs, LookupMultiplicity, TopKSelectWitness, TopKSelectThr, TopKSelectXRange, TopKSelectThrRange, TopKSelectTie, ScatterRouting, ScatterOrder, LookupMultiplicityAgg, GeluIndexXRange, ScaleVecOut, BroadcastScaleOut, ScaleGateOut, ScaleVecRemainder, ScaleGateRemainder, SoftmaxOut, SoftmaxSum, SoftmaxRemainder, StableSoftmaxIndexWitness, RmsNormRowWitness, RmsNormOutWitness, RmsNormRsqrtPairs, RmsNormRsqrtMultiplicity, RmsNormLimbLoPairs, RmsNormLimbLoMultiplicity, RmsNormLimbHiPairs, RmsNormLimbHiMultiplicity, RmsNormOutLimbLoPairs, RmsNormOutLimbHiPairs, RmsNormOutLimbLoMultiplicity, RmsNormOutLimbHiMultiplicity, LncRowWitness, LncOutWitness, LncRsqrtPairs, LncRsqrtMultiplicity, RopeOut, RopeRemF, RopeRemS, RopeRemFMultiplicity, RopeRemSMultiplicity, ReluBits, GeluUpperBits, GeluLowerBits }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -8633,8 +8677,109 @@ fn prepare_gelu_range_aux(store: &Store, ops: &[Op], model: &TrustedModelManifes
     Some(prepared)
 }
 
+/// GeluIndex helper shared by aux preparation and the reverse reduction:
+/// `shifted = x + offset`, `upper = shifted - (table_len - 1)`, both inside
+/// the 25-bit signed domain.
+fn gelu_shifted_upper(input: &[Goldilocks], offset: i64, table_len: usize)
+    -> Option<(Vec<Goldilocks>, Vec<Goldilocks>)>
+{
+    if table_len == 0 || !table_len.is_power_of_two()
+        || table_len > GELU_BOUND as usize
+        || offset.unsigned_abs() > GELU_BOUND as u64
+        || !input.len().is_power_of_two() { return None; }
+    let limit = (table_len - 1) as i64;
+    let mut shifted = Vec::with_capacity(input.len());
+    let mut upper = Vec::with_capacity(input.len());
+    for &x in input {
+        let w = to_i64(x).checked_add(offset)?;
+        if !(-GELU_BOUND..GELU_BOUND).contains(&w) { return None; }
+        let high = w.checked_sub(limit)?;
+        if !(-GELU_BOUND..GELU_BOUND).contains(&high) { return None; }
+        shifted.push(from_i64(w));
+        upper.push(from_i64(high));
+    }
+    Some((shifted, upper))
+}
+
+fn relu_bits_aux_specs(ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<(usize, AuxRole, usize, usize, usize)>>
+{
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            Op::GeluIndex { x, .. } => {
+                let key = TensorKey::Field(*x).encoded()?;
+                let len = *model.tensor_lengths.get(&key)?;
+                if len == 0 || !len.is_power_of_two() { return None; }
+                let arity = len.trailing_zeros().max(5) as usize;
+                specs.push((i, AuxRole::GeluUpperBits, len, arity, GELU_BITS));
+                specs.push((i, AuxRole::GeluLowerBits, len, arity, GELU_BITS));
+            }
+            Op::Relu { x, .. } => {
+                let key = TensorKey::Field(*x).encoded()?;
+                let len = *model.tensor_lengths.get(&key)?;
+                if len == 0 || !len.is_power_of_two() { return None; }
+                let arity = len.trailing_zeros().max(5) as usize;
+                specs.push((i, AuxRole::ReluBits, len, arity, RELU_BITS));
+            }
+            _ => {}
+        }
+    }
+    Some(specs)
+}
+
+fn build_relu_bits_aux(values: &[Goldilocks], op_index: usize, role: AuxRole,
+    len: usize, arity: usize, bits: usize) -> Option<PreparedAux>
+{
+    if values.len() != len || len == 0 || !len.is_power_of_two()
+        || arity != len.trailing_zeros().max(5) as usize
+        || bits < 2 || bits > 31 { return None; }
+    let padded = 1usize.checked_shl(arity as u32)?;
+    let bound = 1i64 << (bits - 1);
+    let mut columns = vec![vec![Goldilocks::ZERO; padded]; bits];
+    for i in 0..padded {
+        let signed = if i < len { to_i64(values[i]) } else { 0 };
+        let encoded = signed.checked_add(bound)?;
+        if encoded < 0 || (encoded as u64) >= (1u64 << bits) { return None; }
+        for b in 0..bits {
+            columns[b][i] = Goldilocks::from_u64(((encoded as u64) >> b) & 1);
+        }
+    }
+    let vars = bits.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+    let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+    let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+    let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+    Some(PreparedAux {
+        descriptor: AuxDescriptor { op_index, role, len, arity, columns: bits, commitment },
+        columns, prover_data, protocol, whir,
+    })
+}
+
+fn prepare_relu_bits_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
+    -> Option<Vec<PreparedAux>>
+{
+    let mut prepared = Vec::new();
+    for (op_index, role, len, arity, bits) in relu_bits_aux_specs(ops, model)? {
+        let values: Vec<Goldilocks> = match (&ops[op_index], role) {
+            (Op::GeluIndex { x, offset, table_len, .. }, AuxRole::GeluUpperBits) => {
+                let (_, upper) = gelu_shifted_upper(store.get(*x), *offset, *table_len)?;
+                upper
+            }
+            (Op::GeluIndex { x, offset, table_len, .. }, AuxRole::GeluLowerBits) => {
+                let (shifted, _) = gelu_shifted_upper(store.get(*x), *offset, *table_len)?;
+                shifted
+            }
+            (Op::Relu { x, .. }, AuxRole::ReluBits) => store.get(*x).to_vec(),
+            _ => return None,
+        };
+        prepared.push(build_relu_bits_aux(&values, op_index, role, len, arity, bits)?);
+    }
+    Some(prepared)
+}
+
 fn aux_role_rank(role: AuxRole) -> u32 {
-    match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::BroadcastScaleOut => 34, AuxRole::ScaleGateOut => 15, AuxRole::SoftmaxOut => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::RopeOut => 28, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RmsNormOutLimbLoPairs => 36, AuxRole::RmsNormOutLimbHiPairs => 37, AuxRole::RmsNormOutLimbLoMultiplicity => 38, AuxRole::RmsNormOutLimbHiMultiplicity => 39, AuxRole::LncRowWitness => 40, AuxRole::LncOutWitness => 41, AuxRole::LncRsqrtPairs => 42, AuxRole::LncRsqrtMultiplicity => 43, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32 }
+    match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::ExpertRouting => 3, AuxRole::GatherRouting => 4, AuxRole::LookupPairs => 5, AuxRole::LookupMultiplicity => 6, AuxRole::TopKSelectWitness => 7, AuxRole::TopKSelectThr => 8, AuxRole::TopKSelectXRange => 9, AuxRole::TopKSelectThrRange => 10, AuxRole::TopKSelectTie => 11, AuxRole::ScatterRouting => 12, AuxRole::ScatterOrder => 13, AuxRole::LookupMultiplicityAgg => 14, AuxRole::GeluIndexXRange => 15, AuxRole::ScaleVecOut => 33, AuxRole::BroadcastScaleOut => 34, AuxRole::ScaleGateOut => 15, AuxRole::SoftmaxOut => 15, AuxRole::ScaleVecRemainder => 16, AuxRole::RopeOut => 28, AuxRole::ScaleGateRemainder => 17, AuxRole::SoftmaxSum => 18, AuxRole::SoftmaxRemainder => 19, AuxRole::StableSoftmaxIndexWitness => 20, AuxRole::RmsNormRowWitness => 21, AuxRole::RmsNormOutWitness => 22, AuxRole::RmsNormRsqrtPairs => 23, AuxRole::RmsNormRsqrtMultiplicity => 24, AuxRole::RmsNormLimbLoPairs => 25, AuxRole::RmsNormLimbLoMultiplicity => 26, AuxRole::RmsNormLimbHiPairs => 27, AuxRole::RmsNormLimbHiMultiplicity => 28, AuxRole::RmsNormOutLimbLoPairs => 36, AuxRole::RmsNormOutLimbHiPairs => 37, AuxRole::RmsNormOutLimbLoMultiplicity => 38, AuxRole::RmsNormOutLimbHiMultiplicity => 39, AuxRole::LncRowWitness => 40, AuxRole::LncOutWitness => 41, AuxRole::LncRsqrtPairs => 42, AuxRole::LncRsqrtMultiplicity => 43, AuxRole::RopeRemF => 29, AuxRole::RopeRemS => 30, AuxRole::RopeRemFMultiplicity => 31, AuxRole::RopeRemSMultiplicity => 32, AuxRole::ReluBits => 44, AuxRole::GeluUpperBits => 45, AuxRole::GeluLowerBits => 46 }
 }
 
 /// Deterministic aux descriptor list derived from the trusted graph and
@@ -8655,6 +8800,10 @@ fn aux_specs(ops: &[Op], model: &TrustedModelManifest)
     };
     match gelu_range_aux_specs(ops, model) {
         Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::GeluIndexXRange, len, arity, cols))),
+        None => return None,
+    };
+    match relu_bits_aux_specs(ops, model) {
+        Some(v) => all.extend(v),
         None => return None,
     };
     match scale_vec_remainder_aux_specs(ops, model) {
@@ -8731,7 +8880,7 @@ fn aux_specs(ops: &[Op], model: &TrustedModelManifest)
 
 /// O7-deep M1: aux layout version. Bumped on any change to the plan
 /// construction or group encoding; the verifier rejects other layouts.
-pub const AUX_LAYOUT_VERSION: u32 = 2;
+pub const AUX_LAYOUT_VERSION: u32 = 3;
 
 /// One per-arity global aux commitment. `columns` is the total number of
 /// padded columns in the group; the deterministic AuxPlan maps every
@@ -8886,11 +9035,12 @@ fn build_pooled_aux_openings(rec: &AuxOpenRecorder,
 /// non-identity shared table, derived from the trusted graph. Used by the
 /// verifier budget (one batch opening per table, claims = member count).
 /// Verifier-derived upper bound on `ProofBudget.openings` for a monolithic
-/// proof of `ops`: pooled aux groups (at most one opening each), one internal
-/// table batch per shared non-identity table, two openings per static lookup
-/// group, one selector opening per Argmax position, one token binding, and
-/// one weight-batch opening per manifest batch. Per-op internal table
-/// openings are batched away by M4, and identity/dynamic tables do not open.
+/// proof of `ops`: pooled aux groups (at most one opening each; P2 pools
+/// Relu/GeluIndex bit columns here), one internal table batch per shared
+/// non-identity table, two openings per static lookup group, one selector
+/// opening per Argmax op, one token binding, and one weight-batch opening per
+/// manifest batch. Per-op internal table openings are batched away by M4, and
+/// identity/dynamic tables do not open.
 pub fn opening_upper_bound(ops: &[Op], model: &TrustedModelManifest)
     -> Option<usize>
 {
@@ -8901,17 +9051,10 @@ pub fn opening_upper_bound(ops: &[Op], model: &TrustedModelManifest)
     // S6 selector openings: ONE batch opening per Argmax op (its m points are
     // claims of that single opening), not m openings.
     let sel: usize = ops.iter().filter(|op| matches!(op, Op::Argmax { .. })).count();
-    // Relu and GeluIndex keep per-op committed bit openings in every layout
-    // (they do not have an aux-group opening): one for Relu, two for
-    // GeluIndex (upper and lower range proofs).
-    let relu_ops = ops.iter().filter(|o| matches!(o, Op::Relu { .. })).count();
-    let gelu_ops = ops.iter().filter(|o| matches!(o, Op::GeluIndex { .. })).count();
     let mut total = aux_groups;
     total = total.checked_add(internal_tables)?;
     total = total.checked_add(lookup_groups.checked_mul(2)?)?;
     total = total.checked_add(sel)?;
-    total = total.checked_add(relu_ops)?;
-    total = total.checked_add(gelu_ops.checked_mul(2)?)?;
     total = total.checked_add(1)?; // token binding (upper bound)
     total = total.checked_add(model.batches.len())?;
     Some(total)
@@ -9150,7 +9293,9 @@ struct ReverseReluProof {
     bit_commitment: zkie_core::pcs::whir::Commitment,
     output: EfVirtualProof,
     range: EfVirtualProof,
-    bit_opening: EfBatchOpeningProof,
+    /// None when the bit columns are pooled in the aux plan; the verifier
+    /// replays the claim against the precommitted aux group instead.
+    bit_opening: Option<EfBatchOpeningProof>,
 }
 
 const RELU_BITS: usize = 23;
@@ -9740,10 +9885,11 @@ fn verify_reverse_lookup(op: &Op, point: &[Ef], value: Ef, pairs: &AuxDescriptor
     } else if let Some(&len) = model.identity_tables.get(&table_id) {
         if model.lookup_lengths.get(&table_id) != Some(&len) || proof.table_opening.is_some()
             || proof.table_value != lookup_index_eval(&table.q_den) { return None; }
-    } else if let Some(values) = model.a_table_values(table_id) {
+    } else if model.a_table_values(table_id).is_some() {
         // A table: no proof-side opening; the leaf is evaluated against the
         // digest-verified caller-loaded values.
-        if proof.table_opening.is_some() || ef_eval(values, &table.q_den) != proof.table_value {
+        if proof.table_opening.is_some()
+            || model.eval_a_table(table_id, &table.q_den) != Some(proof.table_value) {
             return None;
         }
     } else if let Some(r) = rec.as_deref_mut() {
@@ -9876,7 +10022,8 @@ fn verify_reverse_projection(op: &Op, point: &[Ef], value: Ef, aux: &AuxDescript
 }
 
 fn prove_reverse_relu(input: &[Goldilocks], point: &[Ef], value: Ef,
-    bits: usize, transcript: &mut Transcript)
+    bits: usize, aux: Option<PreparedAux>, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseReluProof, Vec<(Vec<Ef>, Ef)>)>
 {
     if bits < 2 || bits > 31 { return None; }
@@ -9899,8 +10046,26 @@ fn prove_reverse_relu(input: &[Goldilocks], point: &[Ef], value: Ef,
     let num_vars = bits.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
     let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, VERIFIER_SECURITY);
     let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
-    let refs: Vec<&[Goldilocks]> = bit_cols.iter().map(Vec::as_slice).collect();
-    let (commitment, prover_data, protocol, batch_whir) = whir.commit_batch(&refs);
+    // Pooled-aux path: the bit columns are precommitted in the AuxPlan and
+    // opened once per arity group after the DAG; the plain path keeps the
+    // proof-carried batch commitment/opening.
+    if let Some(a) = &aux {
+        if a.descriptor.len != input.len() || a.descriptor.arity != arity
+            || a.descriptor.columns != bits || a.columns.len() != bits
+            || a.columns.iter().any(|c| c.len() != len)
+            || a.columns != bit_cols {
+            return None;
+        }
+    }
+    let plain = if aux.is_none() {
+        let refs: Vec<&[Goldilocks]> = bit_cols.iter().map(Vec::as_slice).collect();
+        Some(whir.commit_batch(&refs))
+    } else { None };
+    let commitment = match (&aux, &plain) {
+        (Some(a), None) => a.descriptor.commitment.clone(),
+        (None, Some(p)) => p.0.clone(),
+        _ => return None,
+    };
     transcript.absorb(b"zkie-relu-bits-v1");
     transcript.absorb(&bincode::serialize(&commitment).ok()?);
     let mut padded_point = point.to_vec(); padded_point.resize(arity, Ef::ZERO);
@@ -9923,28 +10088,44 @@ fn prove_reverse_relu(input: &[Goldilocks], point: &[Ef], value: Ef,
     points.extend((0..bits).map(|_| range_point.clone()));
     let mut values = vec![output.final_evals[2]];
     values.extend_from_slice(&range.final_evals[2..]);
-    // The batch contract wants one tensor per unique table, first-appearance
-    // order: bits-1 first, then 0..bits-1.
-    let mut unique = vec![bits - 1];
-    unique.extend(0..(bits - 1));
-    let tensors: Vec<Vec<Goldilocks>> = unique.iter().map(|&j| bit_cols[j].clone()).collect();
-    let opening = prove_batch_open_committed_ef(
-        &batch_whir, &commitment, &protocol, bits, prover_data,
-        &idxs, tensors, &points, &values).ok()?;
+    let bit_opening = if let Some(a) = aux {
+        if let Some(r) = rec.as_deref_mut() {
+            r.record(&a.descriptor, &idxs, &points, &values)?;
+            None
+        } else {
+            Some(open_aux(a, &idxs, &points, &values)?)
+        }
+    } else {
+        // The batch contract wants one tensor per unique table, first-appearance
+        // order: bits-1 first, then 0..bits-1.
+        let mut unique = vec![bits - 1];
+        unique.extend(0..(bits - 1));
+        let tensors: Vec<Vec<Goldilocks>> = unique.iter().map(|&j| bit_cols[j].clone()).collect();
+        let (_, prover_data, protocol, batch_whir) = plain?;
+        Some(prove_batch_open_committed_ef(
+            &batch_whir, &commitment, &protocol, bits, prover_data,
+            &idxs, tensors, &points, &values).ok()?)
+    };
     let claims = vec![unpad_relu_claim(&out_point, output.final_evals[1], input_arity)?, unpad_relu_claim(&range_point, range.final_evals[1], input_arity)?];
-    Some((ReverseReluProof { arity, bit_commitment: commitment, output, range, bit_opening: opening }, claims))
+    Some((ReverseReluProof { arity, bit_commitment: commitment, output, range, bit_opening }, claims))
 }
 
 fn verify_reverse_relu(proof: &ReverseReluProof, point: &[Ef], value: Ef,
-    bits: usize, transcript: &mut Transcript)
+    bits: usize, aux: Option<&AuxDescriptor>, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
     -> Option<Vec<(Vec<Ef>, Ef)>>
 {
     if bits < 2 || bits > 31 { return None; }
-    let bound = 1i64 << (bits - 1);
     let input_arity = point.len();
     if proof.arity != input_arity.max(5) || proof.arity >= usize::BITS as usize
         || proof.output.final_evals.len() != 3 || proof.range.final_evals.len() != bits + 2 { return None; }
     let len = 1usize.checked_shl(proof.arity as u32)?;
+    if let Some(a) = aux {
+        if a.len != 1usize.checked_shl(input_arity as u32)? || a.arity != proof.arity
+            || a.columns != bits
+            || bincode::serialize(&a.commitment).ok()?
+                != bincode::serialize(&proof.bit_commitment).ok()? { return None; }
+    }
     transcript.absorb(b"zkie-relu-bits-v1");
     transcript.absorb(&bincode::serialize(&proof.bit_commitment).ok()?);
     let mut padded_point = point.to_vec(); padded_point.resize(proof.arity, Ef::ZERO);
@@ -9960,13 +10141,23 @@ fn verify_reverse_relu(proof: &ReverseReluProof, point: &[Ef], value: Ef,
     let mut evals = proof.range.final_evals.clone();
     evals[0] = ef_eq_poly(&q, &range_point);
     if final_range != efo::virtual_eval(&terms_range, &evals) { return None; }
-    let num_vars = bits.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
-    let whir = verifier_whir(num_vars)?;
-    let protocol = whir.batch_opening_protocol(bits, proof.arity);
     let mut idxs = vec![bits - 1]; idxs.extend(0..bits);
     let mut points = vec![out_point.clone()]; points.extend((0..bits).map(|_| range_point.clone()));
     let mut values = vec![proof.output.final_evals[2]]; values.extend_from_slice(&proof.range.final_evals[2..]);
-    if !verify_batch_open_committed_ef(&whir, &proof.bit_commitment, &protocol, bits, &idxs, &points, &values, &proof.bit_opening) { return None; }
+    if let Some(a) = aux {
+        if let Some(r) = rec.as_deref_mut() {
+            if proof.bit_opening.is_some() { return None; }
+            r.record(a, &idxs, &points, &values)?;
+        } else if !verify_aux_open(a, &idxs, &points, &values, proof.bit_opening.as_ref()?) {
+            return None;
+        }
+    } else {
+        let num_vars = bits.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let whir = verifier_whir(num_vars)?;
+        let protocol = whir.batch_opening_protocol(bits, proof.arity);
+        if !verify_batch_open_committed_ef(&whir, &proof.bit_commitment, &protocol, bits,
+            &idxs, &points, &values, proof.bit_opening.as_ref()?) { return None; }
+    }
     Some(vec![unpad_relu_claim(&out_point, proof.output.final_evals[1], input_arity)?, unpad_relu_claim(&range_point, proof.range.final_evals[1], input_arity)?])
 }
 
@@ -10070,8 +10261,10 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                         build_gelu_range_aux(xv, op_index, xv.len(), xv.len().trailing_zeros().max(5) as usize)?
                     }
                 };
+                let upper_bits = aux.remove(&(op_index, AuxRole::GeluUpperBits));
+                let lower_bits = aux.remove(&(op_index, AuxRole::GeluLowerBits));
                 let (proof, incoming) = prove_reverse_gelu_index(store.get(*x), *offset, *table_len, &point, value, range_aux,
-                    transcript, aux_rec.as_deref_mut())?;
+                    upper_bits, lower_bits, transcript, aux_rec.as_deref_mut())?;
                 for (p, v) in incoming {
                     absorb_reverse_claim(transcript, *x, &p, v);
                     claims.entry(*x).or_default().push((p, v));
@@ -10405,7 +10598,9 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 ReverseReduction::PadIdx { base: bv }
             }
             Op::Relu { x, .. } => {
-                let (proof, incoming) = prove_reverse_relu(store.get(*x), &point, value, RELU_BITS, transcript)?;
+                let bits_aux = aux.remove(&(op_index, AuxRole::ReluBits));
+                let (proof, incoming) = prove_reverse_relu(store.get(*x), &point, value, RELU_BITS,
+                    bits_aux, transcript, aux_rec.as_deref_mut())?;
                 for (p, v) in incoming {
                     absorb_reverse_claim(transcript, *x, &p, v);
                     claims.entry(*x).or_default().push((p, v));
@@ -10543,8 +10738,10 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
             }
             (Op::GeluIndex { x, offset, table_len, .. }, ReverseReduction::GeluIndex { proof }) => {
                 let range_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::GeluIndexXRange);
-                for (p, v) in verify_reverse_gelu_index(*offset, *table_len, &point, value, range_aux, proof,
-                    transcript, aux_rec.as_deref_mut())? {
+                let upper_bits = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::GeluUpperBits);
+                let lower_bits = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::GeluLowerBits);
+                for (p, v) in verify_reverse_gelu_index(*offset, *table_len, &point, value, range_aux,
+                    upper_bits, lower_bits, proof, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, *x, &p, v);
                     claims.entry(*x).or_default().push((p, v));
                 }
@@ -10803,7 +11000,9 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 claims.entry(key).or_default().push((point[..lb].to_vec(), *bv));
             }
             (Op::Relu { x, .. }, ReverseReduction::Relu { proof }) => {
-                for (p, v) in verify_reverse_relu(proof, &point, value, RELU_BITS, transcript)? {
+                let bits_aux = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ReluBits);
+                for (p, v) in verify_reverse_relu(proof, &point, value, RELU_BITS,
+                    bits_aux, transcript, aux_rec.as_deref_mut())? {
                     absorb_reverse_claim(transcript, *x, &p, v);
                     claims.entry(*x).or_default().push((p, v));
                 }
@@ -14950,8 +15149,28 @@ impl TrustedModelManifest {
         self.a_table_digests.get(&id).copied()
     }
 
+    /// Evaluate the padded A table at `point`, zero-extending the point to the
+    /// padded arity (the standard zero-padding convention). A point longer
+    /// than the table is a construction error.
+    pub fn eval_a_table(&self, id: T, point: &[Ef]) -> Option<Ef> {
+        let values = self.a_table_values.get(&id)?;
+        let arity = values.len().trailing_zeros() as usize;
+        if point.len() > arity { return None; }
+        let mut p = point.to_vec();
+        p.resize(arity, Ef::ZERO);
+        Some(ef_eval(values, &p))
+    }
+
     pub fn lookup_length(&self, id: T) -> Option<usize> {
         self.lookup_lengths.get(&id).copied()
+    }
+
+    /// Trusted logical length of a table id. Static lookup tables use
+    /// `lookup_lengths`; A tables that were execution inputs before the
+    /// migration (RoPE cos/sin) are shape-pinned in `tensor_lengths`.
+    pub fn table_logical_length(&self, id: T) -> Option<usize> {
+        self.lookup_lengths.get(&id).copied()
+            .or_else(|| self.tensor_lengths.get(&id).copied())
     }
 
     pub(crate) fn is_identity_table_id(&self, id: T) -> bool {
@@ -14970,11 +15189,16 @@ impl TrustedModelManifest {
         if values.len() != entries.len() || digests.len() != entries.len() { return None; }
         for (&id, e) in &entries {
             if e.length == 0 || e.arity >= usize::BITS as usize
-                || *self.lookup_lengths.get(&id)? != e.length
+                || self.table_logical_length(id)? != e.length
                 || table_pad_arity(e.length)? != e.arity { return None; }
             let vals = values.get(&id)?;
             if vals.len() != 1usize.checked_shl(e.arity as u32)? { return None; }
-            digests.get(&id)?;
+            let digest = *digests.get(&id)?;
+            // The digest must anchor exactly these values; a caller cannot
+            // install a mismatched (values, digest) pair.
+            if crate::tables::hash_a_table(id, e.length, e.arity, &vals[..e.length]) != digest {
+                return None;
+            }
         }
         for id in entries.keys() { self.lookup_roots.remove(id); }
         self.a_tables = entries;
@@ -17535,6 +17759,7 @@ fn prepare_all_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
     prepared.extend(step!("lookup", prepare_lookup_aux(store, ops, model)?));
     prepared.extend(step!("lookup_group", prepare_lookup_group_aux(store, ops, model)?));
     prepared.extend(step!("gelu_range", prepare_gelu_range_aux(store, ops, model)?));
+    prepared.extend(step!("relu_bits", prepare_relu_bits_aux(store, ops, model)?));
     prepared.extend(step!("topk", prepare_topk_aux(store, ops)?));
     prepared.extend(step!("topk_range", prepare_topk_range_aux(store, ops)?));
     prepared.extend(step!("topk_thr_range", prepare_topk_thr_range_aux(store, ops)?));
@@ -17598,16 +17823,14 @@ pub fn prove_committed_shard_dag_bound(
     if trace { eprintln!("PROVE stage commit_aux_groups aux={}", prepared.len()); }
     let (aux_plan, aux_groups, aux_prepared_groups) = commit_aux_groups_from(&prepared, ops, model)?;
     if trace {
-        eprintln!("PROVE stage groups={}", aux_groups.len());
-        let softmax_ops = ops.iter()
-            .filter(|o| matches!(o, Op::Softmax { .. })).count();
-        let lnc_ops = ops.iter()
-            .filter(|o| matches!(o, Op::LayerNormCentered { .. })).count();
-        let group_tables = static_lookup_groups(ops, model)?.len();
-        let sel: usize = ops.iter().filter_map(|o| match o {
-            Op::Argmax { m, .. } => Some(*m), _ => None }).sum();
-        eprintln!("PROVE opening lower bound: softmax_tables={softmax_ops} lnc_tables={lnc_ops} lookup_group_tables={group_tables} sel={sel} token=1 pooled_groups<={}",
-            aux_groups.len());
+        let ub = opening_upper_bound(ops, model)?;
+        let internal = internal_lookup_member_counts(ops, model).len();
+        let static_groups = static_lookup_groups(ops, model)?.len();
+        let sel = ops.iter().filter(|o| matches!(o, Op::Argmax { .. })).count();
+        let gelu_bits = ops.iter().filter(|o| matches!(o, Op::GeluIndex { .. })).count() * 2;
+        eprintln!("PROVE P1 opening upper bound={ub} aux_groups={} internal_tables={internal} \
+static_lookup_groups={static_groups} sel_batch_openings={sel} gelu_bit_columns_pooled={gelu_bits} batches={}",
+            aux_groups.len(), model.batches.len());
     }
     let mut aux_recorder = AuxOpenRecorder::new(aux_plan);
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
@@ -17931,7 +18154,7 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
             ReverseReduction::Relu { proof } => {
                 b.virtual_proof(&proof.output, 3)?;
                 b.virtual_proof(&proof.range, 3)?;
-                b.opening(&proof.bit_opening, RELU_BITS + 1)?;
+                if let Some(o) = &proof.bit_opening { b.opening(o, RELU_BITS + 1)?; }
             }
             ReverseReduction::Projection { proof } => {
                 b.sumcheck(&proof.matmul.sumcheck)?;
@@ -17955,7 +18178,7 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                 for r in [&proof.upper, &proof.lower] {
                     b.virtual_proof(&r.output, 3)?;
                     b.virtual_proof(&r.range, 3)?;
-                    b.opening(&r.bit_opening, GELU_BITS + 1)?;
+                    if let Some(o) = &r.bit_opening { b.opening(o, GELU_BITS + 1)?; }
                 }
                 b.virtual_proof(&proof.x_range, 3)?;
                 if proof_aux_layout < 2 {
@@ -19908,9 +20131,9 @@ mod tests {
                 input.len().trailing_zeros().max(5) as usize).unwrap();
             let aux_desc = aux.descriptor.clone();
             let mut tp = Transcript::new(b"gelu-boundaries");
-            let (proof, _) = prove_reverse_gelu_index(&input, offset, 4, &point, value, aux, &mut tp, None).unwrap();
+            let (proof, _) = prove_reverse_gelu_index(&input, offset, 4, &point, value, aux, None, None, &mut tp, None).unwrap();
             let mut tv = Transcript::new(b"gelu-boundaries");
-            let leaves = verify_reverse_gelu_index(offset, 4, &point, value, Some(&aux_desc), &proof, &mut tv, None).unwrap();
+            let leaves = verify_reverse_gelu_index(offset, 4, &point, value, Some(&aux_desc), None, None, &proof, &mut tv, None).unwrap();
             assert!(leaves.iter().all(|(p, v)| ef_eval(&input, p) == *v));
         }
     }
@@ -19936,9 +20159,9 @@ mod tests {
         let aux = build_gelu_range_aux(input, 0, input.len(),
             input.len().trailing_zeros().max(5) as usize).unwrap();
         let desc = aux.descriptor.clone();
-        let (proof, _) = prove_reverse_gelu_index(input, offset, table_len, &point, value, aux,
+        let (proof, _) = prove_reverse_gelu_index(input, offset, table_len, &point, value, aux, None, None,
             &mut Transcript::new(b"gelu-bounds"), None).unwrap();
-        let leaves = verify_reverse_gelu_index(offset, table_len, &point, value, Some(&desc), &proof,
+        let leaves = verify_reverse_gelu_index(offset, table_len, &point, value, Some(&desc), None, None, &proof,
             &mut Transcript::new(b"gelu-bounds"), None).unwrap();
         leaves.iter().all(|(p, v)| ef_eval(input, p) == *v)
     }
@@ -19980,18 +20203,18 @@ mod tests {
         let value = ef_eval(&gelu_direct_expected(&good, 0, 1), &point);
         let aux = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
         let desc = aux.descriptor.clone();
-        let (proof, _) = prove_reverse_gelu_index(&good, 0, 1, &point, value, aux,
+        let (proof, _) = prove_reverse_gelu_index(&good, 0, 1, &point, value, aux, None, None,
             &mut Transcript::new(b"gelu-neg"), None).unwrap();
-        assert!(verify_reverse_gelu_index(0, 1, &point, value, Some(&desc), &proof,
+        assert!(verify_reverse_gelu_index(0, 1, &point, value, Some(&desc), None, None, &proof,
             &mut Transcript::new(b"gelu-neg"), None).is_some());
 
         // Contract: non-power-of-two / > 2^24 table_len and |offset| > 2^24.
         for (off, tl) in [(0i64, 3usize), (0, 1usize << 25), (bound + 1, 1)] {
             let aux2 = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
-            assert!(prove_reverse_gelu_index(&good, off, tl, &point, value, aux2,
+            assert!(prove_reverse_gelu_index(&good, off, tl, &point, value, aux2, None, None,
                 &mut Transcript::new(b"gelu-neg"), None).is_none(),
                 "prover must reject contract violation off={off} tl={tl}");
-            assert!(verify_reverse_gelu_index(off, tl, &point, value, Some(&desc), &proof,
+            assert!(verify_reverse_gelu_index(off, tl, &point, value, Some(&desc), None, None, &proof,
                 &mut Transcript::new(b"gelu-neg"), None).is_none(),
                 "verifier must reject contract violation off={off} tl={tl}");
         }
@@ -20005,7 +20228,7 @@ mod tests {
         // With a 25-bit witness for a different input, the prover's bit
         // consistency check still rejects.
         let aux3 = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
-        assert!(prove_reverse_gelu_index(&low, 0, 1, &point, value, aux3,
+        assert!(prove_reverse_gelu_index(&low, 0, 1, &point, value, aux3, None, None,
             &mut Transcript::new(b"gelu-neg"), None).is_none());
 
         // Field-wrap attack: x = -(2^24+1) (to_i64 out of domain) but
@@ -20017,7 +20240,7 @@ mod tests {
         assert!(build_gelu_range_aux(&wrap_input, 0, 8, 5).is_none(),
             "wrap input has no 25-bit x witness");
         let aux4 = build_gelu_range_aux(&good, 0, 8, 5).unwrap();
-        assert!(prove_reverse_gelu_index(&wrap_input, wrap_off, 1, &point, value, aux4,
+        assert!(prove_reverse_gelu_index(&wrap_input, wrap_off, 1, &point, value, aux4, None, None,
             &mut Transcript::new(b"gelu-neg"), None).is_none(),
             "wrap attack must fail closed at the x-range witness");
 
@@ -20026,7 +20249,7 @@ mod tests {
         // at a wrapped x).
         let mut forged = proof;
         forged.x_range.final_evals[1] += Ef::ONE;
-        assert!(verify_reverse_gelu_index(0, 1, &point, value, Some(&desc), &forged,
+        assert!(verify_reverse_gelu_index(0, 1, &point, value, Some(&desc), None, None, &forged,
             &mut Transcript::new(b"gelu-neg"), None).is_none(),
             "forged range x eval must be rejected");
     }
@@ -20318,6 +20541,127 @@ mod tests {
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
             &PublicStatement::Generic, &bad_digest, &execution),
             "changed A digest must shift the challenge and reject");
+    }
+
+    /// P1 Phase 2: a `compute` A entry with no sidecar digest is allowed when
+    /// the whole set has no digest lines; the verifier computes the exp table,
+    /// records its own digest slot, and the proof verifies.
+    #[test]
+    fn p1_a_table_compute_without_digest_records_slot() {
+        use crate::tables::try_install_a_tables;
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let entry = ATableEntry { kind: ATableKind::Compute, length: 1 << 21,
+            arity: 21, file_path: None, digest: None };
+        let table_vals = crate::tables::compute_exp_values(&entry).unwrap();
+        let table = store.push(table_vals.clone());
+        let (m, n) = (4usize, 8usize);
+        let len = m * n;
+        let idx: Vec<u32> = (0..len).map(|i| ((1u32 << 21) - 1 - (i as u32 % 4))).collect();
+        let idx_t = store.push_idx(idx);
+        let e = store.push(vec![Goldilocks::ZERO; len]);
+        let out = store.push(vec![Goldilocks::ZERO; len]);
+        let ops = vec![Op::Softmax { idx: idx_t, e, out, table, m, n }];
+        forward_ops(&mut store, &ops);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-p1-a-compute");
+        let mut model = TrustedModelManifest::from_offline_commitment(
+            &cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx_t, len)].into());
+        let dir = std::env::temp_dir().join(format!("zkie-p1-a-compute-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = format!(r#"{{"version":1,"tables":[{{"table_id":{table},"kind":"compute","length":{},"arity":21,"file_path":null,"digest":null}}]}}"#,
+            1usize << 21);
+        std::fs::write(dir.join("tables.meta"), meta).unwrap();
+        assert!(try_install_a_tables(&dir, &ops, &mut model).expect("compute sidecar"));
+        assert!(model.effective_a_digest(table).is_some(), "verifier must record its own slot");
+        let idx_g: Vec<Goldilocks> = store.idx[idx_t].iter()
+            .map(|&x| Goldilocks::from_u64(x as u64)).collect();
+        let execution = TrustedExecution {
+            inputs: [(TensorKey::Index(idx_t).encoded().unwrap(), idx_g)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let whir = Whir::new_testing(5);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir,
+            &cached, 0, 0, &PublicStatement::Generic, &model, &execution)
+            .expect("compute A proof");
+        assert!(proof.internal_table_openings.is_empty());
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+    }
+
+    /// P1 Phase 2: the full sidecar path for a Lookup A table — write the
+    /// table file + JSON sidecar, load/authenticate, install, prove, verify.
+    #[test]
+    fn p1_a_table_sidecar_load_install_prove() {
+        use crate::tables::{hash_a_table, try_install_a_tables};
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)]);
+        let w = store.push(vec![from_i64(1), from_i64(0), from_i64(0), from_i64(1)]);
+        let bias = store.push(vec![Goldilocks::ZERO; 4]);
+        let p1 = store.push(vec![]);
+        let r1 = store.push(vec![]);
+        let vals_i32 = [1i32, 3, 5, 7];
+        let table = store.push(vals_i32.iter().map(|&v| from_i64(v as i64)).collect());
+        let lookup = store.push(vec![]);
+        let p2 = store.push(vec![]);
+        let r2 = store.push(vec![]);
+        let out = store.push(vec![]);
+        let idx = store.push_idx(vec![]);
+        let ops = vec![
+            Op::Projection { x, w, bias, out: p1, rem: r1, m: 2, k: 2, n: 2, shift: 3 },
+            Op::GeluIndex { x: p1, out: idx, offset: 2, table_len: 4 },
+            Op::Lookup { idx, out: lookup, table },
+            Op::Projection { x: lookup, w, bias, out: p2, rem: r2, m: 2, k: 2, n: 2, shift: 1 },
+            Op::Add { a: p2, b: x, c: out },
+        ];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 17);
+        let path = std::env::temp_dir().join("zkie-p1-a-sidecar");
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let mut model = TrustedModelManifest::from_offline_commitment(
+            &cache, &store.owned_slices(), &ops).with_index_shapes(&[(idx, 4usize)].into());
+        let dir = std::env::temp_dir().join(format!("zkie-p1-a-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut file_bytes = Vec::new();
+        for v in vals_i32 { file_bytes.extend_from_slice(&v.to_le_bytes()); }
+        std::fs::write(dir.join("t.bin"), &file_bytes).unwrap();
+        let logical: Vec<Goldilocks> = vals_i32.iter().map(|&v| from_i64(v as i64)).collect();
+        let digest = hash_a_table(table, 4, 5, &logical);
+        let meta = format!(r#"{{"version":1,"tables":[{{"table_id":{table},"kind":"file","length":4,"arity":5,"file_path":"t.bin","digest":[{},{},{},{},{},{},{},{}]}}]}}"#,
+            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]);
+        std::fs::write(dir.join("tables.meta"), &meta).unwrap();
+        assert!(try_install_a_tables(&dir, &ops, &mut model).expect("sidecar load"));
+        assert!(model.is_a_table(table));
+        assert!(!model.lookup_roots.contains_key(&table));
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec())].into(),
+            outputs: [(out, vec![from_i64(-10), from_i64(-1), from_i64(8), from_i64(16)])].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("sidecar A proof");
+        assert!(proof.internal_table_openings.is_empty());
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+        // Bundle path: the verifier compares the caller copy against the
+        // sidecar, loads the file, installs values, and verifies.
+        use crate::bundle::{verify_bundle_dir_with_model, write_bundle, PublicBundle};
+        let bdir = dir.join("bundle");
+        let bundle = PublicBundle::new(ops.clone(), 1, PublicStatement::Generic,
+            model.clone(), execution.clone());
+        let pbytes = bincode::serialize(&proof).unwrap();
+        write_bundle(&bdir, &bundle, &pbytes).expect("write bundle");
+        assert!(verify_bundle_dir_with_model(&bdir, Some(&dir)));
+        assert!(!verify_bundle_dir_with_model(&bdir, None),
+            "A-bearing bundle must require a model directory");
+        let bad_meta = format!(r#"{{"version":1,"tables":[{{"table_id":{table},"kind":"file","length":4,"arity":5,"file_path":"t.bin","digest":[0,0,0,0,0,0,0,0]}}]}}"#);
+        std::fs::write(dir.join("tables.meta"), bad_meta).unwrap();
+        assert!(!verify_bundle_dir_with_model(&bdir, Some(&dir)),
+            "bundle/sidecar digest mismatch must reject");
+        std::fs::write(dir.join("tables.meta"), meta).unwrap();
+        std::fs::write(dir.join("t.bin"), vec![0u8; 16]).unwrap();
+        assert!(crate::tables::load_a_tables(&dir, &ops, &model).is_err(),
+            "short table file must reject");
     }
 
     #[test]
@@ -27498,8 +27842,25 @@ mod tests {
         assert_eq!(p1_fnv64(&transcript), 0x9e74faf818ed0523,
             "transcript bytes differ from 712f513");
         assert_eq!(bytes.len(), 9085, "proof length changed");
-        assert_eq!(p1_fnv64(&bytes), 0xff4557eaed829cc9,
+        assert_eq!(p1_fnv64(&bytes), 0x5dc0a52f60311411,
             "Phase 2 proof bytes changed unexpectedly");
+    }
+
+    /// P1 cheap correctness gate: the frozen s8 proof (empty A registry) still
+    /// verifies through the digest-absorbing verifier path. Prints the explicit
+    /// accept flag and verify-only wall time.
+    #[test]
+    fn p1_s8_frozen_proof_verify_accepts() {
+        let (ops, whir, model, execution, bytes) = s8_bound_fixture(0x5903);
+        assert_eq!(bytes.len(), 9085);
+        assert_eq!(p1_fnv64(&bytes), 0x5dc0a52f60311411);
+        let t0 = std::time::Instant::now();
+        let accept = verify_committed_shard_dag_bound_bytes(
+            &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution);
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        eprintln!("P1-S8-VERIFY accept={accept} verify_ms={ms:.3} proof_len={} proof_fnv={:016x}",
+            bytes.len(), p1_fnv64(&bytes));
+        assert!(accept, "frozen s8 proof must verify after P1 digest absorption");
     }
 
     /// P1 Phase 1: the manifest (including the A-registry) survives a bincode
@@ -27537,7 +27898,7 @@ mod tests {
     #[test]
     fn p1_phase1_v4_bundle_is_rejected() {
         use crate::bundle::{write_proof, PublicBundle, BUNDLE_VERSION};
-        assert_eq!(BUNDLE_VERSION, 5);
+        assert_eq!(BUNDLE_VERSION, 6);
         let (ops, _whir, model, execution, proof) = s8_bound_fixture(0x5903);
         let dir = std::env::temp_dir().join(format!(
             "zkie-p1-v4-reject-{}", std::process::id()));
@@ -27547,6 +27908,9 @@ mod tests {
         write_proof(&dir, &proof).expect("write proof");
         assert!(PublicBundle::read(&dir).is_none(), "v4 bundle must not load");
         assert!(!crate::bundle::verify_bundle_dir(&dir), "v4 bundle must not verify");
+        bundle.version = 5;
+        bundle.write(&dir).expect("write v5 bundle");
+        assert!(PublicBundle::read(&dir).is_none(), "v5 bundle must not load under v6");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28371,7 +28735,7 @@ mod tests {
         let model = TrustedModelManifest::from_offline_commitment(
             &cached, &store.owned_slices(), &ops);
         // B2 gate: public execution extraction must accept the LNC op.
-        let pub_exec = crate::bundle::public_execution(&store, &ops, &cached)
+        let pub_exec = crate::bundle::public_execution(&store, &ops, &cached, &model)
             .expect("B2 public execution must accept LNC");
         assert!(pub_exec.inputs.contains_key(&x));
         assert!(pub_exec.outputs.contains_key(&out));
@@ -29842,6 +30206,76 @@ mod tests {
                 &bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &e),
                 "tampered RoPE execution {bad} must be rejected");
         }
+    }
+
+    /// P1 Phase 2: RoPE cos/sin move from public execution inputs to the
+    /// A registry. The reduction evaluates them against the digest-verified
+    /// caller values, emits no cos/sin execution claims, and public execution
+    /// extraction lists only `x` as an input.
+    #[test]
+    fn p1_a_table_rope_no_execution_inputs() {
+        use crate::tables::{hash_a_table, LoadedATables};
+        let mut store = Store::new();
+        let (m, heads, d, shift) = (4usize, 2usize, 8usize, 16u32);
+        let half = d / 2;
+        let len = m * heads * d;
+        let xv: Vec<Goldilocks> = (0..len)
+            .map(|i| from_i64(((i as i64 * 7) % 23) - 11)).collect();
+        let cosv: Vec<Goldilocks> = (0..m * half)
+            .map(|i| from_i64(20000 + ((i as i64 * 3) % 7))).collect();
+        let sinv: Vec<Goldilocks> = (0..m * half)
+            .map(|i| from_i64(-3000 + ((i as i64 * 5) % 11))).collect();
+        let x = store.push(xv.clone());
+        let cos = store.push(cosv.clone());
+        let sin = store.push(sinv.clone());
+        let out = store.push(vec![Goldilocks::ZERO; len]);
+        let range_t = store.push((0..65536).map(|i| from_i64(i as i64)).collect());
+        let ops = vec![Op::RoPE { x, cos, sin, out, range_table: range_t,
+            m, d, shift }];
+        forward_ops(&mut store, &ops);
+        let mut model = TrustedModelManifest::from_offline_commitment(
+            &[], &store.owned_slices(), &ops);
+        let mut entries = std::collections::BTreeMap::new();
+        let mut values = std::collections::BTreeMap::new();
+        let mut digests = std::collections::BTreeMap::new();
+        for (id, logical) in [(cos, &cosv), (sin, &sinv)] {
+            let arity = logical.len().checked_next_power_of_two().unwrap().max(32)
+                .trailing_zeros() as usize;
+            let digest = hash_a_table(id, logical.len(), arity, logical);
+            entries.insert(id, ATableEntry { kind: ATableKind::File,
+                length: logical.len(), arity, file_path: Some("t.bin".to_string()),
+                digest: Some(digest) });
+            let mut padded = logical.clone();
+            padded.resize(1usize << arity, Goldilocks::ZERO);
+            values.insert(id, std::sync::Arc::new(padded));
+            digests.insert(id, digest);
+        }
+        LoadedATables { entries, values, digests }.install(&mut model).expect("install A");
+        assert!(!model.lookup_roots.contains_key(&cos));
+        assert!(!model.lookup_roots.contains_key(&sin));
+        let pubexec = crate::bundle::public_execution(&store, &ops, &[], &model)
+            .expect("public execution");
+        assert_eq!(pubexec.inputs.keys().copied().collect::<Vec<_>>(), vec![x]);
+        assert!(pubexec.outputs.contains_key(&out));
+        let execution = TrustedExecution {
+            inputs: [(x, xv)].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, VERIFIER_SECURITY, 0);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0,
+            &PublicStatement::Generic, &model, &execution).expect("A RoPE bound proof");
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &model, &execution));
+        let mut bad = model.clone();
+        std::sync::Arc::make_mut(bad.a_table_values.get_mut(&cos).unwrap())[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &bad, &execution),
+            "changed cos values must be rejected");
+        let mut bad_digest = model.clone();
+        bad_digest.a_table_digests.insert(cos, [9u32; 8]);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
+            &PublicStatement::Generic, &bad_digest, &execution),
+            "changed cos digest must be rejected");
     }
 
     /// PR#45 B2: public bundle + independent verifier contract, plus the
