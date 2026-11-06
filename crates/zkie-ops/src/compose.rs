@@ -271,6 +271,16 @@ fn pad_lookup_table(table: &[Goldilocks]) -> Vec<Goldilocks> {
 /// and the manifest must carry the table's root and length. Members are op
 /// indices in ascending order, giving a deterministic group order and group
 /// membership for the prover/verifier α/β derivation.
+/// Multiplicity aux role of a shared-table member (M4b).
+fn lookup_member_mult_role(op: &Op) -> Option<AuxRole> {
+    match op {
+        Op::Lookup { .. } | Op::Softmax { .. } => Some(AuxRole::LookupMultiplicity),
+        Op::LayerNormCentered { .. } => Some(AuxRole::LncRsqrtMultiplicity),
+        Op::RmsNorm { .. } => Some(AuxRole::RmsNormRsqrtMultiplicity),
+        _ => None,
+    }
+}
+
 fn static_lookup_groups(
     ops: &[Op],
     model: &TrustedModelManifest,
@@ -278,15 +288,22 @@ fn static_lookup_groups(
     let written = op_field_writes(ops);
     let mut groups: std::collections::BTreeMap<T, Vec<usize>> = std::collections::BTreeMap::new();
     for (i, op) in ops.iter().enumerate() {
-        if let Op::Lookup { table, .. } = op {
-            if written.contains(table) || model.identity_tables.contains_key(table)
-                || model.a_tables.contains_key(table) {
-                continue; // dynamic / identity / A: no PCS group or root
-            }
-            model.lookup_roots.get(table)?;
-            model.lookup_lengths.get(table)?;
-            groups.entry(*table).or_default().push(i);
+        let table = match op {
+            Op::Lookup { table, .. } | Op::Softmax { table, .. } => *table,
+            Op::LayerNormCentered { rsqrt_table, .. } => *rsqrt_table,
+            Op::RmsNorm { rsqrt_table, .. } => *rsqrt_table,
+            _ => continue,
+        };
+        if written.contains(&table) || model.identity_tables.contains_key(&table) {
+            continue; // dynamic / identity: no shared static group
         }
+        // A tables are grouped without a PCS root; their values come from the
+        // digest-verified registry. B static tables keep the trusted root.
+        if !model.a_tables.contains_key(&table) {
+            model.lookup_roots.get(&table)?;
+        }
+        model.lookup_lengths.get(&table)?;
+        groups.entry(table).or_default().push(i);
     }
     Some(groups)
 }
@@ -2713,8 +2730,9 @@ fn softmax_dims(op: &Op) -> Option<(T, T, T, T, usize, usize)> {
 fn prove_reverse_softmax(store: &Store, op: &Op, point: &[Ef], value: Ef,
     pairs: PreparedAux, mult: PreparedAux, sum_aux: PreparedAux, rem_aux: PreparedAux,
     out_aux: PreparedAux, model: &TrustedModelManifest, dynamic_table: bool,
+    group: Option<LookupGroupMemberProve<'_>>,
     transcript: &mut Transcript, mut rec: Option<&mut AuxOpenRecorder>)
-    -> Option<(ReverseSoftmaxProof, Vec<EfClaim>)>
+    -> Option<(ReverseSoftmaxProof, Vec<EfClaim>, (Ef, Ef))>
 {
     let (idx, e, out, table, m, n) = softmax_dims(op)?;
     let len = m.checked_mul(n)?;
@@ -2831,18 +2849,19 @@ fn prove_reverse_softmax(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let rem_opening = open_aux(rem_aux, &rem_idx, &rem_points, &rem_values)?;
     let lookup_value = ef_eval(&pairs.columns[1], &q);
     let fake = Op::Lookup { idx, out: e, table };
-    let (lookup, claims, _) = prove_reverse_lookup(
-        store, &fake, &q, lookup_value, pairs, mult, model, dynamic_table, None, transcript,
+    let (lookup, claims, roots) = prove_reverse_lookup(
+        store, &fake, &q, lookup_value, pairs, mult, model, dynamic_table, group, transcript,
         rec.as_deref_mut())?;
     Some((ReverseSoftmaxProof { lookup, lookup_value, row_sum, rescale, bind,
-        out_opening, sum_opening, e_opening, rem_opening }, claims))
+        out_opening, sum_opening, e_opening, rem_opening }, claims, roots))
 }
 
 fn verify_reverse_softmax(op: &Op, point: &[Ef], value: Ef,
     pairs: &AuxDescriptor, mult: &AuxDescriptor, sum_aux: &AuxDescriptor,
     rem_aux: &AuxDescriptor, out_aux: &AuxDescriptor, model: &TrustedModelManifest,
-    dynamic_table: bool, proof: &ReverseSoftmaxProof, transcript: &mut Transcript,
-    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
+    dynamic_table: bool, group: Option<LookupGroupMemberVerify<'_>>,
+    proof: &ReverseSoftmaxProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<(Vec<EfClaim>, (Ef, Ef))>
 {
     let (idx, e, _out, table, m, n) = softmax_dims(op)?;
     let len = m.checked_mul(n)?;
@@ -2914,8 +2933,8 @@ fn verify_reverse_softmax(op: &Op, point: &[Ef], value: Ef,
         &rem_values, &proof.rem_opening) { return None; }
     let fake = Op::Lookup { idx, out: e, table };
     let lk = verify_reverse_lookup(&fake, &q, proof.lookup_value, pairs, mult, model, dynamic_table,
-        None, &proof.lookup, transcript, rec.as_deref_mut()).map(|(claims, _)| claims);
-    lk
+        group, &proof.lookup, transcript, rec.as_deref_mut())?;
+    Some(lk)
 }
 
 fn stable_softmax_index_dims(op: &Op) -> Option<(T, T, T, i64, usize, usize, usize)> {
@@ -3893,6 +3912,115 @@ fn internal_lookup_verify(table_id: T, pairs: &AuxDescriptor, multiplicity: &Aux
     Some(())
 }
 
+/// M4b grouped internal lookup (bound path): the table-side fraction tree
+/// and alpha/beta live at the shared-table group level; this op keeps its
+/// witness tree and opens its multiplicity column at the group identity
+/// point. Returns the witness-tree root for the group relation.
+fn internal_lookup_prove_group(store: &Store, table_id: T, pairs: PreparedAux,
+    multiplicity: PreparedAux, idx_col: usize, val_col: usize,
+    xs: &[u32], ys: &[Goldilocks], point: &[Ef], value: Ef,
+    model: &TrustedModelManifest, group: LookupGroupMemberProve<'_>,
+    transcript: &mut Transcript, mut rec: Option<&mut AuxOpenRecorder>)
+    -> Option<(InternalLookupProof, (Ef, Ef))>
+{
+    let _ = store; let _ = model;
+    if idx_col >= 2 || val_col >= 2 || point.len() != pairs.descriptor.arity
+        || pairs.descriptor.columns != 2 || multiplicity.descriptor.columns != 1
+        || xs.len() != pairs.descriptor.len || ys.len() != xs.len()
+        || multiplicity.descriptor.arity != group.identity_point.len() { return None; }
+    let output_index = ef_eval(&pairs.columns[idx_col], point);
+    if ef_eval(&pairs.columns[val_col], point) != value { return None; }
+    transcript.absorb_ef(output_index);
+    let (alpha, beta) = (group.alpha, group.beta);
+    let (witness, _, _, w_num_col, w_den_col) =
+        zkie_core::common::ef_logup::prove_lookup_witness_batch_columns(
+            &[xs], &[ys], alpha, beta, transcript);
+    let (w_final_num, w_final_den) = fraction_root(w_num_col, w_den_col)?;
+    if w_final_den == Ef::ZERO { return None; }
+    let (w_num_point, w_num, w_den_point, w_den) =
+        zkie_core::common::ef_logup::fractional_leaf(&witness);
+    if w_num != lookup_prefix_eval(xs.len(), &w_num_point) { return None; }
+    let witness_index = ef_eval(&pairs.columns[idx_col], &w_den_point);
+    let witness_value = ef_eval(&pairs.columns[val_col], &w_den_point);
+    if w_den != alpha + witness_index + beta * witness_value { return None; }
+    transcript.absorb_efs(&[witness_index, witness_value, group.member_eval]);
+    let q = transcript.ef_field_vec(multiplicity.descriptor.arity);
+    let eq = efo::eq_evals(&q);
+    let mult_cols = lift_columns(&multiplicity.columns);
+    let mut padding_mask = vec![Ef::ZERO; multiplicity.columns[0].len()];
+    for v in padding_mask.iter_mut().skip(multiplicity.descriptor.len) { *v = Ef::ONE; }
+    let padding_terms = vec![(Ef::ONE, vec![0usize, 1usize, 2usize])];
+    let (padding, padding_point) = efo::prove_virtual(
+        &[&eq, &mult_cols[0], &padding_mask], &padding_terms, Ef::ZERO, transcript);
+    let padding_value = padding.final_evals[1];
+    let pair_idxs = [idx_col, val_col, idx_col, val_col];
+    let pair_points = vec![point.to_vec(), point.to_vec(),
+        w_den_point.clone(), w_den_point.clone()];
+    let pair_values = [output_index, value, witness_index, witness_value];
+    let mult_points = vec![group.identity_point.to_vec(), padding_point.clone()];
+    let mult_values = [group.member_eval, padding_value];
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(&pairs.descriptor, &pair_idxs, &pair_points, &pair_values)?;
+        r.record(&multiplicity.descriptor, &[0, 0], &mult_points, &mult_values)?;
+    }
+    let pairs_opening = open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?;
+    let multiplicity_opening = open_aux(multiplicity, &[0, 0], &mult_points, &mult_values)?;
+    Some((InternalLookupProof {
+        witness,
+        table: EfFractionalProof { layers: Vec::new() },
+        output_index, witness_index, witness_value,
+        multiplicity: group.member_eval, table_value: group.table_eval, padding,
+        pairs_opening, multiplicity_opening, table_opening: None,
+    }, (w_final_num, w_final_den)))
+}
+
+fn internal_lookup_verify_group(table_id: T, pairs: &AuxDescriptor, multiplicity: &AuxDescriptor,
+    idx_col: usize, val_col: usize, point: &[Ef], value: Ef,
+    model: &TrustedModelManifest, group: LookupGroupMemberVerify<'_>,
+    proof: &InternalLookupProof, transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<(Ef, Ef)>
+{
+    let _ = model;
+    if idx_col >= 2 || val_col >= 2 || point.len() != pairs.arity
+        || pairs.columns != 2 || multiplicity.columns != 1
+        || multiplicity.arity != group.identity_point.len()
+        || !proof.table.layers.is_empty() || proof.table_opening.is_some()
+        || proof.multiplicity != group.member_eval || proof.table_value != group.table_eval {
+        return None;
+    }
+    transcript.absorb_ef(proof.output_index);
+    let (alpha, beta) = (group.alpha, group.beta);
+    let witness = zkie_core::common::ef_logup::verify_fractional_chain_core(
+        &proof.witness, pairs.arity, transcript)?;
+    if witness.final_den == Ef::ZERO
+        || witness.num_leaf != lookup_prefix_eval(pairs.len, &witness.q_num)
+        || witness.den_leaf != alpha + proof.witness_index + beta * proof.witness_value {
+        return None;
+    }
+    transcript.absorb_efs(&[proof.witness_index, proof.witness_value, proof.multiplicity]);
+    if proof.padding.final_evals.len() != 3 { return None; }
+    let q = transcript.ef_field_vec(multiplicity.arity);
+    let padding_terms = vec![(Ef::ONE, vec![0usize, 1usize, 2usize])];
+    let (ok, padding_point, fc) = efo::verify_virtual(&proof.padding, &padding_terms,
+        Ef::ZERO, multiplicity.arity, transcript);
+    if !ok || fc != ef_eq_poly(&q, &padding_point) * proof.padding.final_evals[1]
+        * (Ef::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) {
+        return None;
+    }
+    let points = vec![point.to_vec(), point.to_vec(),
+        witness.q_den.clone(), witness.q_den.clone()];
+    let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
+    let mult_points = vec![group.identity_point.to_vec(), padding_point.clone()];
+    let mult_values = [proof.multiplicity, proof.padding.final_evals[1]];
+    if let Some(r) = rec.as_deref_mut() {
+        r.record(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values)?;
+        r.record(multiplicity, &[0, 0], &mult_points, &mult_values)?;
+    } else if !verify_aux_open(pairs, &[idx_col, val_col, idx_col, val_col], &points, &values, &proof.pairs_opening)
+        || !verify_aux_open(multiplicity, &[0, 0], &mult_points, &mult_values,
+            &proof.multiplicity_opening) { return None; }
+    Some((witness.final_num, witness.final_den))
+}
+
 fn rms_mult_matches(columns: &[Vec<Goldilocks>], expected: &[Goldilocks]) -> bool {
     if columns.len() != 1 { return false; }
     let col = &columns[0];
@@ -3902,8 +4030,28 @@ fn rms_mult_matches(columns: &[Vec<Goldilocks>], expected: &[Goldilocks]) -> boo
 
 fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
     aux: RmsAux, model: &TrustedModelManifest, transcript: &mut Transcript,
-    mut rec: Option<&mut AuxOpenRecorder>)
+    rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseRmsNormProof, Vec<EfClaim>)>
+{
+    prove_reverse_rms_norm_impl(store, op, point, value, aux, model, None,
+        transcript, rec).map(|(p, c, _)| (p, c))
+}
+
+fn prove_reverse_rms_norm_grouped(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    aux: RmsAux, model: &TrustedModelManifest, group: LookupGroupMemberProve<'_>,
+    transcript: &mut Transcript, rec: Option<&mut AuxOpenRecorder>)
+    -> Option<(ReverseRmsNormProof, Vec<EfClaim>, (Ef, Ef))>
+{
+    prove_reverse_rms_norm_impl(store, op, point, value, aux, model, Some(group),
+        transcript, rec)
+}
+
+fn prove_reverse_rms_norm_impl(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    aux: RmsAux, model: &TrustedModelManifest,
+    group: Option<LookupGroupMemberProve<'_>>,
+    transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>)
+    -> Option<(ReverseRmsNormProof, Vec<EfClaim>, (Ef, Ef))>
 {
     let (x, w, out, rsqrt_id, limb_id, m, d, n_real) = rms_norm_dims(op)?;
     let len = m.checked_mul(d)?;
@@ -4079,8 +4227,14 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let rsqrt_xs: Vec<u32> = (0..m)
         .map(|r| to_i64(rsqrt_pairs.columns[0][r]) as u32).collect();
     let rsqrt_ys: Vec<Goldilocks> = (0..m).map(|r| rsqrt_pairs.columns[1][r]).collect();
-    let rsqrt = internal_lookup_prove(store, rsqrt_id, rsqrt_pairs, rsqrt_mult, 0, 1,
-        &rsqrt_xs, &rsqrt_ys, &p_rstd, out_vp.final_evals[3], model, transcript, rec.as_deref_mut())?;
+    let (rsqrt, rsqrt_roots) = match group {
+        Some(g) => internal_lookup_prove_group(store, rsqrt_id, rsqrt_pairs, rsqrt_mult, 0, 1,
+            &rsqrt_xs, &rsqrt_ys, &p_rstd, out_vp.final_evals[3], model, g,
+            transcript, rec.as_deref_mut())?,
+        None => (internal_lookup_prove(store, rsqrt_id, rsqrt_pairs, rsqrt_mult, 0, 1,
+            &rsqrt_xs, &rsqrt_ys, &p_rstd, out_vp.final_evals[3], model, transcript,
+            rec.as_deref_mut())?, (Ef::ZERO, Ef::ZERO)),
+    };
     let lo_xs: Vec<u32> = limb_lo_pairs.columns[0].iter()
         .map(|&v| to_i64(v) as u32).collect();
     let lo_ys: Vec<Goldilocks> = limb_lo_pairs.columns[0].clone();
@@ -4138,13 +4292,33 @@ fn prove_reverse_rms_norm(store: &Store, op: &Op, point: &[Ef], value: Ef,
             EfClaim { tensor_id: x, point: z_ms, value: x_ms },
             EfClaim { tensor_id: x, point: z_out.clone(), value: x_out },
             EfClaim { tensor_id: w, point: z_out, value: w_out },
-        ]))
+        ], rsqrt_roots))
 }
 
 fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
     aux: RmsAuxRefs<'_>, model: &TrustedModelManifest,
     proof: &ReverseRmsNormProof, transcript: &mut Transcript,
-    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
+    rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
+{
+    verify_reverse_rms_norm_impl(op, point, value, aux, model, None, proof,
+        transcript, rec).map(|(c, _)| c)
+}
+
+fn verify_reverse_rms_norm_grouped(op: &Op, point: &[Ef], value: Ef,
+    aux: RmsAuxRefs<'_>, model: &TrustedModelManifest,
+    group: LookupGroupMemberVerify<'_>, proof: &ReverseRmsNormProof,
+    transcript: &mut Transcript, rec: Option<&mut AuxOpenRecorder>)
+    -> Option<(Vec<EfClaim>, (Ef, Ef))>
+{
+    verify_reverse_rms_norm_impl(op, point, value, aux, model, Some(group), proof,
+        transcript, rec)
+}
+
+fn verify_reverse_rms_norm_impl(op: &Op, point: &[Ef], value: Ef,
+    aux: RmsAuxRefs<'_>, model: &TrustedModelManifest,
+    group: Option<LookupGroupMemberVerify<'_>>, proof: &ReverseRmsNormProof,
+    transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<(Vec<EfClaim>, (Ef, Ef))>
 {
     let (x, w, _out, rsqrt_id, limb_id, m, d, n_real) = rms_norm_dims(op)?;
     let len = m.checked_mul(d)?;
@@ -4267,8 +4441,15 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
     let mut p_rstd = z_out[lg_d..].to_vec();
     p_rstd.resize(arity, Ef::ZERO);
 
-    internal_lookup_verify(rsqrt_id, aux.rsqrt_pairs, aux.rsqrt_mult, 0, 1, &p_rstd,
-        fo[3], model, &proof.rsqrt, transcript, rec.as_deref_mut())?;
+    let rsqrt_roots = match group {
+        Some(g) => internal_lookup_verify_group(rsqrt_id, aux.rsqrt_pairs, aux.rsqrt_mult,
+            0, 1, &p_rstd, fo[3], model, g, &proof.rsqrt, transcript, rec.as_deref_mut())?,
+        None => {
+            internal_lookup_verify(rsqrt_id, aux.rsqrt_pairs, aux.rsqrt_mult, 0, 1, &p_rstd,
+                fo[3], model, &proof.rsqrt, transcript, rec.as_deref_mut())?;
+            (Ef::ZERO, Ef::ZERO)
+        }
+    };
     internal_lookup_verify(limb_id, aux.limb_lo_pairs, aux.limb_lo_mult, 0, 0, &z_out,
         fo[5], model, &proof.limb_lo, transcript, rec.as_deref_mut())?;
     internal_lookup_verify(limb_id, aux.limb_hi_pairs, aux.limb_hi_mult, 1, 1, &z_out,
@@ -4292,11 +4473,11 @@ fn verify_reverse_rms_norm(op: &Op, point: &[Ef], value: Ef,
     } else if !verify_aux_open(aux.row, &ridx, &rpoints, &rvalues, &proof.row_opening) {
         return None;
     }
-    Some(vec![
+    Some((vec![
         EfClaim { tensor_id: x, point: z_ms, value: fm[2] },
         EfClaim { tensor_id: x, point: z_out.clone(), value: fo[1] },
         EfClaim { tensor_id: w, point: z_out, value: fo[2] },
-    ])
+    ], rsqrt_roots))
 }
 
 // PR#45 B1: RoPE reverse reduction.
@@ -6567,8 +6748,8 @@ struct LookupGroupProof {
     aggregate_opening: EfBatchOpeningProof,
     table: EfFractionalProof,
     /// Step (c): the one table opening of the group, at the shared table
-    /// denominator leaf. Member Lookup proofs carry `table_opening = None`.
-    table_opening: zkie_core::pcs::whir::Proof,
+    /// denominator leaf. A groups are digest-anchored and carry none.
+    table_opening: Option<zkie_core::pcs::whir::Proof>,
 }
 
 /// Prover-side group context: the per-op proofs need the common alpha/beta,
@@ -7712,14 +7893,25 @@ fn prove_reverse_lnc(store: &Store, op: &Op, point: &[Ef], value: Ef,
     rec: Option<&mut AuxOpenRecorder>)
     -> Option<(ReverseLncProof, Vec<EfClaim>)>
 {
-    prove_reverse_lnc_impl(store, op, point, value, aux, model, transcript,
-        rec, false, true)
+    prove_reverse_lnc_impl(store, op, point, value, aux, model, None, transcript,
+        rec, false, true).map(|(p, c, _)| (p, c))
+}
+
+fn prove_reverse_lnc_grouped(store: &Store, op: &Op, point: &[Ef], value: Ef,
+    aux: LncAux, model: &TrustedModelManifest, group: LookupGroupMemberProve<'_>,
+    transcript: &mut Transcript, rec: Option<&mut AuxOpenRecorder>)
+    -> Option<(ReverseLncProof, Vec<EfClaim>, (Ef, Ef))>
+{
+    prove_reverse_lnc_impl(store, op, point, value, aux, model, Some(group),
+        transcript, rec, false, true)
 }
 
 fn prove_reverse_lnc_impl(store: &Store, op: &Op, point: &[Ef], value: Ef,
-    aux: LncAux, model: &TrustedModelManifest, transcript: &mut Transcript,
+    aux: LncAux, model: &TrustedModelManifest,
+    group: Option<LookupGroupMemberProve<'_>>,
+    transcript: &mut Transcript,
     mut rec: Option<&mut AuxOpenRecorder>, forge_rho: bool, check_witness: bool)
-    -> Option<(ReverseLncProof, Vec<EfClaim>)>
+    -> Option<(ReverseLncProof, Vec<EfClaim>, (Ef, Ef))>
 {
     let (x, w, b, out, rsqrt_id, m, d, n_real) = lnc_dims(op)?;
     let len = m.checked_mul(d)?;
@@ -7851,9 +8043,14 @@ fn prove_reverse_lnc_impl(store: &Store, op: &Op, point: &[Ef], value: Ef,
     let rsqrt_xs: Vec<u32> = (0..m)
         .map(|r| to_i64(aux.rsqrt_pairs.columns[0][r]) as u32).collect();
     let rsqrt_ys: Vec<Goldilocks> = (0..m).map(|r| aux.rsqrt_pairs.columns[1][r]).collect();
-    let rsqrt = internal_lookup_prove(store, rsqrt_id, aux.rsqrt_pairs,
-        aux.rsqrt_mult, 0, 1, &rsqrt_xs, &rsqrt_ys, &p_out, fe[3], model,
-        transcript, rec.as_deref_mut())?;
+    let (rsqrt, rsqrt_roots) = match group {
+        Some(g) => internal_lookup_prove_group(store, rsqrt_id, aux.rsqrt_pairs,
+            aux.rsqrt_mult, 0, 1, &rsqrt_xs, &rsqrt_ys, &p_out, fe[3], model,
+            g, transcript, rec.as_deref_mut())?,
+        None => (internal_lookup_prove(store, rsqrt_id, aux.rsqrt_pairs,
+            aux.rsqrt_mult, 0, 1, &rsqrt_xs, &rsqrt_ys, &p_out, fe[3], model,
+            transcript, rec.as_deref_mut())?, (Ef::ZERO, Ef::ZERO)),
+    };
 
     let mut ridx = Vec::new();
     let mut rpoints = Vec::new();
@@ -7897,13 +8094,32 @@ fn prove_reverse_lnc_impl(store: &Store, op: &Op, point: &[Ef], value: Ef,
             EfClaim { tensor_id: x, point: z_out.clone(), value: fe[1] },
             EfClaim { tensor_id: w, point: z_out.clone(), value: fe[4] },
             EfClaim { tensor_id: b, point: z_out, value: fe[5] },
-        ]))
+        ], rsqrt_roots))
 }
 
 fn verify_reverse_lnc(op: &Op, point: &[Ef], value: Ef,
     aux: LncAuxRefs<'_>, model: &TrustedModelManifest,
     proof: &ReverseLncProof, transcript: &mut Transcript,
-    mut rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
+    rec: Option<&mut AuxOpenRecorder>) -> Option<Vec<EfClaim>>
+{
+    verify_reverse_lnc_impl(op, point, value, aux, model, None, proof, transcript, rec)
+        .map(|(c, _)| c)
+}
+
+fn verify_reverse_lnc_grouped(op: &Op, point: &[Ef], value: Ef,
+    aux: LncAuxRefs<'_>, model: &TrustedModelManifest,
+    group: LookupGroupMemberVerify<'_>, proof: &ReverseLncProof,
+    transcript: &mut Transcript, rec: Option<&mut AuxOpenRecorder>)
+    -> Option<(Vec<EfClaim>, (Ef, Ef))>
+{
+    verify_reverse_lnc_impl(op, point, value, aux, model, Some(group), proof, transcript, rec)
+}
+
+fn verify_reverse_lnc_impl(op: &Op, point: &[Ef], value: Ef,
+    aux: LncAuxRefs<'_>, model: &TrustedModelManifest,
+    group: Option<LookupGroupMemberVerify<'_>>, proof: &ReverseLncProof,
+    transcript: &mut Transcript,
+    mut rec: Option<&mut AuxOpenRecorder>) -> Option<(Vec<EfClaim>, (Ef, Ef))>
 {
     let (x, w, b, _out, rsqrt_id, m, d, n_real) = lnc_dims(op)?;
     let len = m.checked_mul(d)?;
@@ -8034,15 +8250,22 @@ fn verify_reverse_lnc(op: &Op, point: &[Ef], value: Ef,
     } else if !verify_aux_open(aux.row, &ridx, &rpoints, &rvalues, &proof.row_opening) {
         return None;
     }
-    internal_lookup_verify(rsqrt_id, aux.rsqrt_pairs, aux.rsqrt_mult, 0, 1, &p_out,
-        fo[3], model, &proof.rsqrt, transcript, rec.as_deref_mut())?;
-    Some(vec![
+    let rsqrt_roots = match group {
+        Some(g) => internal_lookup_verify_group(rsqrt_id, aux.rsqrt_pairs, aux.rsqrt_mult,
+            0, 1, &p_out, fo[3], model, g, &proof.rsqrt, transcript, rec.as_deref_mut())?,
+        None => {
+            internal_lookup_verify(rsqrt_id, aux.rsqrt_pairs, aux.rsqrt_mult, 0, 1, &p_out,
+                fo[3], model, &proof.rsqrt, transcript, rec.as_deref_mut())?;
+            (Ef::ZERO, Ef::ZERO)
+        }
+    };
+    Some((vec![
         EfClaim { tensor_id: x, point: z_mean, value: fm[2] },
         EfClaim { tensor_id: x, point: z_var, value: fv[2] },
         EfClaim { tensor_id: x, point: z_out.clone(), value: fo[1] },
         EfClaim { tensor_id: w, point: z_out.clone(), value: fo[4] },
         EfClaim { tensor_id: b, point: z_out, value: fo[5] },
-    ])
+    ], rsqrt_roots))
 }
 fn rope_out_aux_specs(ops: &[Op], model: &TrustedModelManifest)
     -> Option<Vec<(usize, usize, usize, usize)>>
@@ -8595,7 +8818,10 @@ fn prepare_lookup_group_aux(store: &Store, ops: &[Op], model: &TrustedModelManif
         let arity = padded.trailing_zeros() as usize;
         let mut m = vec![Goldilocks::ZERO; padded];
         for &oi in &members {
-            let idx = match &ops[oi] { Op::Lookup { idx, .. } => *idx, _ => return None };
+            let idx = match &ops[oi] {
+                Op::Lookup { idx, .. } | Op::Softmax { idx, .. } => *idx,
+                _ => return None,
+            };
             let xs = store.idx.get(idx)?;
             if !xs.len().is_power_of_two() { return None; }
             for &x in xs {
@@ -8614,6 +8840,48 @@ fn prepare_lookup_group_aux(store: &Store, ops: &[Op], model: &TrustedModelManif
         });
     }
     Some(prepared)
+}
+
+/// M4b: build the per-table aggregate multiplicity column from the already
+/// prepared per-member multiplicity aux. Works for Lookup/Softmax (exp) and
+/// norm rsqrt members alike.
+fn prepare_lookup_group_aux_from(prepared: &[PreparedAux], ops: &[Op],
+    model: &TrustedModelManifest) -> Option<Vec<PreparedAux>>
+{
+    let groups = static_lookup_groups(ops, model)?;
+    let mut out = Vec::new();
+    for (tid, members) in groups {
+        let table_len = *model.lookup_lengths.get(&tid)?;
+        if table_len == 0 { return None; }
+        let padded = table_len.checked_next_power_of_two()?.max(32);
+        let arity = padded.trailing_zeros() as usize;
+        let mut m = vec![Goldilocks::ZERO; padded];
+        let mut seen_arity = None;
+        for &oi in &members {
+            let role = lookup_member_mult_role(&ops[oi])?;
+            let ma = prepared.iter().find(|p| p.descriptor.op_index == oi
+                && p.descriptor.role == role)?;
+            if ma.descriptor.len != table_len || ma.descriptor.columns != 1
+                || ma.columns.len() != 1 || ma.columns[0].len() != padded { return None; }
+            if let Some(a) = seen_arity { if a != ma.descriptor.arity { return None; } }
+            seen_arity = Some(ma.descriptor.arity);
+            for (dst, &src) in m.iter_mut().zip(&ma.columns[0]) {
+                *dst += src;
+            }
+        }
+        let vars = padded.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, VERIFIER_SECURITY);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+        let refs: [&[Goldilocks]; 1] = [m.as_slice()];
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        out.push(PreparedAux {
+            descriptor: AuxDescriptor { op_index: members[0],
+                role: AuxRole::LookupMultiplicityAgg, len: table_len, arity, columns: 1,
+                commitment },
+            columns: vec![m], prover_data, protocol, whir,
+        });
+    }
+    Some(out)
 }
 
 /// GeluIndex (project ②): one precommitted 25-bit range witness per op,
@@ -9047,13 +9315,17 @@ pub fn opening_upper_bound(ops: &[Op], model: &TrustedModelManifest)
     let plan = build_aux_plan(ops, model)?;
     let aux_groups = plan.groups.len();
     let internal_tables = internal_lookup_member_counts(ops, model).len();
-    let lookup_groups = static_lookup_groups(ops, model)?.len();
+    let lookup_groups = static_lookup_groups(ops, model)?;
+    // M4b: one aggregate-column opening per shared group; a PCS table
+    // opening only for B groups (A groups are digest-anchored).
+    let group_openings = lookup_groups.len()
+        + lookup_groups.keys().filter(|id| !model.a_tables.contains_key(id)).count();
     // S6 selector openings: ONE batch opening per Argmax op (its m points are
     // claims of that single opening), not m openings.
     let sel: usize = ops.iter().filter(|op| matches!(op, Op::Argmax { .. })).count();
     let mut total = aux_groups;
     total = total.checked_add(internal_tables)?;
-    total = total.checked_add(lookup_groups.checked_mul(2)?)?;
+    total = total.checked_add(group_openings)?;
     total = total.checked_add(sel)?;
     total = total.checked_add(1)?; // token binding (upper bound)
     total = total.checked_add(model.batches.len())?;
@@ -9434,10 +9706,14 @@ fn prove_lookup_groups(
         // else the padded store table (root checked). The opening is produced
         // once; step (b) copies it into every member's Lookup proof, step (c)
         // will keep a single group-level copy.
-        let cached = store.static_table_commits.get(&tid);
+        let a_values = model.a_table_values(tid);
+        let cached = if a_values.is_none() { store.static_table_commits.get(&tid) } else { None };
         let owned: Option<Vec<Goldilocks>>;
         let table_values: &[Goldilocks];
-        if let Some((values, _committed)) = cached {
+        if let Some(values) = a_values {
+            table_values = values;
+            if table_values.len() != padded { return None; }
+        } else if let Some((values, _committed)) = cached {
             table_values = values.as_slice();
             if table_values.len() != padded { return None; }
         } else {
@@ -9455,7 +9731,8 @@ fn prove_lookup_groups(
         let mut mles: Vec<&[Ef]> = vec![&eq, &m_aux_col];
         let mut member_cols: Vec<Vec<Ef>> = Vec::with_capacity(members.len());
         for &oi in &members {
-            let ma = aux.get(&(oi, AuxRole::LookupMultiplicity))?;
+            let role = lookup_member_mult_role(&ops[oi])?;
+            let ma = aux.get(&(oi, role))?;
             if ma.descriptor.len != table_len || ma.descriptor.arity != arity || ma.columns.len() != 1
                 || ma.columns[0].len() != padded { return None; }
             member_cols.push(ef_lift(&ma.columns[0]));
@@ -9488,25 +9765,31 @@ fn prove_lookup_groups(
         let aggregate_opening = open_aux(m_aux, &[0, 0],
             &[identity_point.clone(), t_num_point.clone()],
             &[identity.final_evals[1], t_num])?;
-        let (table_opening, opened) = match cached {
-            Some((_, committed)) => {
-                let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY,
-                    zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY));
-                whir.open_ef(committed.prover_data.clone(), &committed.protocol, &t_den_point)
-            }
-            None => {
-                let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
-                let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
-                let committed = zkie_core::pcs::committed::commit(&whir, table_values);
-                if bincode::serialize(&committed.commitment).ok()?
-                    != bincode::serialize(model.lookup_roots.get(&tid)?).ok()? { return None; }
-                store.o7_table_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
-                whir.open_ef(committed.prover_data, &committed.protocol, &t_den_point)
-            }
+        let table_opening = if a_values.is_some() {
+            // A table: digest-verified values, no PCS table opening.
+            None
+        } else {
+            let (opening, opened) = match cached {
+                Some((_, committed)) => {
+                    let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY,
+                        zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY));
+                    whir.open_ef(committed.prover_data.clone(), &committed.protocol, &t_den_point)
+                }
+                None => {
+                    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, VERIFIER_SECURITY);
+                    let whir = zkie_core::pcs::whir::Whir::with_params(arity, VERIFIER_SECURITY, pow);
+                    let committed = zkie_core::pcs::committed::commit(&whir, table_values);
+                    if bincode::serialize(&committed.commitment).ok()?
+                        != bincode::serialize(model.lookup_roots.get(&tid)?).ok()? { return None; }
+                    store.o7_table_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    store.o7_table_scan_bytes.fetch_add(table_bytes, std::sync::atomic::Ordering::Relaxed);
+                    whir.open_ef(committed.prover_data, &committed.protocol, &t_den_point)
+                }
+            };
+            if opened != table_eval { return None; }
+            store.o7_table_openings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(opening)
         };
-        if opened != table_eval { return None; }
-        store.o7_table_openings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         proofs.push(LookupGroupProof {
             table_id: tid,
             members: members.clone(),
@@ -9578,10 +9861,15 @@ fn verify_lookup_groups(
         // Step (c): one table opening per group, at the shared denominator
         // leaf. The opened value is bound by the group leaf relation; the
         // table root comes from the trusted model, never from the proof.
-        let root = model.lookup_roots.get(&tid)?;
-        let whir = verifier_whir(arity)?;
-        let protocol = whir.opening_protocol(arity, 1);
-        let table_eval = whir.verify_ef(root, &gp.table_opening, &protocol, &tc.q_den).ok()?;
+        let table_eval = if model.a_table_values(tid).is_some() {
+            if gp.table_opening.is_some() { return None; }
+            model.eval_a_table(tid, &tc.q_den)?
+        } else {
+            let root = model.lookup_roots.get(&tid)?;
+            let whir = verifier_whir(arity)?;
+            let protocol = whir.opening_protocol(arity, 1);
+            whir.verify_ef(root, gp.table_opening.as_ref()?, &protocol, &tc.q_den).ok()?
+        };
         if tc.den_leaf != alpha + lookup_index_eval(&tc.q_den) + beta * table_eval { return None; }
         ctxs.insert(tid, LookupGroupVerifyCtx {
             alpha, beta, members,
@@ -10432,14 +10720,28 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 let dynamic = op_field_writes(ops).contains(table);
                 if dynamic { return None; } // static exp table only for now
                 let model = model?;
-                let (proof, incoming) = prove_reverse_softmax(
+                let group_member = match group_ctxs.get(table) {
+                    Some(ctx) => {
+                        let pos = ctx.members.iter().position(|&m| m == op_index)?;
+                        Some(LookupGroupMemberProve {
+                            alpha: ctx.alpha, beta: ctx.beta,
+                            identity_point: &ctx.identity_point,
+                            member_eval: *ctx.member_evals.get(pos)?,
+                            table_eval: ctx.table_eval,
+                        })
+                    }
+                    None => None,
+                };
+                let grouped = group_member.is_some();
+                let (proof, incoming, roots) = prove_reverse_softmax(
                     store, op, &point, value,
                     aux.remove(&(op_index, AuxRole::LookupPairs))?,
                     aux.remove(&(op_index, AuxRole::LookupMultiplicity))?,
                     aux.remove(&(op_index, AuxRole::SoftmaxSum))?,
                     aux.remove(&(op_index, AuxRole::SoftmaxRemainder))?,
                     aux.remove(&(op_index, AuxRole::SoftmaxOut))?,
-                    model, dynamic, transcript, aux_rec.as_deref_mut())?;
+                    model, dynamic, group_member, transcript, aux_rec.as_deref_mut())?;
+                if grouped { group_roots.entry(*table).or_default().push(roots); }
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -10456,7 +10758,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                 }
                 ReverseReduction::StableSoftmaxIndex { proof }
             }
-            Op::RmsNorm { .. } => {
+            Op::RmsNorm { rsqrt_table, .. } => {
                 let mut take = |role: AuxRole| aux.remove(&(op_index, role));
                 let auxp = RmsAux {
                     row: take(AuxRole::RmsNormRowWitness)?,
@@ -10472,16 +10774,36 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                     out_limb_hi_pairs: take(AuxRole::RmsNormOutLimbHiPairs)?,
                     out_limb_hi_mult: take(AuxRole::RmsNormOutLimbHiMultiplicity)?,
                 };
-                let (proof, incoming) = prove_reverse_rms_norm(
-                    store, op, &point, value, auxp, model?, transcript,
-                    aux_rec.as_deref_mut())?;
+                let group_member = match group_ctxs.get(rsqrt_table) {
+                    Some(ctx) => {
+                        let pos = ctx.members.iter().position(|&m| m == op_index)?;
+                        Some(LookupGroupMemberProve {
+                            alpha: ctx.alpha, beta: ctx.beta,
+                            identity_point: &ctx.identity_point,
+                            member_eval: *ctx.member_evals.get(pos)?,
+                            table_eval: ctx.table_eval,
+                        })
+                    }
+                    None => None,
+                };
+                let grouped = group_member.is_some();
+                let (proof, incoming, roots) = match group_member {
+                    Some(g) => prove_reverse_rms_norm_grouped(store, op, &point, value,
+                        auxp, model?, g, transcript, aux_rec.as_deref_mut())?,
+                    None => {
+                        let (p, c) = prove_reverse_rms_norm(store, op, &point, value,
+                            auxp, model?, transcript, aux_rec.as_deref_mut())?;
+                        (p, c, (Ef::ZERO, Ef::ZERO))
+                    }
+                };
+                if grouped { group_roots.entry(*rsqrt_table).or_default().push(roots); }
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
                 ReverseReduction::RmsNorm { proof }
             }
-            Op::LayerNormCentered { .. } => {
+            Op::LayerNormCentered { rsqrt_table, .. } => {
                 let mut take = |role: AuxRole| aux.remove(&(op_index, role));
                 let auxp = LncAux {
                     row: take(AuxRole::LncRowWitness)?,
@@ -10489,9 +10811,29 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EfClaim], transcr
                     rsqrt_pairs: take(AuxRole::LncRsqrtPairs)?,
                     rsqrt_mult: take(AuxRole::LncRsqrtMultiplicity)?,
                 };
-                let (proof, incoming) = prove_reverse_lnc(
-                    store, op, &point, value, auxp, model?, transcript,
-                    aux_rec.as_deref_mut())?;
+                let group_member = match group_ctxs.get(rsqrt_table) {
+                    Some(ctx) => {
+                        let pos = ctx.members.iter().position(|&m| m == op_index)?;
+                        Some(LookupGroupMemberProve {
+                            alpha: ctx.alpha, beta: ctx.beta,
+                            identity_point: &ctx.identity_point,
+                            member_eval: *ctx.member_evals.get(pos)?,
+                            table_eval: ctx.table_eval,
+                        })
+                    }
+                    None => None,
+                };
+                let grouped = group_member.is_some();
+                let (proof, incoming, roots) = match group_member {
+                    Some(g) => prove_reverse_lnc_grouped(store, op, &point, value,
+                        auxp, model?, g, transcript, aux_rec.as_deref_mut())?,
+                    None => {
+                        let (p, c) = prove_reverse_lnc(store, op, &point, value,
+                            auxp, model?, transcript, aux_rec.as_deref_mut())?;
+                        (p, c, (Ef::ZERO, Ef::ZERO))
+                    }
+                };
+                if grouped { group_roots.entry(*rsqrt_table).or_default().push(roots); }
                 for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
@@ -10879,8 +11221,23 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                 let sum_aux = find(AuxRole::SoftmaxSum)?;
                 let rem_aux = find(AuxRole::SoftmaxRemainder)?;
                 let out_aux = find(AuxRole::SoftmaxOut)?;
-                for c in verify_reverse_softmax(op, &point, value, pairs, mult, sum_aux, rem_aux,
-                    out_aux, model, dynamic, proof, transcript, aux_rec.as_deref_mut())? {
+                let group_member = match group_ctxs.get(table) {
+                    Some(ctx) => {
+                        let pos = ctx.members.iter().position(|&m| m == op_index)?;
+                        Some(LookupGroupMemberVerify {
+                            alpha: ctx.alpha, beta: ctx.beta,
+                            identity_point: &ctx.identity_point,
+                            member_eval: *ctx.member_evals.get(pos)?,
+                            table_eval: ctx.table_eval,
+                        })
+                    }
+                    None => None,
+                };
+                let grouped = group_member.is_some();
+                let (incoming, roots) = verify_reverse_softmax(op, &point, value, pairs, mult, sum_aux, rem_aux,
+                    out_aux, model, dynamic, group_member, proof, transcript, aux_rec.as_deref_mut())?;
+                if grouped { group_roots.entry(*table).or_default().push(roots); }
+                for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -10894,7 +11251,7 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
             }
-            (Op::RmsNorm { .. }, ReverseReduction::RmsNorm { proof }) => {
+            (Op::RmsNorm { rsqrt_table, .. }, ReverseReduction::RmsNorm { proof }) => {
                 let find = |role: AuxRole| aux.iter().find(|a| a.op_index == op_index && a.role == role);
                 let refs = RmsAuxRefs {
                     row: find(AuxRole::RmsNormRowWitness)?,
@@ -10910,13 +11267,32 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                     out_limb_hi_pairs: find(AuxRole::RmsNormOutLimbHiPairs)?,
                     out_limb_hi_mult: find(AuxRole::RmsNormOutLimbHiMultiplicity)?,
                 };
-                for c in verify_reverse_rms_norm(op, &point, value, refs, model?, proof,
-                    transcript, aux_rec.as_deref_mut())? {
+                let group_member = match group_ctxs.get(rsqrt_table) {
+                    Some(ctx) => {
+                        let pos = ctx.members.iter().position(|&m| m == op_index)?;
+                        Some(LookupGroupMemberVerify {
+                            alpha: ctx.alpha, beta: ctx.beta,
+                            identity_point: &ctx.identity_point,
+                            member_eval: *ctx.member_evals.get(pos)?,
+                            table_eval: ctx.table_eval,
+                        })
+                    }
+                    None => None,
+                };
+                let grouped = group_member.is_some();
+                let (incoming, roots) = match group_member {
+                    Some(g) => verify_reverse_rms_norm_grouped(op, &point, value, refs,
+                        model?, g, proof, transcript, aux_rec.as_deref_mut())?,
+                    None => (verify_reverse_rms_norm(op, &point, value, refs, model?, proof,
+                        transcript, aux_rec.as_deref_mut())?, (Ef::ZERO, Ef::ZERO)),
+                };
+                if grouped { group_roots.entry(*rsqrt_table).or_default().push(roots); }
+                for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
             }
-            (Op::LayerNormCentered { .. }, ReverseReduction::Lnc { proof }) => {
+            (Op::LayerNormCentered { rsqrt_table, .. }, ReverseReduction::Lnc { proof }) => {
                 let find = |role: AuxRole| aux.iter().find(|a| a.op_index == op_index && a.role == role);
                 let refs = LncAuxRefs {
                     row: find(AuxRole::LncRowWitness)?,
@@ -10924,8 +11300,27 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
                     rsqrt_pairs: find(AuxRole::LncRsqrtPairs)?,
                     rsqrt_mult: find(AuxRole::LncRsqrtMultiplicity)?,
                 };
-                for c in verify_reverse_lnc(op, &point, value, refs, model?, proof,
-                    transcript, aux_rec.as_deref_mut())? {
+                let group_member = match group_ctxs.get(rsqrt_table) {
+                    Some(ctx) => {
+                        let pos = ctx.members.iter().position(|&m| m == op_index)?;
+                        Some(LookupGroupMemberVerify {
+                            alpha: ctx.alpha, beta: ctx.beta,
+                            identity_point: &ctx.identity_point,
+                            member_eval: *ctx.member_evals.get(pos)?,
+                            table_eval: ctx.table_eval,
+                        })
+                    }
+                    None => None,
+                };
+                let grouped = group_member.is_some();
+                let (incoming, roots) = match group_member {
+                    Some(g) => verify_reverse_lnc_grouped(op, &point, value, refs,
+                        model?, g, proof, transcript, aux_rec.as_deref_mut())?,
+                    None => (verify_reverse_lnc(op, &point, value, refs, model?, proof,
+                        transcript, aux_rec.as_deref_mut())?, (Ef::ZERO, Ef::ZERO)),
+                };
+                if grouped { group_roots.entry(*rsqrt_table).or_default().push(roots); }
+                for c in incoming {
                     absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                     claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 }
@@ -17757,7 +18152,10 @@ fn prepare_all_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest)
     prepared.extend(step!("expert_routing", prepare_expert_routing_aux(store, ops)?));
     prepared.extend(step!("gather_routing", prepare_gather_routing_aux(store, ops, model)?));
     prepared.extend(step!("lookup", prepare_lookup_aux(store, ops, model)?));
-    prepared.extend(step!("lookup_group", prepare_lookup_group_aux(store, ops, model)?));
+    // M4b group aggregate is built from all member multiplicity aux, so it
+    // runs after every member stage.
+    let group_aux = step!("lookup_group", prepare_lookup_group_aux_from(&prepared, ops, model)?);
+    prepared.extend(group_aux);
     prepared.extend(step!("gelu_range", prepare_gelu_range_aux(store, ops, model)?));
     prepared.extend(step!("relu_bits", prepare_relu_bits_aux(store, ops, model)?));
     prepared.extend(step!("topk", prepare_topk_aux(store, ops)?));
@@ -18366,7 +18764,7 @@ fn proof_budget(proof: &BoundExecutionProof, aux: &[AuxDescriptor],
                     // Aggregate column at [identity, table leaf]: two claims.
                     b.opening(&g.aggregate_opening, 2)?;
                     b.fractional(&g.table)?;
-                    b.base_opening()?;
+                    if g.table_opening.is_some() { b.base_opening()?; }
                 }
             }
             ReverseReduction::Add { .. }
@@ -20518,7 +20916,9 @@ mod tests {
         let digests = [(table, digest)].into_iter().collect();
         LoadedATables { entries, values, digests }.install(&mut model).expect("install A");
         assert!(!model.lookup_roots.contains_key(&table), "A root must be removed");
-        assert!(static_lookup_groups(&ops, &model).unwrap().is_empty());
+        let groups = static_lookup_groups(&ops, &model).unwrap();
+        assert_eq!(groups.len(), 1, "A lookup joins the shared M4b group");
+        assert!(groups.contains_key(&table));
         assert!(internal_lookup_member_counts(&ops, &model).is_empty());
         let execution = TrustedExecution {
             inputs: [(x, store.get(x).to_vec())].into(),
@@ -20527,6 +20927,9 @@ mod tests {
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0,
             &PublicStatement::Generic, &model, &execution).expect("A lookup proof");
         assert!(proof.internal_table_openings.is_empty(), "A table must not open");
+        let groups = static_lookup_groups(&ops, &model).unwrap();
+        assert_eq!(groups.len(), 1, "A lookup joins the shared M4b group");
+        assert!(groups.contains_key(&table));
         assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof,
             &PublicStatement::Generic, &model, &execution));
 
@@ -28065,18 +28468,18 @@ mod tests {
                 sum_aux.descriptor.clone(), rem_aux.descriptor.clone(),
                 out_aux.descriptor.clone()];
             let mut tp = Transcript::new(b"softmax-window-measured");
-            let (proof, _claims) = prove_reverse_softmax(
+            let (proof, _claims, _roots) = prove_reverse_softmax(
                 &store, &ops[0], &point, value, pairs, mult, sum_aux, rem_aux,
-                out_aux, &model, false, &mut tp, None).expect("window proof");
+                out_aux, &model, false, None, &mut tp, None).expect("window proof");
             let mut tv = Transcript::new(b"softmax-window-measured");
             let ok = verify_reverse_softmax(&ops[0], &point, value, &descs[0],
-                &descs[1], &descs[2], &descs[3], &descs[4], &model, false,
+                &descs[1], &descs[2], &descs[3], &descs[4], &model, false, None,
                 &proof, &mut tv, None).is_some();
             if !ok { return false; }
             // Forged caller value must still be rejected.
             let mut tv = Transcript::new(b"softmax-window-measured");
             verify_reverse_softmax(&ops[0], &point, value + Ef::ONE, &descs[0],
-                &descs[1], &descs[2], &descs[3], &descs[4], &model, false,
+                &descs[1], &descs[2], &descs[3], &descs[4], &model, false, None,
                 &proof, &mut tv, None).is_none()
         }
         let (m, n) = (4usize, 8usize);
@@ -28156,33 +28559,33 @@ mod tests {
             sum_aux.descriptor.clone(), rem_aux.descriptor.clone(),
             out_aux.descriptor.clone()];
         let mut tp = Transcript::new(b"b1-softmax");
-        let (proof, claims) = prove_reverse_softmax(
+        let (proof, claims, _roots) = prove_reverse_softmax(
             &store, &ops[0], &point, value, pairs, mult, sum_aux, rem_aux, out_aux,
-            &model, false, &mut tp, None).unwrap();
+            &model, false, None, &mut tp, None).unwrap();
         assert_eq!(claims.len(), 1, "static Softmax returns the idx claim");
         let mut tv = Transcript::new(b"b1-softmax");
         let got = verify_reverse_softmax(
             &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
-            &model, false, &proof, &mut tv, None);
+            &model, false, None, &proof, &mut tv, None);
         assert!(got.is_some(), "honest Softmax must verify");
         let mut tv = Transcript::new(b"b1-softmax");
         assert!(verify_reverse_softmax(
             &ops[0], &point, value + Ef::ONE, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
-            &model, false, &proof, &mut tv, None).is_none());
+            &model, false, None, &proof, &mut tv, None).is_none());
         let mut bad: ReverseSoftmaxProof =
             bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
         bad.row_sum.final_evals[1] += Ef::ONE;
         let mut tv = Transcript::new(b"b1-softmax");
         assert!(verify_reverse_softmax(
             &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
-            &model, false, &bad, &mut tv, None).is_none());
+            &model, false, None, &bad, &mut tv, None).is_none());
         let mut bad: ReverseSoftmaxProof =
             bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
         bad.rescale.final_evals[4] += Ef::ONE;
         let mut tv = Transcript::new(b"b1-softmax");
         assert!(verify_reverse_softmax(
             &ops[0], &point, value, &descs[0], &descs[1], &descs[2], &descs[3], &descs[4],
-            &model, false, &bad, &mut tv, None).is_none());
+            &model, false, None, &bad, &mut tv, None).is_none());
 
         // Bound bytes entry: idx is the only execution input; out the output.
         let execution = TrustedExecution {
@@ -28240,9 +28643,9 @@ mod tests {
         let sum_aux = take(&mut sa, AuxRole::SoftmaxSum);
         let rem_aux = take(&mut sa, AuxRole::SoftmaxRemainder);
         let mut tp = Transcript::new(b"audit-softmax");
-        let (proof, _claims) = prove_reverse_softmax(
+        let (proof, _claims, _roots) = prove_reverse_softmax(
             &store, &ops[0], &point, genuine, pairs, mult, sum_aux, rem_aux, out_aux,
-            &model, false, &mut tp, None).expect("honest proof");
+            &model, false, None, &mut tp, None).expect("honest proof");
         let mut tp = Transcript::new(b"audit-softmax");
         tp.absorb(&bincode::serialize(&out_commit).unwrap());
         tp.absorb(b"zkie-softmax-v1");
@@ -28288,7 +28691,7 @@ mod tests {
         let rd = take(&mut sa2, AuxRole::SoftmaxRemainder).descriptor;
         let mut tv = Transcript::new(b"audit-softmax");
         let got = verify_reverse_softmax(&ops[0], &point, forged, &pd, &md, &sd, &rd,
-            &outd, &model, false, &forged_proof, &mut tv, None);
+            &outd, &model, false, None, &forged_proof, &mut tv, None);
         assert!(got.is_none(),
             "AUDIT FAILURE: forged Softmax output claim was ACCEPTED");
     }
@@ -28904,8 +29307,8 @@ mod tests {
         let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir,
             &cached, 0, 0, &PublicStatement::Generic, &model, &execution)
             .expect("M4 shared-table bound proof");
-        assert_eq!(proof.internal_table_openings.len(), 1,
-            "one batch opening per shared rsqrt table");
+        assert_eq!(proof.internal_table_openings.len(), 0,
+            "M4b: shared rsqrt joins the group; no per-table batch opening");
         let budget = proof_budget(&proof, &proof.aux, &ops, &model).expect("budget");
         let ub = opening_upper_bound(&ops, &model).expect("upper bound");
         assert!(budget.openings <= ub,
@@ -28925,10 +29328,17 @@ mod tests {
             &PublicStatement::Generic, &model, &execution),
             "M4 shared-table proof must verify");
         let mut bad = proof;
-        bad.internal_table_openings[0].proof.evals[0] += Ef::ONE;
+        let mut hit = false;
+        for step in &mut bad.reverse.steps {
+            if let ReverseReduction::LookupGroups { groups } = &mut step.reduction {
+                groups[0].identity.final_evals[0] += Ef::ONE;
+                hit = true;
+            }
+        }
+        assert!(hit, "LNC rsqrt must be in the shared group proof");
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad,
             &PublicStatement::Generic, &model, &execution),
-            "tampered per-table batch opening must be rejected");
+            "tampered shared rsqrt group must be rejected");
     }
 
     /// M4: two Softmax ops sharing one exp table produce one batch table
@@ -28972,8 +29382,8 @@ mod tests {
             &cached, 0, 0, &PublicStatement::Generic, &model, &execution)
             .expect("M4 softmax shared-table bound proof");
         eprintln!("M4 softmax table openings = {}", proof.internal_table_openings.len());
-        assert_eq!(proof.internal_table_openings.len(), 1,
-            "one batch opening per shared exp table");
+        assert_eq!(proof.internal_table_openings.len(), 0,
+            "M4b: Softmax exp joins the shared group; no per-table batch opening");
         let budget = proof_budget(&proof, &proof.aux, &ops, &model).expect("budget");
         assert!(budget.openings <= MAX_EFFECTIVE_OPENINGS,
             "M4 softmax shared-table K={} exceeds cap", budget.openings);
@@ -28990,10 +29400,17 @@ mod tests {
             &PublicStatement::Generic, &model, &execution),
             "M4 softmax shared-table proof must verify");
         let mut bad = proof;
-        bad.internal_table_openings[0].proof.evals[0] += Ef::ONE;
+        let mut hit = false;
+        for step in &mut bad.reverse.steps {
+            if let ReverseReduction::LookupGroups { groups } = &mut step.reduction {
+                groups[0].identity.final_evals[0] += Ef::ONE;
+                hit = true;
+            }
+        }
+        assert!(hit, "Softmax exp must be in the shared group proof");
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &bad,
             &PublicStatement::Generic, &model, &execution),
-            "tampered Softmax per-table batch opening must be rejected");
+            "tampered shared exp group must be rejected");
     }
 
     /// P1 Phase 2: the Softmax exp table as an A table. The internal lookup
@@ -29027,7 +29444,9 @@ mod tests {
         let values = [(table, std::sync::Arc::new(table_vals.clone()))].into_iter().collect();
         let digests = [(table, digest)].into_iter().collect();
         LoadedATables { entries, values, digests }.install(&mut model).expect("install A");
-        assert!(static_lookup_groups(&ops, &model).unwrap().is_empty());
+        let groups = static_lookup_groups(&ops, &model).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups.contains_key(&table));
         assert!(internal_lookup_member_counts(&ops, &model).is_empty());
         let idx_g: Vec<Goldilocks> = store.idx[idx].iter()
             .map(|&x| Goldilocks::from_u64(x as u64)).collect();
@@ -29313,8 +29732,8 @@ mod tests {
             .map(|i| ef_u64(2 + i as u64)).collect();
         let forged_value = ef_eval(store.get(out), &point);
         let mut tp = Transcript::new(b"audit-lnc-rho");
-        let (proof, _claims) = prove_reverse_lnc_impl(
-            &store, &ops[0], &point, forged_value, auxp, &model, &mut tp,
+        let (proof, _claims, _roots) = prove_reverse_lnc_impl(
+            &store, &ops[0], &point, forged_value, auxp, &model, None, &mut tp,
             None, true, false).expect("forged rho proof");
         let refs = LncAuxRefs { row: &descs[0], out: &descs[1],
             rsqrt_pairs: &descs[2], rsqrt_mult: &descs[3] };
