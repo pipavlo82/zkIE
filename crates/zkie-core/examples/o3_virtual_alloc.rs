@@ -44,15 +44,38 @@ fn snapshot() -> (usize, usize) {
     (ALLOCS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed))
 }
 
-fn rss_kb() -> u64 {
+fn status_kb(key: &str) -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines()
-                .find(|l| l.starts_with("VmHWM:"))
+                .find(|l| l.starts_with(key))
                 .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
         })
         .unwrap_or(0)
+}
+
+fn rss_kb() -> u64 { status_kb("VmHWM:") }
+fn rss_now_kb() -> u64 { status_kb("VmRSS:") }
+
+fn clock_ticks() -> f64 {
+    std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(100.0)
+}
+
+/// Process CPU time (user+system) in milliseconds, from /proc on Linux.
+fn cpu_ms() -> f64 {
+    let tck = clock_ticks();
+    let Ok(s) = std::fs::read_to_string("/proc/self/stat") else { return 0.0; };
+    let t = s.replace(')', " ");
+    let f: Vec<&str> = t.split_whitespace().collect();
+    let utime: f64 = f.get(13).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let stime: f64 = f.get(14).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    (utime + stime) * 1000.0 / tck
 }
 
 /// Pre-O3 implementation: `map` allocates one Vec per element pair.
@@ -154,37 +177,51 @@ fn main() {
         let _ = reference_virtual(&mles, &terms, claimed, &mut t);
     }
 
+    let rss0 = rss_now_kb();
+    let cpu0 = cpu_ms();
     let (a0, b0) = snapshot();
     let t0 = std::time::Instant::now();
     let mut ts = Transcript::new(b"o3-measure");
     let (opt, opt_ch) = prove_virtual(&mles, &terms, claimed, &mut ts);
-    let opt_ms = t0.elapsed().as_secs_f64() * 1e3;
     let (a1, b1) = snapshot();
+    let opt_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let opt_cpu_ms = cpu_ms() - cpu0;
+    let rss1 = rss_now_kb();
 
+    let rss2 = rss_now_kb();
+    let cpu1 = cpu_ms();
     let (a2, b2) = snapshot();
     let t1 = std::time::Instant::now();
     let mut ts = Transcript::new(b"o3-measure");
     let (rf, rf_ch) = reference_virtual(&mles, &terms, claimed, &mut ts);
-    let rf_ms = t1.elapsed().as_secs_f64() * 1e3;
     let (a3, b3) = snapshot();
+    let rf_ms = t1.elapsed().as_secs_f64() * 1e3;
+    let rf_cpu_ms = cpu_ms() - cpu1;
+    let rss3 = rss_now_kb();
 
     println!(
-        "O3 n={} terms={} threads={} optimized_allocs={} optimized_bytes={} optimized_ms={:.3}",
+        "O3 n={} terms={} threads={} optimized_allocs={} optimized_bytes={} optimized_ms={:.3} optimized_cpu_ms={:.3} rss_before_kb={} rss_after_kb={}",
         n,
         terms.len(),
         rayon::current_num_threads(),
         a1 - a0,
         b1 - b0,
-        opt_ms
+        opt_ms,
+        opt_cpu_ms,
+        rss0,
+        rss1
     );
     println!(
-        "O3 n={} terms={} threads={} reference_allocs={} reference_bytes={} reference_ms={:.3}",
+        "O3 n={} terms={} threads={} reference_allocs={} reference_bytes={} reference_ms={:.3} reference_cpu_ms={:.3} rss_before_kb={} rss_after_kb={}",
         n,
         terms.len(),
         rayon::current_num_threads(),
         a3 - a2,
         b3 - b2,
-        rf_ms
+        rf_ms,
+        rf_cpu_ms,
+        rss2,
+        rss3
     );
     let opt_bytes = bincode::serialize(&opt).unwrap();
     let rf_bytes = bincode::serialize(&rf).unwrap();

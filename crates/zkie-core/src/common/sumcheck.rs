@@ -648,6 +648,56 @@ pub fn absorb_virtual_rounds(t: &mut Transcript, rounds: &[Vec<Goldilocks>]) {
     }
 }
 
+/// One virtual round's `max_deg+1` coefficient sums. Work is split into a
+/// bounded number of chunks; each chunk owns a fixed-length accumulator in
+/// `scratch`, and the chunk accumulators are reduced in order. `scratch` is
+/// allocated once by the caller and reused across rounds, so the round loop
+/// does not allocate per-worker accumulator vectors. Field addition is exact
+/// and associative, so the coefficients and transcript message order are
+/// unchanged.
+fn virtual_round_pvals(
+    bufs: &[Vec<Goldilocks>],
+    terms: &[(Goldilocks, Vec<usize>)],
+    half: usize,
+    max_deg: usize,
+    scratch: &mut [Goldilocks],
+) -> Vec<Goldilocks> {
+    let deg = max_deg + 1;
+    // Keep chunk accumulators on separate cache lines: a 4-8 field
+    // accumulator would otherwise let adjacent workers false-share.
+    let stride = ((deg + 15) / 16) * 16;
+    let target = rayon::current_num_threads().max(1) * 4;
+    let chunk_len = ((half + target - 1) / target).max(1);
+    let active = (half + chunk_len - 1) / chunk_len;
+    let scratch = &mut scratch[..active * stride];
+    scratch.fill(Goldilocks::ZERO);
+    scratch.par_chunks_mut(stride).enumerate().for_each(|(ci, acc)| {
+        let start = ci * chunk_len;
+        let end = ((ci + 1) * chunk_len).min(half);
+        for s in start..end {
+            for (coeff, idxs) in terms {
+                for k in 0..=max_deg {
+                    let mut prod = *coeff;
+                    for &j in idxs {
+                        let f0 = bufs[j][2 * s];
+                        let f1 = bufs[j][2 * s + 1];
+                        let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
+                        prod = prod * fk;
+                    }
+                    acc[k] = acc[k] + prod;
+                }
+            }
+        }
+    });
+    let mut pvals = vec![Goldilocks::ZERO; deg];
+    for acc in scratch.chunks(stride) {
+        for k in 0..deg {
+            pvals[k] = pvals[k] + acc[k];
+        }
+    }
+    pvals
+}
+
 /// Fiat-Shamir prove of the virtual polynomial sumcheck. Returns the proof and
 /// the assembled challenge point.
 pub fn prove_virtual(
@@ -668,43 +718,11 @@ pub fn prove_virtual(
     let mut bufs: Vec<Vec<Goldilocks>> = mles.iter().map(|m| m.to_vec()).collect();
     let mut rounds = Vec::with_capacity(t);
     let mut challenges = Vec::with_capacity(t);
+    let scratch_len = rayon::current_num_threads().max(1) * 4 * (((max_deg + 1 + 15) / 16) * 16);
+    let mut scratch = vec![Goldilocks::ZERO; scratch_len];
     for _ in 0..t {
         let half = bufs[0].len() / 2;
-        let min_len = (half / (rayon::current_num_threads().max(1) * 4)).max(1);
-        let pvals: Vec<Goldilocks> = (0..half)
-            .into_par_iter()
-            .with_min_len(min_len)
-            // O3: one reused accumulator per Rayon worker/chunk, not one Vec
-            // allocation per element pair. Field addition is exact and
-            // associative, so the round coefficients and the transcript
-            // messages are unchanged.
-            .fold(
-                || vec![Goldilocks::ZERO; max_deg + 1],
-                |mut p, s| {
-                    for (coeff, idxs) in terms {
-                        for k in 0..=max_deg {
-                            let mut prod = *coeff;
-                            for &j in idxs {
-                                let f0 = bufs[j][2 * s];
-                                let f1 = bufs[j][2 * s + 1];
-                                let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
-                                prod = prod * fk;
-                            }
-                            p[k] = p[k] + prod;
-                        }
-                    }
-                    p
-                },
-            )
-            .reduce(
-                || vec![Goldilocks::ZERO; max_deg + 1],
-                |mut a, b| {
-                    for i in 0..=max_deg {
-                        a[i] = a[i] + b[i];
-                    }
-                    a
-                },
-            );
+        let pvals = virtual_round_pvals(bufs.as_slice(), terms, half, max_deg, &mut scratch);
         for &p in &pvals {
             transcript.absorb_field(p);
         }
@@ -807,43 +825,11 @@ pub fn prove_virtual_with_challenges(
     let max_deg = terms.iter().map(|(_, idxs)| idxs.len()).max().unwrap_or(0);
     let mut bufs: Vec<Vec<Goldilocks>> = mles.iter().map(|m| m.to_vec()).collect();
     let mut rounds = Vec::with_capacity(t);
+    let scratch_len = rayon::current_num_threads().max(1) * 4 * (((max_deg + 1 + 15) / 16) * 16);
+    let mut scratch = vec![Goldilocks::ZERO; scratch_len];
     for &r in challenges {
         let half = bufs[0].len() / 2;
-        let min_len = (half / (rayon::current_num_threads().max(1) * 4)).max(1);
-        let pvals: Vec<Goldilocks> = (0..half)
-            .into_par_iter()
-            .with_min_len(min_len)
-            // O3: one reused accumulator per Rayon worker/chunk, not one Vec
-            // allocation per element pair. Field addition is exact and
-            // associative, so the round coefficients and the transcript
-            // messages are unchanged.
-            .fold(
-                || vec![Goldilocks::ZERO; max_deg + 1],
-                |mut p, s| {
-                    for (coeff, idxs) in terms {
-                        for k in 0..=max_deg {
-                            let mut prod = *coeff;
-                            for &j in idxs {
-                                let f0 = bufs[j][2 * s];
-                                let f1 = bufs[j][2 * s + 1];
-                                let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
-                                prod = prod * fk;
-                            }
-                            p[k] = p[k] + prod;
-                        }
-                    }
-                    p
-                },
-            )
-            .reduce(
-                || vec![Goldilocks::ZERO; max_deg + 1],
-                |mut a, b| {
-                    for i in 0..=max_deg {
-                        a[i] = a[i] + b[i];
-                    }
-                    a
-                },
-            );
+        let pvals = virtual_round_pvals(bufs.as_slice(), terms, half, max_deg, &mut scratch);
         rounds.push(pvals);
         bufs.par_iter_mut().for_each(|buf| {
             for s in 0..half {
@@ -1045,6 +1031,37 @@ mod virtual_tests {
         let rf2 = reference_virtual_with_challenges(&mles, &terms, claimed, &challenges);
         assert_eq!(bincode::serialize(&opt2).unwrap(), bincode::serialize(&rf2).unwrap(),
             "fixed-challenge fold proof must match the reference");
+    }
+
+    #[test]
+    fn virtual_thread_count_outputs_identical() {
+        let mut rng = XorShift64::new(0x0F3E);
+        let n = 1usize << 10;
+        let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let g: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let h: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let terms: Vec<(Goldilocks, Vec<usize>)> = vec![
+            (Goldilocks::from_u64(3), vec![0, 1]),
+            (from_i64(-2), vec![1, 2]),
+            (Goldilocks::ONE, vec![0, 1, 2]),
+        ];
+        let claimed: Goldilocks = (0..n)
+            .map(|i| Goldilocks::from_u64(3) * f[i] * g[i]
+                + from_i64(-2) * g[i] * h[i]
+                + f[i] * g[i] * h[i])
+            .sum();
+        let mles: Vec<&[Goldilocks]> = vec![&f, &g, &h];
+        let run = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(|| {
+                let mut t = Transcript::new(b"o3-thread-count");
+                prove_virtual(&mles, &terms, claimed, &mut t)
+            })
+        };
+        let (p1, ch1) = run(1);
+        let (p8, ch8) = run(8);
+        assert_eq!(bincode::serialize(&p1).unwrap(), bincode::serialize(&p8).unwrap());
+        assert_eq!(ch1, ch8);
     }
 
     #[test]
