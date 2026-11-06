@@ -18544,31 +18544,44 @@ fn lookup_collision_units(ops: &[Op], model: &TrustedModelManifest, aux: &[AuxDe
         .map(|a| a.len as u128)
         .max()
         .unwrap_or(2);
-    let mut total = 0u128;
-    // A static table used by several Lookup ops contributes one denominator
-    // set (M4b/O7 shared group); charge its length once, not once per member.
     let written = op_field_writes(ops);
-    let mut seen_static = std::collections::BTreeSet::new();
+    let groups = static_lookup_groups(ops, model)?;
+    let mut total = 0u128;
+    // Shared static group: one denominator set per table. Charge the table
+    // length once plus the sum of all member witness index lengths (the
+    // per-op `max(li, lt)` charge undercounts multi-member groups when
+    // li is small relative to lt).
+    for (tid, members) in &groups {
+        let kt = TensorKey::Field(*tid).encoded()?;
+        let lt = model.lookup_lengths.get(tid).copied()
+            .or_else(|| model.tensor_lengths.get(&kt).copied())
+            .map(|v| v as u128).unwrap_or(pairs_len);
+        let mut sum_li = 0u128;
+        for &oi in members {
+            let li = match &ops[oi] {
+                Op::Lookup { idx, .. } | Op::Softmax { idx, .. } => {
+                    let ki = TensorKey::Index(*idx).encoded()?;
+                    model.tensor_lengths.get(&ki).copied()
+                        .map(|v| v as u128).unwrap_or(pairs_len)
+                }
+                Op::LayerNormCentered { m, .. } | Op::RmsNorm { m, .. } => *m as u128,
+                _ => pairs_len,
+            };
+            sum_li = sum_li.checked_add(li)?;
+        }
+        total = total.checked_add(lt.checked_add(sum_li)?)?;
+    }
+    // Ungrouped/dynamic Lookup ops keep the per-op max(li, lt) charge.
     for op in ops {
         if let Op::Lookup { idx, table, .. } = op {
-            if !written.contains(table)
-                && !model.identity_tables.contains_key(table)
-                && !seen_static.insert(*table) { continue; }
+            if groups.contains_key(table) { continue; }
             let ki = TensorKey::Index(*idx).encoded()?;
             let kt = TensorKey::Field(*table).encoded()?;
-            // Index length: trusted manifest shape, else the precommitted
-            // pairs descriptor length (validated later).
             let li = model.tensor_lengths.get(&ki).copied()
-                .map(|v| v as u128)
-                .unwrap_or(pairs_len);
-            // Table length: field shape or the offline static-table length;
-            // fall back to the index length if the dynamic table shape is not
-            // materialized in the manifest (conservative for the usual
-            // index-length table; the op graph still pins dynamic shapes).
+                .map(|v| v as u128).unwrap_or(pairs_len);
             let lt = model.tensor_lengths.get(&kt).copied()
                 .or_else(|| model.lookup_lengths.get(&kt).copied())
-                .map(|v| v as u128)
-                .unwrap_or(li);
+                .map(|v| v as u128).unwrap_or(li);
             total = total.checked_add(li.max(lt).max(2))?;
         }
     }
