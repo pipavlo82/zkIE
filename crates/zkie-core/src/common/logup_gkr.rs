@@ -626,13 +626,14 @@ pub fn prove_lookup_witness_batch(
     prove_fractional(num, den, transcript)
 }
 
-pub fn prove_lookup_witness_batch_columns(
+/// Build the witness-side `x`/`y`/`num` columns without alpha/beta and
+/// without generating the fractional proof. Used by split commitment
+/// protocols: the caller commits these columns, derives alpha/beta, then
+/// builds the den column and generates the proof once.
+pub fn build_lookup_witness_batch_columns(
     xs: &[&[u32]],
     ys: &[&[Goldilocks]],
-    alpha: Goldilocks,
-    beta: Goldilocks,
-    transcript: &mut Transcript,
-) -> (FractionalProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>) {
+) -> (Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>) {
     assert_eq!(xs.len(), ys.len());
     let n: usize = xs.iter().map(|x| x.len()).sum();
     // WHIR folding factor 5 needs arity >= 5; pad tiny witnesses to 2^5.
@@ -640,7 +641,6 @@ pub fn prove_lookup_witness_batch_columns(
     let mut num = vec![Goldilocks::from_u64(0); total];
     let mut x_flat = vec![Goldilocks::from_u64(0); total];
     let mut y_flat = vec![Goldilocks::from_u64(0); total];
-    let mut den = vec![Goldilocks::from_u64(0); total];
     let mut pos = 0usize;
     for (x, y) in xs.iter().zip(ys.iter()) {
         for i in 0..x.len() {
@@ -650,6 +650,19 @@ pub fn prove_lookup_witness_batch_columns(
             pos += 1;
         }
     }
+    (x_flat, y_flat, num)
+}
+
+pub fn prove_lookup_witness_batch_columns(
+    xs: &[&[u32]],
+    ys: &[&[Goldilocks]],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    transcript: &mut Transcript,
+) -> (FractionalProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>) {
+    let (x_flat, y_flat, num) = build_lookup_witness_batch_columns(xs, ys);
+    let total = num.len();
+    let mut den = vec![Goldilocks::from_u64(0); total];
     for j in 0..total {
         den[j] = alpha + x_flat[j] + beta * y_flat[j];
     }
@@ -1720,6 +1733,22 @@ pub fn prove_permutation(
         alpha,
         a: a.to_vec(),
         b: b.to_vec(),
+    }
+}
+
+/// Witness-only permutation constructor for split commitment protocols.
+/// The `a`/`b` columns are fixed before the challenge is derived; a caller
+/// that commits them first fills `a_side`/`b_side`/`alpha` in its later
+/// challenge-dependent stage. The empty sides are a placeholder and must not
+/// be serialized as a final proof.
+pub fn permutation_witness(a: Vec<Goldilocks>, b: Vec<Goldilocks>) -> PermutationProof {
+    assert_eq!(a.len(), b.len());
+    PermutationProof {
+        a_side: FractionalProof { layers: Vec::new() },
+        b_side: FractionalProof { layers: Vec::new() },
+        alpha: Goldilocks::ZERO,
+        a,
+        b,
     }
 }
 

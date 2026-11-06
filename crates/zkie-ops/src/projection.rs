@@ -54,9 +54,40 @@ pub fn prove_projection(
     shift: u32,
     transcript: &mut Transcript,
 ) -> ProjectionProof {
+    prove_projection_with_h(x, w, bias, out, rem_off, m, k, n, shift, None, transcript)
+}
+
+/// Like [`prove_projection`], but reuses an `x @ w` product computed during
+/// the forward pass when the caller retained it. The cached value must be the
+/// exact bounded-fixed-point product for these inputs; the caller owns the
+/// lifetime/budget decision.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_projection_with_h(
+    x: &[Goldilocks],
+    w: &[Goldilocks],
+    bias: &[Goldilocks],
+    out: &[Goldilocks],
+    rem_off: &[Goldilocks],
+    m: usize,
+    k: usize,
+    n: usize,
+    shift: u32,
+    cached_h: Option<&[Goldilocks]>,
+    transcript: &mut Transcript,
+) -> ProjectionProof {
     let half = Goldilocks::from_u64(1u64 << (shift - 1));
     let two_shift = Goldilocks::from_u64(1u64 << shift);
-    let h = matmul_full(x, w, m, k, n);
+    let h_owned: Vec<Goldilocks>;
+    let h: &[Goldilocks] = match cached_h {
+        Some(h) => {
+            assert_eq!(h.len(), m * n, "cached Projection product shape");
+            h
+        }
+        None => {
+            h_owned = matmul_full(x, w, m, k, n);
+            h_owned.as_slice()
+        }
+    };
     let wt = transpose(x, m, k);
 
     // S1 ordering: the affine sumcheck runs FIRST. Its eq point is squeezed
@@ -76,13 +107,13 @@ pub fn prove_projection(
         (neg * two_shift, vec![0usize, 4usize]),
         (neg * half, vec![0usize, 5usize]),
     ];
-    let mles: Vec<&[Goldilocks]> = vec![&eq, &rem_off, &h, &out, &bias, &ones];
+    let mles: Vec<&[Goldilocks]> = vec![&eq, &rem_off, h, &out, &bias, &ones];
     let (affine, r_aff) = prove_virtual(&mles, &terms, Goldilocks::from_u64(0), transcript);
 
     let n_log = n.trailing_zeros() as usize;
     let v: Vec<Goldilocks> = r_aff[..n_log].to_vec();
     let u: Vec<Goldilocks> = r_aff[n_log..].to_vec();
-    let (matmul, ch) = matmul_prove(&wt, w, &h, m, k, n, &u, &v, transcript);
+    let (matmul, ch) = matmul_prove(&wt, w, h, m, k, n, &u, &v, transcript);
     let mut pt = v.clone();
     pt.extend_from_slice(&u);
 

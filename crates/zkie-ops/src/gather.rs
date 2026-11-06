@@ -60,33 +60,35 @@ pub fn prove_scatter_add(
     prove_scatter_add_with_mode(weighted, token_id, gate, out, m, h, transcript, crate::compose::FracMode::Plain)
 }
 
+/// The challenge-dependent Gather columns, built after `alpha`/`gamma` are
+/// derived from the transcript that binds the independent commitments.
+pub struct ScatterAddColumns {
+    pub num_source: Vec<Goldilocks>,
+    pub den_source: Vec<Goldilocks>,
+    pub num_target: Vec<Goldilocks>,
+    pub den_target: Vec<Goldilocks>,
+}
+
+/// Build `num_source`/`den_source`/`num_target`/`den_target` from an already
+/// derived `alpha`/`gamma`. This is deliberately separate from proving: the
+/// committed path commits the `alpha`/`gamma`-independent columns first,
+/// derives the challenges, and only then builds and commits these columns.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_scatter_add_with_mode(
+pub fn build_scatter_add_columns(
     weighted: &[Goldilocks],
     token_id: &[u32],
     gate: &[Goldilocks],
     out: &[Goldilocks],
     m: usize,
     h: usize,
-    transcript: &mut Transcript,
-    mode: crate::compose::FracMode,
-) -> ScatterAddProof {
+    alpha: Goldilocks,
+    gamma: &[Goldilocks],
+) -> ScatterAddColumns {
     let s = token_id.len();
     assert_eq!(weighted.len(), s * h);
     assert_eq!(gate.len(), s);
     assert_eq!(out.len(), m * h);
-    // Committed mode: alpha/gamma and the two fractional proofs are derived
-    // on a scratch transcript — the committed gather section re-proves them
-    // on its own transcript (binding the committed column roots), and the
-    // shard transcript must stay frac-free for the committed replay. The
-    // product sumchecks below always run on the caller's transcript.
-    let mut scratch = Transcript::new(b"zkie-scratch-gather");
-    let frac_ts: &mut Transcript = match mode {
-        crate::compose::FracMode::Plain => transcript,
-        crate::compose::FracMode::Committed => &mut scratch,
-    };
-    let alpha = frac_ts.field();
-    let gamma: Vec<Goldilocks> = frac_ts.field_vec(h);
+    assert_eq!(gamma.len(), h);
     // WHIR folding needs arity >= 5: pad the fractional domains (num=0 /
     // den=alpha padding contributes 0 to the logUp sum, so the roots
     // relation is unaffected).
@@ -115,9 +117,37 @@ pub fn prove_scatter_add_with_mode(
     for idx in m * h..tgt_total {
         den_target[idx] = alpha - Goldilocks::from_u64((idx >> h_log) as u64);
     }
-    let source_side = prove_fractional(num_source.clone(), den_source.clone(), frac_ts);
-    let target_side = prove_fractional(num_target.clone(), den_target.clone(), frac_ts);
+    ScatterAddColumns {
+        num_source,
+        den_source,
+        num_target,
+        den_target,
+    }
+}
 
+/// Product sumchecks for the Gather columns. They are generated only after
+/// the challenge-dependent columns have been committed (and therefore run on
+/// the committed transcript), so the early-challenge columns are never used
+/// to produce a proof.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_scatter_add_products(
+    weighted: &[Goldilocks],
+    token_id: &[u32],
+    gate: &[Goldilocks],
+    out: &[Goldilocks],
+    num_source: &[Goldilocks],
+    num_target: &[Goldilocks],
+    gamma: &[Goldilocks],
+    m: usize,
+    h: usize,
+    transcript: &mut Transcript,
+) -> (VirtualProof, Vec<Goldilocks>, VirtualProof, Vec<Goldilocks>) {
+    let s = token_id.len();
+    let src_total = (s * h).next_power_of_two().max(32);
+    let tgt_total = (m * h).next_power_of_two().max(32);
+    assert_eq!(gamma.len(), h);
+    assert_eq!(num_source.len(), src_total);
+    assert_eq!(num_target.len(), tgt_total);
     // Product check (source): num_source[pos*h+d] == gamma[d]*weighted[pos*h+d]*gate[pos].
     // The eq point is squeezed upfront (the eq table needs it); the sumcheck
     // challenges are derived per-round (S1) and stored as r_prod_source.
@@ -171,16 +201,83 @@ pub fn prove_scatter_add_with_mode(
         Goldilocks::ZERO,
         transcript,
     );
+    (prod_source, r_prod_source, prod_target, r_prod_target)
+}
 
+fn empty_fractional() -> FractionalProof {
+    FractionalProof { layers: Vec::new() }
+}
+
+fn empty_virtual() -> VirtualProof {
+    VirtualProof { rounds: Vec::new(), final_evals: Vec::new() }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_scatter_add_with_mode(
+    weighted: &[Goldilocks],
+    token_id: &[u32],
+    gate: &[Goldilocks],
+    out: &[Goldilocks],
+    m: usize,
+    h: usize,
+    transcript: &mut Transcript,
+    mode: crate::compose::FracMode,
+) -> ScatterAddProof {
+    let s = token_id.len();
+    assert_eq!(weighted.len(), s * h);
+    assert_eq!(gate.len(), s);
+    assert_eq!(out.len(), m * h);
+    if mode == crate::compose::FracMode::Committed {
+        // Witness-only stage: keep the alpha/gamma-independent columns. The
+        // committed section commits them, derives alpha/gamma, then builds
+        // and commits the dependent columns and generates the fractional and
+        // product proofs exactly once on the committed transcript. No proof
+        // is generated here (and therefore none is discarded).
+        return ScatterAddProof {
+            source_side: empty_fractional(),
+            target_side: empty_fractional(),
+            alpha: Goldilocks::ZERO,
+            gamma: Vec::new(),
+            num_source: Vec::new(),
+            den_source: Vec::new(),
+            num_target: Vec::new(),
+            den_target: Vec::new(),
+            prod_source: empty_virtual(),
+            prod_target: empty_virtual(),
+            r_prod_source: Vec::new(),
+            r_prod_target: Vec::new(),
+            weighted: weighted.to_vec(),
+            gate: gate.to_vec(),
+            out: out.to_vec(),
+            token_id: token_id.to_vec(),
+        };
+    }
+    let alpha = transcript.field();
+    let gamma: Vec<Goldilocks> = transcript.field_vec(h);
+    let cols = build_scatter_add_columns(weighted, token_id, gate, out, m, h, alpha, &gamma);
+    let source_side = prove_fractional(cols.num_source.clone(), cols.den_source.clone(), transcript);
+    let target_side = prove_fractional(cols.num_target.clone(), cols.den_target.clone(), transcript);
+    let (prod_source, r_prod_source, prod_target, r_prod_target) = prove_scatter_add_products(
+        weighted,
+        token_id,
+        gate,
+        out,
+        &cols.num_source,
+        &cols.num_target,
+        &gamma,
+        m,
+        h,
+        transcript,
+    );
     ScatterAddProof {
         source_side,
         target_side,
         alpha,
         gamma,
-        num_source,
-        den_source,
-        num_target,
-        den_target,
+        num_source: cols.num_source,
+        den_source: cols.den_source,
+        num_target: cols.num_target,
+        den_target: cols.den_target,
         prod_source,
         prod_target,
         r_prod_source,
@@ -201,32 +298,36 @@ pub fn verify_scatter_add_with_mode(
     transcript: &mut Transcript,
     mode: crate::compose::FracMode,
 ) -> bool {
-    // Plain: replay the alpha/gamma preamble, then the two fractional proofs.
-    // Committed: alpha/gamma and the fracs live on the committed gather
-    // transcript (never on this shard transcript), so nothing is replayed
-    // here; the committed gather section verifies them and compares the
-    // product final evals against the openings.
-    if mode == crate::compose::FracMode::Plain {
-        if transcript.field() != proof.alpha {
-            return false;
-        }
-        let gamma: Vec<Goldilocks> = transcript.field_vec(proof.gamma.len());
-        if gamma != proof.gamma {
-            return false;
-        }
-        // S3: each side's depth comes from its (padded, proof-carried)
-        // column length.
-        let t_src = proof.num_source.len().trailing_zeros() as usize;
-        let t_tgt = proof.num_target.len().trailing_zeros() as usize;
-        if !verify_lookup_split(
-            &proof.source_side,
-            &proof.target_side,
-            t_src,
-            t_tgt,
-            transcript,
-        ) {
-            return false;
-        }
+    // Plain: replay the alpha/gamma preamble, then the fractional and
+    // product proofs. Committed: the shard stage is witness-only; alpha/gamma
+    // and every final proof are generated on the committed gather transcript
+    // after its independent column roots are absorbed, so nothing is
+    // replayed on this shard transcript.
+    if mode != crate::compose::FracMode::Plain {
+        // Committed: the witness-only shard stage carries no frac/product
+        // proofs; every final proof is generated on the committed gather
+        // transcript after the independent roots are absorbed.
+        return true;
+    }
+    if transcript.field() != proof.alpha {
+        return false;
+    }
+    let gamma: Vec<Goldilocks> = transcript.field_vec(proof.gamma.len());
+    if gamma != proof.gamma {
+        return false;
+    }
+    // S3: each side's depth comes from its (padded, proof-carried)
+    // column length.
+    let t_src = proof.num_source.len().trailing_zeros() as usize;
+    let t_tgt = proof.num_target.len().trailing_zeros() as usize;
+    if !verify_lookup_split(
+        &proof.source_side,
+        &proof.target_side,
+        t_src,
+        t_tgt,
+        transcript,
+    ) {
+        return false;
     }
     // Product checks: sumcheck self-consistency on the stored final_evals.
     // The final_evals are authenticated by the committed openings. The eq

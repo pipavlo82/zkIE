@@ -64,12 +64,13 @@ pub fn prove_scatter_with_mode(
         .map(|(&t, &e)| Goldilocks::from_u64((t as usize * n + e as usize) as u64))
         .collect();
     let perm = match mode {
-        // Committed: the committed perm section re-proves the fracs on its
-        // own transcript (binding the committed column roots); here they run
-        // on a scratch transcript so the shard transcript stays frac-free.
+        // Committed: witness-only. The committed perm section commits the
+        // alpha-independent a/b columns, derives alpha from the resulting
+        // roots, and generates the two fractional proofs exactly once. No
+        // scratch proof is produced (and therefore none is discarded).
         crate::compose::FracMode::Committed => {
-            let mut scratch = Transcript::new(b"zkie-scratch-perm");
-            prove_permutation(&a, &b, &mut scratch)
+            let _ = transcript;
+            zkie_core::common::logup_gkr::permutation_witness(a, b)
         }
         crate::compose::FracMode::Plain => prove_permutation(&a, &b, transcript),
     };

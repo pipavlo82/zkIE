@@ -23,7 +23,7 @@ use crate::gather::{
     gather_forward, prove_scatter_add, prove_scatter_add_with_mode, verify_scatter_add,
     verify_scatter_add_with_mode, ScatterAddProof,
 };
-use crate::projection::{prove_projection, verify_projection, ProjectionProof};
+use crate::projection::{prove_projection, prove_projection_with_h, verify_projection, ProjectionProof};
 use crate::scatter::{
     prove_scatter, prove_scatter_with_mode, scatter_forward, verify_scatter,
     verify_scatter_with_mode, ScatterProof,
@@ -43,7 +43,8 @@ use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
 use zkie_core::common::logup_gkr::{
     prove_lookup_fractional, prove_lookup_fractional_batch, prove_lookup_fractional_columns,
     verify_lookup_fractional, verify_lookup_fractional_batch, verify_lookup_fractional_chain,
-    build_lookup_table_num_den, build_perm_num_den, fractional_leaf, merge_multiplicity, pad_table,
+    build_lookup_table_num_den, build_lookup_witness_batch_columns, build_perm_num_den,
+    fractional_leaf, merge_multiplicity, pad_table,
     prove_fractional, prove_lookup_table, prove_lookup_witness_batch_columns,
     verify_fractional_chain_core, verify_lookup_split, FractionalChainClaims, FractionalProof,
     prove_permutation, PermutationProof,
@@ -11542,11 +11543,11 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EfClaim], proof: &ReverseDagPro
 }
 
 /// Where the per-op fractional proofs (permutation / gather) run. On the
-/// plain shard path they live on the shard transcript; on the committed path
-/// they are re-proven on the committed transcripts (which bind the committed
-/// column roots), so the shard transcript must stay frac-free — the
-/// committed-mode shard proof runs them on a scratch transcript and the
-/// committed replay skips them.
+/// plain shard path they live on the shard transcript. On the committed path
+/// the shard stage is witness-only: it builds the alpha/gamma-independent
+/// columns and generates no fractional/product proof; after those columns are
+/// committed and the challenges derived, the committed section builds the
+/// dependent columns and generates each final proof exactly once.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FracMode {
     Plain,
@@ -12101,6 +12102,16 @@ pub struct Store {
     pub(crate) o6_fwd_mm: std::sync::atomic::AtomicU64,
     pub(crate) o6_proof_mm: std::sync::atomic::AtomicU64,
     pub(crate) o6_hits: std::sync::atomic::AtomicU64,
+    // O6 committed-path split counters: final permutation/gather fractional
+    // proofs, final gather product sumchecks, and plain proofs generated on
+    // a scratch transcript and then discarded. The latter must stay zero.
+    pub(crate) o6_perm_fracs: std::sync::atomic::AtomicU64,
+    pub(crate) o6_gather_fracs: std::sync::atomic::AtomicU64,
+    pub(crate) o6_gather_products: std::sync::atomic::AtomicU64,
+    pub(crate) o6_lookup_witness_fracs: std::sync::atomic::AtomicU64,
+    pub(crate) o6_lookup_table_fracs: std::sync::atomic::AtomicU64,
+    pub(crate) o6_discarded_fracs: std::sync::atomic::AtomicU64,
+    pub(crate) o6_discarded_frac_ns: std::sync::atomic::AtomicU64,
     /// O7: per-proof committed static lookup tables, keyed by the TRUSTED
     /// table tensor id. Same-id lookups share one Merkle tree/commitment;
     /// different ids are never merged even if their contents coincide.
@@ -12121,9 +12132,14 @@ impl Store {
     }
     /// O6: enable the bounded Projection `h = x @ w` cache for a bound
     /// prover. A zero budget disables it (baseline / memory-constrained).
+    /// Enabling starts a fresh shard lifetime: any product retained by a
+    /// previous proof is dropped, so a reused Store can never make the proof
+    /// consume a stale `x @ w`.
     pub fn enable_projection_cache(&mut self, budget_bytes: usize) {
         self.projection_cache_enabled = budget_bytes > 0;
         self.projection_cache_budget = budget_bytes;
+        self.projection_h.clear();
+        self.projection_h_bytes = 0;
     }
     /// O6 cache stats: `(cached tensors, cached bytes)`.
     pub fn projection_cache_stats(&self) -> (usize, usize) {
@@ -12145,6 +12161,35 @@ impl Store {
         self.o6_fwd_mm.store(0, Ordering::Relaxed);
         self.o6_proof_mm.store(0, Ordering::Relaxed);
         self.o6_hits.store(0, Ordering::Relaxed);
+    }
+    /// O6 committed-split metrics: `(final permutation fractional proofs,
+    /// final gather fractional proofs, final gather product sumchecks, final
+    /// lookup-witness fractional proofs, final lookup-table fractional
+    /// proofs, discarded scratch fractional proofs, discarded scratch time
+    /// ns)`. Honest committed proving generates each final subtask exactly
+    /// once and discards nothing.
+    pub fn o6_split_metrics(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.o6_perm_fracs.load(Ordering::Relaxed),
+            self.o6_gather_fracs.load(Ordering::Relaxed),
+            self.o6_gather_products.load(Ordering::Relaxed),
+            self.o6_lookup_witness_fracs.load(Ordering::Relaxed),
+            self.o6_lookup_table_fracs.load(Ordering::Relaxed),
+            self.o6_discarded_fracs.load(Ordering::Relaxed),
+            self.o6_discarded_frac_ns.load(Ordering::Relaxed),
+        )
+    }
+    /// Reset the O6 committed-split counters (measurement tooling).
+    pub fn o6_split_metrics_reset(&self) {
+        use std::sync::atomic::Ordering;
+        self.o6_perm_fracs.store(0, Ordering::Relaxed);
+        self.o6_gather_fracs.store(0, Ordering::Relaxed);
+        self.o6_gather_products.store(0, Ordering::Relaxed);
+        self.o6_lookup_witness_fracs.store(0, Ordering::Relaxed);
+        self.o6_lookup_table_fracs.store(0, Ordering::Relaxed);
+        self.o6_discarded_fracs.store(0, Ordering::Relaxed);
+        self.o6_discarded_frac_ns.store(0, Ordering::Relaxed);
     }
     /// O7 metrics: number of static lookup-table Merkle trees committed.
     pub fn o7_table_commits(&self) -> u64 {
@@ -13101,9 +13146,15 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[out] = TensorData::Owned(o);
                 store.v[rem] = TensorData::Owned(r);
                 // O6: retain the forward matmul product (bounded) so the
-                // reverse Projection proof does not recompute x@w.
-                if store.projection_cache_enabled && !store.projection_h.contains_key(&out) {
+                // reverse Projection proof does not recompute x@w. Always
+                // refresh an existing entry: a re-run forward must never let
+                // the proof consume a product from an earlier input.
+                if store.projection_cache_enabled {
                     let bytes = h.len() * std::mem::size_of::<Goldilocks>();
+                    if let Some(old) = store.projection_h.remove(&out) {
+                        store.projection_h_bytes =
+                            store.projection_h_bytes.saturating_sub(old.len() * std::mem::size_of::<Goldilocks>());
+                    }
                     if bytes <= store.projection_cache_budget.saturating_sub(store.projection_h_bytes) {
                         store.projection_h_bytes += bytes;
                         store.projection_h.insert(out, h);
@@ -13357,8 +13408,12 @@ pub fn prove_shard(
 /// serialized into [`OpShardProof`] — the shard-DAG and committed composers
 /// use them prover-side, while every verifier rebuilds its own claims from
 /// the op verifications. In [`FracMode::Committed`] the permutation/gather
-/// fractional proofs run on scratch transcripts (they are re-proven on the
-/// committed transcripts later), so the shard transcript stays frac-free.
+/// stage is witness-only: no proof is generated on the shard transcript.
+/// The committed section commits the independent columns, derives the
+/// challenges, then generates the dependent columns and final proofs once.
+/// In that mode the returned proof is a witness-only intermediate: the
+/// lookup/permutation/gather proof fields are placeholders that the committed
+/// stage fills before the proof is serialized.
 pub fn prove_shard_precomputed(
     store: &Store,
     ops: &[Op],
@@ -13766,7 +13821,16 @@ pub fn prove_shard_precomputed(
                 shift,
             } => {
                 let wv = store.materialize(w);
-                let p = prove_projection(
+                // O6: reuse the forward `x @ w` product when the caller
+                // enabled the bounded per-store cache; otherwise recompute it
+                // once here (controlled fallback under memory pressure).
+                let cached_h = store.projection_h.get(&out).map(Vec::as_slice);
+                if cached_h.is_some() {
+                    store.o6_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    store.o6_proof_mm.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let p = prove_projection_with_h(
                     store.get(x),
                     wv.as_ref(),
                     store.get(bias),
@@ -13776,6 +13840,7 @@ pub fn prove_shard_precomputed(
                     k,
                     n,
                     shift,
+                    cached_h,
                     transcript,
                 );
                 let mut in_pt = p.ch.clone();
@@ -14364,13 +14429,37 @@ pub fn prove_shard_precomputed(
     let mut witness_columns = Vec::new();
     let mut table_columns = Vec::new();
     for (table, lookups) in &lookup_by_table {
-        let alpha = transcript.field();
-        let beta = transcript.field();
         let xs: Vec<&[u32]> = lookups.iter().map(|(x, _)| x.as_slice()).collect();
         let ys: Vec<&[Goldilocks]> = lookups.iter().map(|(_, y)| y.as_slice()).collect();
+        let m = merge_multiplicity(&xs, store.get(*table).len());
+        if mode == FracMode::Committed {
+            // Witness-only: commit x/y/num and the multiplicity m first; the
+            // committed section derives alpha/beta after the roots are
+            // absorbed, builds the den columns, and generates the witness and
+            // table fractional proofs exactly once.
+            let (x, y, num) = build_lookup_witness_batch_columns(&xs, &ys);
+            witness_columns.push(WitnessColumn {
+                proof: FractionalProof { layers: Vec::new() },
+                x,
+                y,
+                num,
+                alpha: Goldilocks::ZERO,
+                beta: Goldilocks::ZERO,
+                table: *table,
+            });
+            table_columns.push(TableColumn {
+                proof: FractionalProof { layers: Vec::new() },
+                table: *table,
+                m,
+                alpha: Goldilocks::ZERO,
+                beta: Goldilocks::ZERO,
+            });
+            continue;
+        }
+        let alpha = transcript.field();
+        let beta = transcript.field();
         let (proof, x, y, num, _den) =
             prove_lookup_witness_batch_columns(&xs, &ys, alpha, beta, transcript);
-        let m = merge_multiplicity(&xs, store.get(*table).len());
         let table_proof = prove_lookup_table(&m, store.get(*table), alpha, beta, transcript);
         witness_columns.push(WitnessColumn {
             proof,
@@ -15170,8 +15259,9 @@ pub fn prove_shard_dag(
 /// Prove the shard DAG and also return the per-shard claim sets (S2): the
 /// shard proofs carry no claims — the DAG/committed composers consume these
 /// prover-side, while every verifier rebuilds its own. In
-/// [`FracMode::Committed`] the per-op permutation/gather fracs stay off the
-/// shard transcripts (they are re-proven on the committed transcripts).
+/// [`FracMode::Committed`] the per-op permutation/gather shard stage builds
+/// witness columns only; the final proofs are generated later, once, on the
+/// committed transcripts.
 fn prove_shard_dag_inner(
     store: &mut Store,
     ops: &[Op],
@@ -16432,9 +16522,18 @@ fn prove_committed_shard_dag_inner(
     argmax_t: T,
     extra_claims: &[EvalClaim],
 ) -> CommittedShardDagProof {
-    // Committed mode: the per-op perm/gather fracs stay off the shard
-    // transcripts (re-proven on the committed transcripts below); the shard
-    // claims come back separately (S2).
+    // O6: bounded Projection forward-product reuse for this shard lifetime.
+    // The committed path uses the same budget/fallback contract as the bound
+    // path: ZKIE_O6_CACHE_MB=0 disables retention and the proof recomputes.
+    let cache_mb = std::env::var("ZKIE_O6_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256);
+    store.enable_projection_cache(cache_mb.saturating_mul(1024 * 1024));
+    store.o6_split_metrics_reset();
+    // Committed mode: the shard stage builds witnesses only; the perm/gather
+    // fractional and product proofs are generated on the committed
+    // transcripts below, after their independent columns are committed.
     let (plain, shard_claims) = prove_shard_dag_inner(store, ops, ops_per_shard, FracMode::Committed);
     let boundary_tensors = plain.cross_tensors.clone();
 
@@ -16743,6 +16842,7 @@ fn prove_committed_shard_dag_inner(
                 den[j] = alpha + wc.x[j] + beta * wc.y[j];
             }
             let new_proof = prove_fractional(wc.num.clone(), den, &mut ts);
+            store.o6_lookup_witness_fracs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             wc.proof = new_proof;
             wc.alpha = alpha;
             wc.beta = beta;
@@ -16769,6 +16869,7 @@ fn prove_committed_shard_dag_inner(
                 den_t[j] = alpha + Goldilocks::from_u64(j as u64) + beta * table_pad[j];
             }
             let new_proof = prove_fractional(num_t, den_t, &mut ts);
+            store.o6_lookup_table_fracs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tc.proof = new_proof;
             tc.alpha = alpha;
             tc.beta = beta;
@@ -17173,6 +17274,7 @@ fn prove_committed_shard_dag_inner(
         let (num_b, den_b) = build_perm_num_den(&sp.perm.b, alpha);
         let new_a = prove_fractional(num_a, den_a, &mut perm_ts);
         let new_b = prove_fractional(num_b, den_b, &mut perm_ts);
+        store.o6_perm_fracs.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
         sp.perm.a_side = new_a;
         sp.perm.b_side = new_b;
         sp.perm.alpha = alpha;
@@ -17294,10 +17396,12 @@ fn prove_committed_shard_dag_inner(
             for (li, op) in ops[s..e].iter().enumerate() {
                 if let (Op::Gather { m, h, .. }, OpProof::Gather(sp)) = (op, &shards[si].ops[li]) {
                     let s_len = sp.token_id.len();
-                    // The fractional domains are padded to arity >= 5 in
-                    // prove_scatter_add; the committed columns follow.
-                    let arity_src = sp.num_source.len().trailing_zeros() as usize;
-                    let arity_tgt = sp.num_target.len().trailing_zeros() as usize;
+                    // The witness-only shard stage does not carry the
+                    // challenge-dependent num columns, so derive the padded
+                    // fractional domains from the independent dimensions
+                    // (the same formula build_scatter_add_columns uses).
+                    let arity_src = (s_len * *h).next_power_of_two().max(32).trailing_zeros() as usize;
+                    let arity_tgt = (*m * *h).next_power_of_two().max(32).trailing_zeros() as usize;
                     let arity_gate = s_len.next_power_of_two().max(32).trailing_zeros() as usize;
                     gather_ops.push((si, li, arity_src, arity_tgt, arity_gate, *h, *m));
                 }
@@ -17473,7 +17577,7 @@ fn prove_committed_shard_dag_inner(
     let mut op_den_point_src: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     let mut op_point_tgt: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     let mut op_den_point_tgt: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
-    for (gid, &(si, li, arity_src, arity_tgt, _, _, _)) in gather_ops.iter().enumerate() {
+    for (gid, &(si, li, arity_src, arity_tgt, _, h, m)) in gather_ops.iter().enumerate() {
         let sp = match &mut shards[si].ops[li] {
             OpProof::Gather(p) => p,
             _ => unreachable!(),
@@ -17484,12 +17588,33 @@ fn prove_committed_shard_dag_inner(
         let (point_src, _, den_point_src, _) = fractional_leaf(&new_src);
         let new_tgt = prove_fractional(op_num_tgt[gid].clone(), op_den_tgt[gid].clone(), &mut ts);
         let (point_tgt, _, den_point_tgt, _) = fractional_leaf(&new_tgt);
-        sp.num_source = op_num_src[gid].clone();
-        sp.num_target = op_num_tgt[gid].clone();
-        sp.den_source = op_den_src[gid].clone();
-        sp.den_target = op_den_tgt[gid].clone();
+        // The product sumchecks use the same committed gamma and the rebuilt
+        // num columns. They are generated here, after the dependent roots
+        // were absorbed, so no challenge-dependent column is built or proven
+        // before its commitment. Each final subtask is generated exactly once.
+        let (prod_source, r_prod_source, prod_target, r_prod_target) =
+            crate::gather::prove_scatter_add_products(
+                &sp.weighted,
+                &sp.token_id,
+                &sp.gate,
+                &sp.out,
+                &op_num_src[gid],
+                &op_num_tgt[gid],
+                &sp.gamma,
+                m,
+                h,
+                &mut ts,
+            );
+        // The committed columns live in the batch openings, not in the
+        // serialized proof; keep only the proof subtasks here.
         sp.source_side = new_src;
         sp.target_side = new_tgt;
+        sp.prod_source = prod_source;
+        sp.r_prod_source = r_prod_source;
+        sp.prod_target = prod_target;
+        sp.r_prod_target = r_prod_target;
+        store.o6_gather_fracs.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        store.o6_gather_products.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
         op_point_src[gid] = point_src;
         op_den_point_src[gid] = den_point_src;
         op_point_tgt[gid] = point_tgt;
@@ -17497,6 +17622,12 @@ fn prove_committed_shard_dag_inner(
         let _ = arity_src;
         let _ = arity_tgt;
     }
+    // The committed-stage columns are owned by the opening contexts now;
+    // release the prover-side copies before building the openings.
+    drop(op_num_src);
+    drop(op_num_tgt);
+    drop(op_den_src);
+    drop(op_den_tgt);
 
     // Batch-open each group and fill locations in global order.
     let mut group_idx_of: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
@@ -22144,6 +22275,182 @@ mod tests {
         assert_eq!((fwd, recompute, hits), (1, 0, 1),
             "forward must compute h once and the proof must reuse it");
         assert_eq!(store.projection_cache_stats().0, 1, "one cached h");
+    }
+
+    /// O6: the committed path builds the Scatter/Gather witness columns first
+    /// (no scratch fractional/product proofs), commits them, derives the
+    /// challenges, and then generates every final proof subtask exactly once
+    /// on the committed transcripts.
+    #[test]
+    fn o6_committed_split_generates_each_final_proof_once() {
+        use crate::gather::{gather_forward, prove_scatter_add_with_mode, prove_scatter_add_products,
+            build_scatter_add_columns};
+        use crate::scatter::{prove_scatter_with_mode, scatter_forward};
+
+        let (m, n, k) = (8usize, 8usize, 2usize);
+        let s = m * k;
+        let h = 8usize;
+        let mut sel = vec![Goldilocks::ZERO; m * n];
+        for t in 0..m {
+            for j in 0..k {
+                sel[t * n + (t * 3 + j) % n] = Goldilocks::ONE;
+            }
+        }
+        let (token_id, expert_of) = scatter_forward(&sel, m, n);
+        assert_eq!(token_id.len(), s);
+        let weighted: Vec<Goldilocks> = (0..s * h)
+            .map(|i| from_i64((i as i64 % 7) - 3))
+            .collect();
+        let gate: Vec<Goldilocks> = (0..s).map(|i| from_i64((i as i64 % 5) - 2)).collect();
+        let out = gather_forward(&weighted, &token_id, &gate, m, h);
+
+        // The committed witness stage must not generate proofs. This is the
+        // direct check that no scratch proof is created and discarded.
+        let mut tsp = Transcript::new(b"o6-split-witness-scatter");
+        let sp = prove_scatter_with_mode(
+            &sel, &token_id, &expert_of, m, n, &mut tsp, FracMode::Committed,
+        );
+        assert!(sp.perm.a_side.layers.is_empty());
+        assert!(sp.perm.b_side.layers.is_empty());
+        assert_eq!(sp.perm.a.len(), s);
+        assert_eq!(sp.perm.b.len(), s);
+        let mut tgp = Transcript::new(b"o6-split-witness-gather");
+        let gp = prove_scatter_add_with_mode(
+            &weighted, &token_id, &gate, &out, m, h, &mut tgp, FracMode::Committed,
+        );
+        assert!(gp.source_side.layers.is_empty());
+        assert!(gp.target_side.layers.is_empty());
+        assert!(gp.prod_source.rounds.is_empty());
+        assert!(gp.prod_target.rounds.is_empty());
+        assert!(gp.num_source.is_empty() && gp.gamma.is_empty());
+        assert_eq!(gp.weighted.len(), s * h);
+        // The challenge-dependent columns are only built after alpha/gamma
+        // are derived from the committed transcript (shape check here).
+        let alpha = Goldilocks::from_u64(17);
+        let gamma: Vec<Goldilocks> = (0..h).map(|i| Goldilocks::from_u64(i as u64 + 1)).collect();
+        let cols = build_scatter_add_columns(&weighted, &token_id, &gate, &out, m, h, alpha, &gamma);
+        assert_eq!(cols.num_source.len(), (s * h).next_power_of_two().max(32));
+        assert_eq!(cols.den_source.len(), cols.num_source.len());
+        assert_eq!(cols.num_target.len(), (m * h).next_power_of_two().max(32));
+        let mut tprod = Transcript::new(b"o6-split-products");
+        let (ps, rs, pt, rt) = prove_scatter_add_products(
+            &weighted, &token_id, &gate, &out,
+            &cols.num_source, &cols.num_target, &gamma, m, h, &mut tprod,
+        );
+        assert!(!ps.rounds.is_empty() && !pt.rounds.is_empty());
+        assert_eq!(rs.len(), cols.num_source.len().trailing_zeros() as usize);
+        assert_eq!(rt.len(), cols.num_target.len().trailing_zeros() as usize);
+
+        // End-to-end committed proof: counts are per final subtask and no
+        // scratch proof is produced.
+        let mut store = Store::new();
+        let sel_t = store.push(sel);
+        let tok_t = store.push_idx(token_id);
+        let exp_t = store.push_idx(expert_of);
+        let weighted_t = store.push(weighted);
+        let gate_t = store.push(gate);
+        let out_t = store.push(out);
+        let tokens_t = store.push_idx(Vec::new());
+        let argmax_t = store.push_idx(Vec::new());
+        let ops = vec![
+            Op::Scatter { sel: sel_t, token_id: tok_t, expert_of: exp_t, m, n },
+            Op::Gather { weighted: weighted_t, token_id: tok_t, gate: gate_t, out: out_t, m, h },
+        ];
+        let whir = zkie_core::pcs::whir::Whir::new_testing(5);
+        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &[], tokens_t, argmax_t);
+        let (perm_fracs, gather_fracs, gather_products, lookup_w, lookup_t, discarded, discarded_ns) =
+            store.o6_split_metrics();
+        assert_eq!((perm_fracs, gather_fracs, gather_products, lookup_w, lookup_t),
+            (2, 2, 2, 0, 0),
+            "each final Scatter/Gather proof subtask must be generated once");
+        assert_eq!((discarded, discarded_ns), (0, 0),
+            "the split must not generate a proof that is then discarded");
+        eprintln!(
+            "O6-SPLIT-METRICS perm_fracs={} gather_fracs={} gather_products={} lookup_witness_fracs={} lookup_table_fracs={} discarded={} discarded_ns={}",
+            perm_fracs, gather_fracs, gather_products, lookup_w, lookup_t, discarded, discarded_ns
+        );
+        // The final proof carries the committed-stage sides/products.
+        match &proof.shards[0].ops[0] {
+            OpProof::Scatter(p) => {
+                assert!(!p.perm.a_side.layers.is_empty());
+                assert!(!p.perm.b_side.layers.is_empty());
+            }
+            _ => panic!("expected Scatter proof"),
+        }
+        match &proof.shards[1].ops[0] {
+            OpProof::Gather(p) => {
+                assert!(!p.source_side.layers.is_empty());
+                assert!(!p.target_side.layers.is_empty());
+                assert!(!p.prod_source.rounds.is_empty());
+                assert!(!p.prod_target.rounds.is_empty());
+                assert_eq!(p.gamma.len(), h);
+                // The committed columns are moved into the batch openings
+                // and cleared from the serialized proof.
+                assert!(p.num_source.is_empty() && p.den_target.is_empty());
+            }
+            _ => panic!("expected Gather proof"),
+        }
+        assert!(bincode::serialize(&proof).is_ok());
+    }
+
+    /// O6: the committed lookup/table fractional proofs are witness-only in
+    /// the shard stage and generated once after the committed columns are
+    /// absorbed. The shard-stage scratch proofs are gone.
+    #[test]
+    fn o6_committed_lookup_generates_final_proofs_once() {
+        let mut store = Store::new();
+        let table_vals: Vec<Goldilocks> = (0..8u64)
+            .map(|i| Goldilocks::from_u64(10 * (i + 1)))
+            .collect();
+        let table = store.push(table_vals);
+        let idx = store.push_idx((0..8u32).collect());
+        let out = store.push(Vec::new());
+        let tokens_t = store.push_idx(Vec::new());
+        let argmax_t = store.push_idx(Vec::new());
+        let ops = vec![Op::Lookup { idx, out, table }];
+        let whir = zkie_core::pcs::whir::Whir::new_testing(5);
+        let proof = prove_committed_shard_dag(
+            &mut store, &ops, 1, &whir, &[], tokens_t, argmax_t,
+        );
+        let (perm_fracs, gather_fracs, gather_products, lookup_w, lookup_t, discarded, discarded_ns) =
+            store.o6_split_metrics();
+        assert_eq!((perm_fracs, gather_fracs, gather_products, lookup_w, lookup_t),
+            (0, 0, 0, 1, 1),
+            "one witness-side and one table-side final proof, each once");
+        assert_eq!((discarded, discarded_ns), (0, 0));
+        eprintln!(
+            "O6-SPLIT-METRICS lookup_witness_fracs={} lookup_table_fracs={} discarded={}",
+            lookup_w, lookup_t, discarded
+        );
+        let shard = &proof.shards[0];
+        assert_eq!(shard.witness_columns.len(), 1);
+        assert_eq!(shard.table_columns.len(), 1);
+        assert!(!shard.witness_columns[0].proof.layers.is_empty());
+        assert!(!shard.table_columns[0].proof.layers.is_empty());
+        assert!(bincode::serialize(&proof).is_ok());
+    }
+
+    /// O6: the committed shard path reuses the forward Projection product too
+    /// (same bounded cache contract as the bound path).
+    #[test]
+    fn o6_committed_projection_reuses_forward_product() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)]);
+        let w = store.push(vec![from_i64(1), from_i64(0), from_i64(0), from_i64(1)]);
+        let bias = store.push(vec![Goldilocks::ZERO; 4]);
+        let out = store.push(vec![]);
+        let rem = store.push(vec![]);
+        let ops = vec![Op::Projection { x, w, bias, out, rem, m: 2, k: 2, n: 2, shift: 3 }];
+        let tokens_t = store.push_idx(Vec::new());
+        let argmax_t = store.push_idx(Vec::new());
+        let whir = zkie_core::pcs::whir::Whir::new_testing(5);
+        let _proof = prove_committed_shard_dag(
+            &mut store, &ops, 1, &whir, &[], tokens_t, argmax_t,
+        );
+        let (fwd, recompute, hits) = store.o6_metrics();
+        assert_eq!((fwd, recompute, hits), (1, 0, 1),
+            "committed forward computes h once and the shard proof reuses it");
+        assert_eq!(store.projection_cache_stats().0, 1);
     }
 
     #[test]
